@@ -6400,6 +6400,10 @@ impl MatrixFreeTrustRegionCore {
 
         let mut trust_radius = self.trust_radius.max(self.trust_radius_min).min(self.trust_radius_max);
         self.last_trust_radius = Some(trust_radius);
+        // Allocate CG scratch once. Reused across every outer iteration's
+        // inner Steihaug-Toint loop — eliminates ~5 `Array1<f64>` of size n
+        // allocated per CG step in the previous implementation.
+        let mut cg_scratch = CgScratch::with_dim(self.x0.len());
         // Resolve the rich `gradient_tolerance` (if set) once using
         // the seed cost and initial projected gradient norm. Falls
         // back to the scalar `tolerance` field.
@@ -6529,9 +6533,10 @@ impl MatrixFreeTrustRegionCore {
                 self.cg_tol,
                 cg_max_iter,
                 &mut hvp_evals,
+                &mut cg_scratch,
             );
-            let (step, predicted) = match step_result {
-                Ok(Some(pair)) => pair,
+            let predicted = match step_result {
+                Ok(Some(p)) => p,
                 Ok(None) => {
                     // Gradient was already at convergence (caught by the
                     // tolerance check above, so this is unreachable in
@@ -6595,8 +6600,9 @@ impl MatrixFreeTrustRegionCore {
                 continue;
             }
 
-            // Try the trial point.
-            let x_trial = self.project_point(&(&x_k + &step));
+            // Step lives in `cg_scratch.p`. Form the trial point in
+            // place via x_k + p, then project onto bounds.
+            let x_trial = self.project_point(&(&x_k + &cg_scratch.p));
             let trial_eval = obj_fn.eval_value_grad_op(&x_trial);
             let trial = match trial_eval {
                 Ok(t) => t,
@@ -6649,7 +6655,7 @@ impl MatrixFreeTrustRegionCore {
 
             let actual = sample.value - trial.value;
             let rho = actual / predicted;
-            let step_norm = step.dot(&step).sqrt();
+            let step_norm = cg_scratch.p.dot(&cg_scratch.p).sqrt();
             let on_boundary = step_norm >= 0.99 * trust_radius;
 
             let accepted = rho >= self.eta_accept && actual.is_finite();
@@ -6733,17 +6739,53 @@ impl OperatorHandle {
         match self {
             Self::Borrowed(op) => op.apply_into(v, out),
             Self::DenseAdapter(h) => {
-                let result = h.dot(v);
-                out.assign(&result);
+                // `out = 1.0 * h * v + 0.0 * out` — in-place GEMV via
+                // ndarray's BLAS path. Replaces a `h.dot(v)` that
+                // allocated a fresh `Array1` per CG step.
+                ndarray::linalg::general_mat_vec_mul(1.0, h, v, 0.0, out);
                 Ok(())
             }
         }
     }
 }
 
-/// Steihaug-Toint truncated CG step on a HessianOperator. Returns
-/// `Some((step, predicted_decrease))` when a step is found, `None` when
-/// the gradient is already at convergence.
+/// Reusable scratch buffers for `operator_steihaug_toint_step`.
+/// Allocated once at the top of `MatrixFreeTrustRegionCore::run` and
+/// reused across every outer iteration's CG inner loop, so the inner
+/// CG never allocates after the first iteration.
+struct CgScratch {
+    /// Accumulated step; written by `axpy` into successive iterations.
+    p: Array1<f64>,
+    /// CG residual `r = -g - H * p` (sign-flipped from textbook so
+    /// the recurrence is `r += alpha * H d` with positive `alpha`).
+    r: Array1<f64>,
+    /// CG direction.
+    d: Array1<f64>,
+    /// `H * d` workspace.
+    hd: Array1<f64>,
+    /// `H * p` workspace, used by the predicted-decrease computation.
+    hp: Array1<f64>,
+}
+
+impl CgScratch {
+    fn with_dim(n: usize) -> Self {
+        Self {
+            p: Array1::zeros(n),
+            r: Array1::zeros(n),
+            d: Array1::zeros(n),
+            hd: Array1::zeros(n),
+            hp: Array1::zeros(n),
+        }
+    }
+}
+
+/// Steihaug-Toint truncated CG step on a `HessianOperator`. Returns
+/// `Ok(Some(predicted_decrease))` when a step is left in `scratch.p`,
+/// `Ok(None)` when the gradient is already at convergence.
+///
+/// Caller-owned scratch buffers eliminate per-CG-iter allocations: the
+/// previous implementation allocated `p_new`, `r_new`, and
+/// `-&r_new + beta * &d` on every iteration.
 fn operator_steihaug_toint_step(
     op: &OperatorHandle,
     g_proj: &Array1<f64>,
@@ -6752,8 +6794,10 @@ fn operator_steihaug_toint_step(
     cg_tol: f64,
     max_cg_iter: usize,
     hvp_evals: &mut usize,
-) -> Result<Option<(Array1<f64>, f64)>, ObjectiveEvalError> {
+    scratch: &mut CgScratch,
+) -> Result<Option<f64>, ObjectiveEvalError> {
     let n = g_proj.len();
+    debug_assert_eq!(scratch.p.len(), n);
     let g_norm = g_proj.dot(g_proj).sqrt();
     if !g_norm.is_finite() || g_norm == 0.0 {
         return Ok(None);
@@ -6770,61 +6814,110 @@ fn operator_steihaug_toint_step(
         }
     };
 
-    let mut p = Array1::<f64>::zeros(n);
-    let mut r = g_proj.clone();
-    mask_inplace(&mut r);
-    let mut d: Array1<f64> = -&r;
-    let mut hd = Array1::<f64>::zeros(n);
+    // Initialize p = 0, r = g_proj (after mask), d = -r, hd = 0.
+    scratch.p.fill(0.0);
+    scratch.r.assign(g_proj);
+    mask_inplace(&mut scratch.r);
+    // d = -r in place: zero, then axpy (-1) * r.
+    scratch.d.fill(0.0);
+    scratch.d.scaled_add(-1.0, &scratch.r);
 
     for _ in 0..max_cg_iter {
-        op.apply_into(&d, &mut hd)?;
+        op.apply_into(&scratch.d, &mut scratch.hd)?;
         *hvp_evals += 1;
-        // Mask any contribution along active coordinates so the
-        // subspace step stays in the free set.
         if use_mask {
-            mask_inplace(&mut hd);
+            mask_inplace(&mut scratch.hd);
         }
-        let dHd = d.dot(&hd);
-        if !dHd.is_finite() || dHd <= 0.0 {
-            // Negative or zero curvature: head to the trust-region boundary.
-            if let Some(tau) = boundary_intersection_tau(&p, &d, trust_radius) {
-                let mut step = &p + tau * &d;
-                mask_inplace(&mut step);
-                let pred = predicted_decrease_op(op, g_proj, &step, hvp_evals)?;
-                return Ok(Some((step, pred)));
+        let d_h_d = scratch.d.dot(&scratch.hd);
+        if !d_h_d.is_finite() || d_h_d <= 0.0 {
+            // Negative / zero curvature → head to the trust-region boundary.
+            if let Some(tau) =
+                boundary_intersection_tau(&scratch.p, &scratch.d, trust_radius)
+            {
+                // p += tau * d (in place)
+                scratch.p.scaled_add(tau, &scratch.d);
+                if use_mask {
+                    mask_inplace(&mut scratch.p);
+                }
+                let pred = predicted_decrease_op(
+                    op,
+                    g_proj,
+                    &scratch.p,
+                    hvp_evals,
+                    &mut scratch.hp,
+                )?;
+                return Ok(Some(pred));
             }
-            // Couldn't intersect — return p so the outer loop can shrink.
-            let pred = predicted_decrease_op(op, g_proj, &p, hvp_evals)?;
-            return Ok(Some((p, pred)));
+            let pred = predicted_decrease_op(
+                op,
+                g_proj,
+                &scratch.p,
+                hvp_evals,
+                &mut scratch.hp,
+            )?;
+            return Ok(Some(pred));
         }
-        let r_dot_r = r.dot(&r);
-        let alpha = r_dot_r / dHd;
-        let p_new = &p + alpha * &d;
-        let p_new_norm = p_new.dot(&p_new).sqrt();
+        let r_dot_r = scratch.r.dot(&scratch.r);
+        let alpha = r_dot_r / d_h_d;
+
+        // Tentatively `p_new = p + alpha * d`. Reuse `hp` as a scratch
+        // buffer for the boundary-check norm so we don't allocate.
+        scratch.hp.assign(&scratch.p);
+        scratch.hp.scaled_add(alpha, &scratch.d);
+        let p_new_norm = scratch.hp.dot(&scratch.hp).sqrt();
+
         if p_new_norm >= trust_radius {
-            // Step would leave the trust region; intersect.
-            if let Some(tau) = boundary_intersection_tau(&p, &d, trust_radius) {
-                let mut step = &p + tau * &d;
-                mask_inplace(&mut step);
-                let pred = predicted_decrease_op(op, g_proj, &step, hvp_evals)?;
-                return Ok(Some((step, pred)));
+            // Trust-region boundary intersection.
+            if let Some(tau) =
+                boundary_intersection_tau(&scratch.p, &scratch.d, trust_radius)
+            {
+                scratch.p.scaled_add(tau, &scratch.d);
+                if use_mask {
+                    mask_inplace(&mut scratch.p);
+                }
+                let pred = predicted_decrease_op(
+                    op,
+                    g_proj,
+                    &scratch.p,
+                    hvp_evals,
+                    &mut scratch.hp,
+                )?;
+                return Ok(Some(pred));
             }
-            let pred = predicted_decrease_op(op, g_proj, &p, hvp_evals)?;
-            return Ok(Some((p, pred)));
+            let pred = predicted_decrease_op(
+                op,
+                g_proj,
+                &scratch.p,
+                hvp_evals,
+                &mut scratch.hp,
+            )?;
+            return Ok(Some(pred));
         }
-        p = p_new;
-        let r_new = &r + alpha * &hd;
-        let r_new_norm = r_new.dot(&r_new).sqrt();
+
+        // Commit the step: p += alpha * d.
+        scratch.p.scaled_add(alpha, &scratch.d);
+        // r += alpha * hd.
+        scratch.r.scaled_add(alpha, &scratch.hd);
+        let r_new_dot = scratch.r.dot(&scratch.r);
+        let r_new_norm = r_new_dot.sqrt();
         if r_new_norm <= cg_tol * g_norm {
-            let pred = predicted_decrease_op(op, g_proj, &p, hvp_evals)?;
-            return Ok(Some((p, pred)));
+            let pred = predicted_decrease_op(
+                op,
+                g_proj,
+                &scratch.p,
+                hvp_evals,
+                &mut scratch.hp,
+            )?;
+            return Ok(Some(pred));
         }
-        let beta = r_new.dot(&r_new) / r_dot_r;
-        d = -&r_new + beta * &d;
-        r = r_new;
+        let beta = r_new_dot / r_dot_r;
+        // d = -r + beta * d → scale d by beta in place, then axpy -1*r.
+        scratch.d.mapv_inplace(|x| beta * x);
+        scratch.d.scaled_add(-1.0, &scratch.r);
     }
-    let pred = predicted_decrease_op(op, g_proj, &p, hvp_evals)?;
-    Ok(Some((p, pred)))
+    let pred =
+        predicted_decrease_op(op, g_proj, &scratch.p, hvp_evals, &mut scratch.hp)?;
+    Ok(Some(pred))
 }
 
 fn predicted_decrease_op(
@@ -6832,11 +6925,11 @@ fn predicted_decrease_op(
     g: &Array1<f64>,
     p: &Array1<f64>,
     hvp_evals: &mut usize,
+    hp_scratch: &mut Array1<f64>,
 ) -> Result<f64, ObjectiveEvalError> {
-    let mut hp = Array1::<f64>::zeros(p.len());
-    op.apply_into(p, &mut hp)?;
+    op.apply_into(p, hp_scratch)?;
     *hvp_evals += 1;
-    Ok(-(g.dot(p) + 0.5 * p.dot(&hp)))
+    Ok(-(g.dot(p) + 0.5 * p.dot(hp_scratch)))
 }
 
 /// Smallest non-negative `tau` such that `||p + tau * d|| = delta`.
