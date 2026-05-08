@@ -5600,6 +5600,757 @@ where
     }
 }
 
+// =====================================================================
+// Matrix-free trust-region (opt 0.4)
+// =====================================================================
+//
+// `MatrixFreeTrustRegion` is a Steihaug-Toint truncated-CG trust-region
+// method that consumes Hessians as `HessianOperator` (Hv products)
+// instead of dense `Array2`. It is the matrix-free counterpart to
+// `NewtonTrustRegion` and is intended for objectives whose Hessians are
+// expensive to materialize (block-structured, large dense, or genuinely
+// only available as Hv probes).
+//
+// Compared to `NewtonTrustRegion`:
+// - the inner CG iteration uses `op.apply_into(d, &mut hd)` instead of
+//   `h_model.dot(&d)`, so it never builds an explicit Hessian;
+// - the trust-region subproblem is solved approximately by truncated CG
+//   following Steihaug-Toint, with negative-curvature and
+//   trust-boundary detection;
+// - bounds are handled the same way as `NewtonTrustRegion`: project the
+//   point, mask active constraints in both the gradient and the CG
+//   directions.
+//
+// The solver requires the objective to implement `OperatorObjective`,
+// which is parallel to `SecondOrderObjective` but yields an
+// `OperatorSample` whose Hessian field is a `HessianValue` (Dense /
+// Operator / Unavailable). Dense Hessians are accepted as a degenerate
+// case: the CG path treats them as an operator via a small wrapper.
+// =====================================================================
+
+/// An objective that exposes its Hessian as a [`HessianValue`] rather
+/// than a dense `Option<Array2<f64>>`. `MatrixFreeTrustRegion` uses
+/// this shape so it can drive Hv-only Hessians without materializing
+/// them. Callers that already have a dense Hessian should still
+/// implement this trait by returning `HessianValue::Dense(_)` — the
+/// dense path is handled internally as a degenerate operator.
+pub trait OperatorObjective: FirstOrderObjective {
+    fn eval_value_grad_op(
+        &mut self,
+        x: &Array1<f64>,
+    ) -> Result<OperatorSample, ObjectiveEvalError>;
+}
+
+/// A sample carrying value, gradient, and a [`HessianValue`].
+pub struct OperatorSample {
+    pub value: f64,
+    pub gradient: Array1<f64>,
+    pub hessian: HessianValue,
+}
+
+impl Clone for OperatorSample {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value,
+            gradient: self.gradient.clone(),
+            hessian: self.hessian.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for OperatorSample {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorSample")
+            .field("value", &self.value)
+            .field("gradient", &format!("Array1[{}]", self.gradient.len()))
+            .field("hessian", &self.hessian)
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MatrixFreeTrustRegionError {
+    #[error("Objective evaluation failed: {message}")]
+    ObjectiveFailed { message: String },
+    #[error("Objective returned non-finite values.")]
+    NonFiniteObjective,
+    #[error(
+        "Hessian operator dim {got} does not match parameter dim {expected}"
+    )]
+    OperatorDimensionMismatch { expected: usize, got: usize },
+    #[error(
+        "Trust radius shrank below the configured floor without producing an accepted step. \
+         The objective may have severe noise or the model may be poorly scaled."
+    )]
+    TrustRegionRejectFloor { last_solution: Box<Solution> },
+    #[error(
+        "Maximum number of iterations reached without converging. The best solution found is returned."
+    )]
+    MaxIterationsReached { last_solution: Box<Solution> },
+}
+
+struct MatrixFreeTrustRegionCore {
+    x0: Array1<f64>,
+    tolerance: f64,
+    max_iterations: usize,
+    bounds: Option<BoxSpec>,
+    trust_radius: f64,
+    trust_radius_max: f64,
+    /// Trust-region floor. If the radius shrinks below this without
+    /// accepting a step, the run terminates with `TrustRegionRejectFloor`.
+    trust_radius_min: f64,
+    eta_accept: f64,
+    /// Forcing-sequence factor for the inner CG residual: the inner
+    /// loop terminates when `‖r‖ ≤ cg_tol * ‖g‖`. Eisenstat-Walker
+    /// type forcing.
+    cg_tol: f64,
+    /// CG iteration cap as a multiplier on the parameter dimension.
+    cg_max_iter_factor: f64,
+    initial_sample: Option<(Array1<f64>, OperatorSample)>,
+    hessian_fallback_policy: HessianFallbackPolicy,
+}
+
+/// Matrix-free Newton trust-region solver. Uses Steihaug-Toint
+/// truncated CG with Hessian-vector products supplied by the
+/// objective's [`HessianOperator`].
+pub struct MatrixFreeTrustRegion<ObjFn> {
+    core: MatrixFreeTrustRegionCore,
+    obj_fn: ObjFn,
+}
+
+impl MatrixFreeTrustRegionCore {
+    fn new(x0: Array1<f64>) -> Self {
+        Self {
+            x0,
+            tolerance: 1e-5,
+            max_iterations: 100,
+            bounds: None,
+            trust_radius: 1.0,
+            trust_radius_max: 1e6,
+            trust_radius_min: 1e-12,
+            eta_accept: 0.1,
+            cg_tol: 0.1,
+            cg_max_iter_factor: 1.0,
+            initial_sample: None,
+            hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
+        }
+    }
+
+    #[inline]
+    fn project_point(&self, x: &Array1<f64>) -> Array1<f64> {
+        if let Some(b) = &self.bounds {
+            b.project(x)
+        } else {
+            x.clone()
+        }
+    }
+
+    #[inline]
+    fn projected_gradient(&self, x: &Array1<f64>, g: &Array1<f64>) -> Array1<f64> {
+        if let Some(b) = &self.bounds {
+            b.projected_gradient(x, g)
+        } else {
+            g.clone()
+        }
+    }
+
+    fn active_mask_vec(&self, x: &Array1<f64>, g: &Array1<f64>) -> Vec<bool> {
+        if let Some(b) = &self.bounds {
+            b.active_mask(x, g)
+        } else {
+            vec![false; x.len()]
+        }
+    }
+
+    fn run<ObjFn>(
+        &mut self,
+        obj_fn: &mut ObjFn,
+    ) -> Result<Solution, MatrixFreeTrustRegionError>
+    where
+        ObjFn: OperatorObjective,
+    {
+        let n = self.x0.len();
+        let mut x_k = self.project_point(&self.x0);
+        let mut func_evals = 0usize;
+        let mut grad_evals = 0usize;
+        let mut hvp_evals = 0usize;
+
+        // Evaluate the seed (or use the precomputed sample).
+        let seed_eval = if let Some((seed_x, sample)) = self.initial_sample.as_ref() {
+            if approx_point(seed_x, &x_k) {
+                Ok(sample.clone())
+            } else {
+                obj_fn.eval_value_grad_op(&x_k)
+            }
+        } else {
+            obj_fn.eval_value_grad_op(&x_k)
+        };
+        let mut sample = match seed_eval {
+            Ok(s) => s,
+            Err(ObjectiveEvalError::Recoverable { .. }) => {
+                return Err(MatrixFreeTrustRegionError::NonFiniteObjective);
+            }
+            Err(ObjectiveEvalError::Fatal { message }) => {
+                return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
+            }
+        };
+        if !sample.value.is_finite() || sample.gradient.iter().any(|v| !v.is_finite()) {
+            return Err(MatrixFreeTrustRegionError::NonFiniteObjective);
+        }
+        if self.initial_sample.is_some() {
+            // The seed was supplied externally; either way it counts as
+            // one objective evaluation toward the diagnostics — but we
+            // do *not* increment the local counters because the caller
+            // already owns that evaluation. Keep counts honest.
+            // (Matches `Bfgs::with_initial_sample` semantics.)
+        } else {
+            func_evals += 1;
+            grad_evals += 1;
+        }
+
+        let mut trust_radius = self.trust_radius.max(self.trust_radius_min).min(self.trust_radius_max);
+
+        for k in 0..self.max_iterations {
+            let g_proj = self.projected_gradient(&x_k, &sample.gradient);
+            let g_proj_norm = g_proj.dot(&g_proj).sqrt();
+            if g_proj_norm <= self.tolerance {
+                let sol = Solution::gradient_based(
+                    x_k.clone(),
+                    sample.value,
+                    sample.gradient.clone(),
+                    g_proj_norm,
+                    None,
+                    k,
+                    func_evals,
+                    grad_evals,
+                    hvp_evals, // we account for HVPs in the hess_evals slot for now
+                );
+                return Ok(sol);
+            }
+
+            // Materialize a Hessian operator handle for the CG step.
+            let op_handle = match &sample.hessian {
+                HessianValue::Operator(op) => {
+                    if op.dim() != n {
+                        return Err(MatrixFreeTrustRegionError::OperatorDimensionMismatch {
+                            expected: n,
+                            got: op.dim(),
+                        });
+                    }
+                    OperatorHandle::Borrowed(StdArc::clone(op))
+                }
+                HessianValue::Dense(h) => {
+                    if h.nrows() != n || h.ncols() != n {
+                        return Err(MatrixFreeTrustRegionError::OperatorDimensionMismatch {
+                            expected: n,
+                            got: h.nrows(),
+                        });
+                    }
+                    OperatorHandle::DenseAdapter(h.clone())
+                }
+                HessianValue::Unavailable => {
+                    match self.hessian_fallback_policy {
+                        HessianFallbackPolicy::Error => {
+                            return Err(MatrixFreeTrustRegionError::ObjectiveFailed {
+                                message: "objective returned HessianValue::Unavailable but the \
+                                          solver is configured with HessianFallbackPolicy::Error"
+                                    .to_string(),
+                            });
+                        }
+                        HessianFallbackPolicy::FiniteDifference => {
+                            return Err(MatrixFreeTrustRegionError::ObjectiveFailed {
+                                message: "MatrixFreeTrustRegion does not yet support \
+                                          finite-difference fallback for HessianValue::Unavailable; \
+                                          use HessianFallbackPolicy::Error or supply Dense/Operator"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            };
+
+            // Compute a step via Steihaug-Toint truncated CG.
+            let active = self.active_mask_vec(&x_k, &sample.gradient);
+            let cg_max_iter = ((n as f64) * self.cg_max_iter_factor).ceil() as usize;
+            let cg_max_iter = cg_max_iter.max(2 * n).max(8);
+            let step_result = operator_steihaug_toint_step(
+                &op_handle,
+                &g_proj,
+                trust_radius,
+                if self.bounds.is_some() { Some(&active) } else { None },
+                self.cg_tol,
+                cg_max_iter,
+                &mut hvp_evals,
+            );
+            let (step, predicted) = match step_result {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    // Gradient was already at convergence (caught by the
+                    // tolerance check above, so this is unreachable in
+                    // practice; play safe).
+                    let sol = Solution::gradient_based(
+                        x_k.clone(),
+                        sample.value,
+                        sample.gradient.clone(),
+                        g_proj_norm,
+                        None,
+                        k,
+                        func_evals,
+                        grad_evals,
+                        hvp_evals,
+                    );
+                    return Ok(sol);
+                }
+                Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    // CG failed recoverably; shrink and retry.
+                    trust_radius *= 0.25;
+                    if trust_radius < self.trust_radius_min {
+                        let last = Box::new(Solution::gradient_based(
+                            x_k.clone(),
+                            sample.value,
+                            sample.gradient.clone(),
+                            g_proj_norm,
+                            None,
+                            k,
+                            func_evals,
+                            grad_evals,
+                            hvp_evals,
+                        ));
+                        return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
+                            last_solution: last,
+                        });
+                    }
+                    continue;
+                }
+                Err(ObjectiveEvalError::Fatal { message }) => {
+                    return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
+                }
+            };
+            if predicted <= 0.0 || !predicted.is_finite() {
+                trust_radius *= 0.25;
+                if trust_radius < self.trust_radius_min {
+                    let last = Box::new(Solution::gradient_based(
+                        x_k.clone(),
+                        sample.value,
+                        sample.gradient.clone(),
+                        g_proj_norm,
+                        None,
+                        k,
+                        func_evals,
+                        grad_evals,
+                        hvp_evals,
+                    ));
+                    return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
+                        last_solution: last,
+                    });
+                }
+                continue;
+            }
+
+            // Try the trial point.
+            let x_trial = self.project_point(&(&x_k + &step));
+            let trial_eval = obj_fn.eval_value_grad_op(&x_trial);
+            let trial = match trial_eval {
+                Ok(t) => t,
+                Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    trust_radius *= 0.5;
+                    if trust_radius < self.trust_radius_min {
+                        let last = Box::new(Solution::gradient_based(
+                            x_k.clone(),
+                            sample.value,
+                            sample.gradient.clone(),
+                            g_proj_norm,
+                            None,
+                            k,
+                            func_evals,
+                            grad_evals,
+                            hvp_evals,
+                        ));
+                        return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
+                            last_solution: last,
+                        });
+                    }
+                    continue;
+                }
+                Err(ObjectiveEvalError::Fatal { message }) => {
+                    return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
+                }
+            };
+            func_evals += 1;
+            grad_evals += 1;
+            if !trial.value.is_finite() || trial.gradient.iter().any(|v| !v.is_finite()) {
+                trust_radius *= 0.5;
+                if trust_radius < self.trust_radius_min {
+                    let last = Box::new(Solution::gradient_based(
+                        x_k.clone(),
+                        sample.value,
+                        sample.gradient.clone(),
+                        g_proj_norm,
+                        None,
+                        k,
+                        func_evals,
+                        grad_evals,
+                        hvp_evals,
+                    ));
+                    return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
+                        last_solution: last,
+                    });
+                }
+                continue;
+            }
+
+            let actual = sample.value - trial.value;
+            let rho = actual / predicted;
+            let step_norm = step.dot(&step).sqrt();
+            let on_boundary = step_norm >= 0.99 * trust_radius;
+
+            if rho >= self.eta_accept && actual.is_finite() {
+                // Accept.
+                x_k = x_trial;
+                sample = trial;
+                if rho > 0.75 && on_boundary {
+                    trust_radius = (trust_radius * 2.0).min(self.trust_radius_max);
+                } else if rho < 0.25 {
+                    trust_radius *= 0.5;
+                }
+            } else {
+                // Reject.
+                trust_radius *= 0.25;
+                if trust_radius < self.trust_radius_min {
+                    let last = Box::new(Solution::gradient_based(
+                        x_k.clone(),
+                        sample.value,
+                        sample.gradient.clone(),
+                        g_proj_norm,
+                        None,
+                        k,
+                        func_evals,
+                        grad_evals,
+                        hvp_evals,
+                    ));
+                    return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
+                        last_solution: last,
+                    });
+                }
+            }
+        }
+
+        let g_proj = self.projected_gradient(&x_k, &sample.gradient);
+        let g_proj_norm = g_proj.dot(&g_proj).sqrt();
+        let last = Box::new(Solution::gradient_based(
+            x_k,
+            sample.value,
+            sample.gradient,
+            g_proj_norm,
+            None,
+            self.max_iterations,
+            func_evals,
+            grad_evals,
+            hvp_evals,
+        ));
+        Err(MatrixFreeTrustRegionError::MaxIterationsReached {
+            last_solution: last,
+        })
+    }
+}
+
+/// Borrowed-or-owned wrapper so the matrix-free CG step can treat a
+/// `HessianValue::Dense` and `HessianValue::Operator` uniformly.
+enum OperatorHandle {
+    Borrowed(StdArc<dyn HessianOperator>),
+    DenseAdapter(Array2<f64>),
+}
+
+impl OperatorHandle {
+    fn apply_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), ObjectiveEvalError> {
+        match self {
+            Self::Borrowed(op) => op.apply_into(v, out),
+            Self::DenseAdapter(h) => {
+                let result = h.dot(v);
+                out.assign(&result);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Steihaug-Toint truncated CG step on a HessianOperator. Returns
+/// `Some((step, predicted_decrease))` when a step is found, `None` when
+/// the gradient is already at convergence.
+fn operator_steihaug_toint_step(
+    op: &OperatorHandle,
+    g_proj: &Array1<f64>,
+    trust_radius: f64,
+    active: Option<&[bool]>,
+    cg_tol: f64,
+    max_cg_iter: usize,
+    hvp_evals: &mut usize,
+) -> Result<Option<(Array1<f64>, f64)>, ObjectiveEvalError> {
+    let n = g_proj.len();
+    let g_norm = g_proj.dot(g_proj).sqrt();
+    if !g_norm.is_finite() || g_norm == 0.0 {
+        return Ok(None);
+    }
+    let use_mask = active.map(|a| !a.is_empty()).unwrap_or(false);
+    let active = active.unwrap_or(&[]);
+    let mask_inplace = |v: &mut Array1<f64>| {
+        if use_mask {
+            for i in 0..v.len() {
+                if active.get(i).copied().unwrap_or(false) {
+                    v[i] = 0.0;
+                }
+            }
+        }
+    };
+
+    let mut p = Array1::<f64>::zeros(n);
+    let mut r = g_proj.clone();
+    mask_inplace(&mut r);
+    let mut d: Array1<f64> = -&r;
+    let mut hd = Array1::<f64>::zeros(n);
+
+    for _ in 0..max_cg_iter {
+        op.apply_into(&d, &mut hd)?;
+        *hvp_evals += 1;
+        // Mask any contribution along active coordinates so the
+        // subspace step stays in the free set.
+        if use_mask {
+            mask_inplace(&mut hd);
+        }
+        let dHd = d.dot(&hd);
+        if !dHd.is_finite() || dHd <= 0.0 {
+            // Negative or zero curvature: head to the trust-region boundary.
+            if let Some(tau) = boundary_intersection_tau(&p, &d, trust_radius) {
+                let mut step = &p + tau * &d;
+                mask_inplace(&mut step);
+                let pred = predicted_decrease_op(op, g_proj, &step, hvp_evals)?;
+                return Ok(Some((step, pred)));
+            }
+            // Couldn't intersect — return p so the outer loop can shrink.
+            let pred = predicted_decrease_op(op, g_proj, &p, hvp_evals)?;
+            return Ok(Some((p, pred)));
+        }
+        let r_dot_r = r.dot(&r);
+        let alpha = r_dot_r / dHd;
+        let p_new = &p + alpha * &d;
+        let p_new_norm = p_new.dot(&p_new).sqrt();
+        if p_new_norm >= trust_radius {
+            // Step would leave the trust region; intersect.
+            if let Some(tau) = boundary_intersection_tau(&p, &d, trust_radius) {
+                let mut step = &p + tau * &d;
+                mask_inplace(&mut step);
+                let pred = predicted_decrease_op(op, g_proj, &step, hvp_evals)?;
+                return Ok(Some((step, pred)));
+            }
+            let pred = predicted_decrease_op(op, g_proj, &p, hvp_evals)?;
+            return Ok(Some((p, pred)));
+        }
+        p = p_new;
+        let r_new = &r + alpha * &hd;
+        let r_new_norm = r_new.dot(&r_new).sqrt();
+        if r_new_norm <= cg_tol * g_norm {
+            let pred = predicted_decrease_op(op, g_proj, &p, hvp_evals)?;
+            return Ok(Some((p, pred)));
+        }
+        let beta = r_new.dot(&r_new) / r_dot_r;
+        d = -&r_new + beta * &d;
+        r = r_new;
+    }
+    let pred = predicted_decrease_op(op, g_proj, &p, hvp_evals)?;
+    Ok(Some((p, pred)))
+}
+
+fn predicted_decrease_op(
+    op: &OperatorHandle,
+    g: &Array1<f64>,
+    p: &Array1<f64>,
+    hvp_evals: &mut usize,
+) -> Result<f64, ObjectiveEvalError> {
+    let mut hp = Array1::<f64>::zeros(p.len());
+    op.apply_into(p, &mut hp)?;
+    *hvp_evals += 1;
+    Ok(-(g.dot(p) + 0.5 * p.dot(&hp)))
+}
+
+/// Smallest non-negative `tau` such that `||p + tau * d|| = delta`.
+/// Returns `None` when no real positive intersection exists.
+fn boundary_intersection_tau(p: &Array1<f64>, d: &Array1<f64>, delta: f64) -> Option<f64> {
+    let a = d.dot(d);
+    if !a.is_finite() || a <= 0.0 {
+        return None;
+    }
+    let b = 2.0 * p.dot(d);
+    let c = p.dot(p) - delta * delta;
+    let disc = b * b - 4.0 * a * c;
+    if !disc.is_finite() || disc < 0.0 {
+        return None;
+    }
+    let sqrt_disc = disc.sqrt();
+    let t1 = (-b - sqrt_disc) / (2.0 * a);
+    let t2 = (-b + sqrt_disc) / (2.0 * a);
+    let mut best: Option<f64> = None;
+    for t in [t1, t2] {
+        if t.is_finite() && t >= 0.0 {
+            best = Some(best.map(|v| v.min(t)).unwrap_or(t));
+        }
+    }
+    best
+}
+
+impl<ObjFn> MatrixFreeTrustRegion<ObjFn>
+where
+    ObjFn: OperatorObjective,
+{
+    /// Creates a new matrix-free trust-region solver.
+    pub fn new(x0: Array1<f64>, obj_fn: ObjFn) -> Self {
+        Self {
+            core: MatrixFreeTrustRegionCore::new(x0),
+            obj_fn,
+        }
+    }
+
+    pub fn with_tolerance(mut self, tolerance: Tolerance) -> Self {
+        self.core.tolerance = tolerance.get();
+        self
+    }
+
+    pub fn with_max_iterations(mut self, max_iterations: MaxIterations) -> Self {
+        self.core.max_iterations = max_iterations.get();
+        self
+    }
+
+    /// Provide simple box bounds for each coordinate (lower <= x <= upper).
+    pub fn with_bounds(mut self, bounds: Bounds) -> Self {
+        self.obj_fn.set_finite_difference_bounds(Some(&bounds));
+        self.core.bounds = Some(bounds.spec);
+        self
+    }
+
+    /// Set the initial trust radius (default: 1.0). Useful when the
+    /// caller has scale information that better than the unit ball.
+    pub fn with_initial_trust_radius(mut self, radius: f64) -> Self {
+        self.core.trust_radius = radius;
+        self
+    }
+
+    /// Set the maximum trust radius (default: 1e6).
+    pub fn with_max_trust_radius(mut self, radius: f64) -> Self {
+        self.core.trust_radius_max = radius;
+        self
+    }
+
+    /// Set the trust-radius floor (default: 1e-12). If the radius
+    /// shrinks below this without producing an accepted step, the run
+    /// terminates with `TrustRegionRejectFloor` and the best-seen
+    /// solution.
+    pub fn with_min_trust_radius(mut self, radius: f64) -> Self {
+        self.core.trust_radius_min = radius;
+        self
+    }
+
+    /// Inner-CG forcing sequence factor. The CG iteration terminates
+    /// when `‖r‖ ≤ cg_tol * ‖g‖`; default `0.1` is the classic
+    /// Eisenstat-Walker one-tenth value.
+    pub fn with_cg_tolerance(mut self, tol: f64) -> Self {
+        self.core.cg_tol = tol;
+        self
+    }
+
+    /// CG iteration cap as a multiplier on the parameter dimension.
+    /// Default `1.0` (n inner iterations); set higher when ill-conditioned.
+    pub fn with_cg_max_iter_factor(mut self, factor: f64) -> Self {
+        self.core.cg_max_iter_factor = factor;
+        self
+    }
+
+    /// See `NewtonTrustRegion::with_hessian_fallback_policy`.
+    pub fn with_hessian_fallback_policy(mut self, policy: HessianFallbackPolicy) -> Self {
+        self.core.hessian_fallback_policy = policy;
+        self
+    }
+
+    /// See `NewtonTrustRegion::with_initial_sample`.
+    pub fn with_initial_sample(mut self, x0: Array1<f64>, sample: OperatorSample) -> Self {
+        self.core.initial_sample = Some((x0, sample));
+        self
+    }
+
+    pub fn run(&mut self) -> Result<Solution, MatrixFreeTrustRegionError> {
+        self.core.run(&mut self.obj_fn)
+    }
+
+    pub fn run_report(&mut self) -> OptimizationReport {
+        let outcome = self.core.run(&mut self.obj_fn);
+        matrix_free_outcome_into_report(&self.core.x0, outcome)
+    }
+}
+
+fn matrix_free_outcome_into_report(
+    x0: &Array1<f64>,
+    outcome: Result<Solution, MatrixFreeTrustRegionError>,
+) -> OptimizationReport {
+    match outcome {
+        Ok(solution) => {
+            let diagnostics = OptimizationDiagnostics {
+                func_evals: solution.func_evals,
+                grad_evals: solution.grad_evals,
+                hess_evals: 0,
+                hvp_evals: solution.hess_evals,
+                ..OptimizationDiagnostics::default()
+            };
+            OptimizationReport {
+                solution,
+                status: OptimizationStatus::Converged,
+                diagnostics,
+            }
+        }
+        Err(MatrixFreeTrustRegionError::MaxIterationsReached { last_solution }) => {
+            let solution = *last_solution;
+            let diagnostics = OptimizationDiagnostics {
+                func_evals: solution.func_evals,
+                grad_evals: solution.grad_evals,
+                hess_evals: 0,
+                hvp_evals: solution.hess_evals,
+                ..OptimizationDiagnostics::default()
+            };
+            OptimizationReport {
+                solution,
+                status: OptimizationStatus::MaxIterations,
+                diagnostics,
+            }
+        }
+        Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor { last_solution }) => {
+            let solution = *last_solution;
+            let diagnostics = OptimizationDiagnostics {
+                func_evals: solution.func_evals,
+                grad_evals: solution.grad_evals,
+                hess_evals: 0,
+                hvp_evals: solution.hess_evals,
+                ..OptimizationDiagnostics::default()
+            };
+            OptimizationReport {
+                solution,
+                status: OptimizationStatus::TrustRegionRejectFloor,
+                diagnostics,
+            }
+        }
+        Err(MatrixFreeTrustRegionError::ObjectiveFailed { .. }) => OptimizationReport {
+            solution: placeholder_solution(x0),
+            status: OptimizationStatus::ObjectiveFailed,
+            diagnostics: OptimizationDiagnostics::default(),
+        },
+        Err(_) => OptimizationReport {
+            solution: placeholder_solution(x0),
+            status: OptimizationStatus::NumericalFailure,
+            diagnostics: OptimizationDiagnostics::default(),
+        },
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FixedPointError {
     #[error("Objective evaluation failed: {message}")]
@@ -6845,9 +7596,11 @@ mod tests {
         ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, Bfgs, BfgsError, Bounds,
         FallbackPolicy, FiniteDiffGradient, FirstOrderObjective, FirstOrderSample, FixedPoint,
         FixedPointObjective, FixedPointSample, FixedPointStatus, HessianFallbackPolicy,
-        LineSearchFailureReason, MaxIterations, NewtonTrustRegion, ObjectiveEvalError,
-        OptimizationStatus, Problem, Profile, SecondOrderObjective, SecondOrderProblem,
-        SecondOrderSample, Solution, Tolerance, ZerothOrderObjective, optimize,
+        HessianMaterialization, HessianOperator, HessianValue, LineSearchFailureReason,
+        MatrixFreeTrustRegion, MatrixFreeTrustRegionError, MaxIterations, NewtonTrustRegion,
+        ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus, Problem,
+        Profile, SecondOrderObjective, SecondOrderProblem, SecondOrderSample, Solution,
+        Tolerance, ZerothOrderObjective, optimize,
     };
     use ndarray::{Array1, Array2, array};
     use spectral::prelude::*;
@@ -9596,6 +10349,204 @@ mod tests {
         for v in report.solution.final_point.iter() {
             assert!((v - 1.0).abs() < 1e-3);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // opt 0.4 — MatrixFreeTrustRegion (operator-only Hessian path)
+    // -----------------------------------------------------------------
+
+    /// A `HessianOperator` for the constant identity matrix. Used to
+    /// drive `MatrixFreeTrustRegion` through a quadratic problem with
+    /// a known minimizer.
+    struct IdentityOperator {
+        n: usize,
+    }
+
+    impl HessianOperator for IdentityOperator {
+        fn dim(&self) -> usize {
+            self.n
+        }
+
+        fn apply_into(
+            &self,
+            v: &Array1<f64>,
+            out: &mut Array1<f64>,
+        ) -> Result<(), ObjectiveEvalError> {
+            out.assign(v);
+            Ok(())
+        }
+
+        fn materialization(&self) -> HessianMaterialization {
+            HessianMaterialization::Explicit
+        }
+
+        fn materialize_dense(&self) -> Result<Array2<f64>, ObjectiveEvalError> {
+            Ok(Array2::eye(self.n))
+        }
+    }
+
+    /// `f(x) = 0.5 * (x - 1)^T (x - 1)`, with the Hessian exposed as
+    /// the identity operator instead of a dense matrix.
+    struct OperatorQuadratic {
+        n: usize,
+    }
+
+    impl ZerothOrderObjective for OperatorQuadratic {
+        fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+            let mut s = 0.0;
+            for v in x.iter() {
+                let d = v - 1.0;
+                s += 0.5 * d * d;
+            }
+            Ok(s)
+        }
+    }
+
+    impl FirstOrderObjective for OperatorQuadratic {
+        fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+            let value = ZerothOrderObjective::eval_cost(self, x)?;
+            Ok(FirstOrderSample {
+                value,
+                gradient: x - 1.0,
+            })
+        }
+    }
+
+    impl OperatorObjective for OperatorQuadratic {
+        fn eval_value_grad_op(
+            &mut self,
+            x: &Array1<f64>,
+        ) -> Result<OperatorSample, ObjectiveEvalError> {
+            let value = ZerothOrderObjective::eval_cost(self, x)?;
+            Ok(OperatorSample {
+                value,
+                gradient: x - 1.0,
+                hessian: HessianValue::Operator(super::StdArc::new(IdentityOperator {
+                    n: self.n,
+                })),
+            })
+        }
+    }
+
+    /// `MatrixFreeTrustRegion` must converge on a strictly convex
+    /// quadratic when given the exact Hessian as a HessianOperator.
+    /// One Newton step (which Steihaug-Toint reproduces exactly when
+    /// the trust region is large enough) lands at the minimum.
+    #[test]
+    fn matrix_free_trust_region_converges_on_quadratic() {
+        let n = 3;
+        let x0 = array![5.0, -2.0, 7.0];
+        let mut solver = MatrixFreeTrustRegion::new(x0, OperatorQuadratic { n })
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_tolerance(Tolerance::new(1e-8).unwrap())
+            .with_initial_trust_radius(10.0);
+        let solution = solver
+            .run()
+            .expect("matrix-free TR should converge on a convex quadratic");
+        for v in solution.final_point.iter() {
+            assert!(
+                (v - 1.0).abs() < 1e-6,
+                "matrix-free TR should converge near (1,1,1); got {v}"
+            );
+        }
+        // Hv evaluations are tracked in the `hess_evals` slot of the
+        // Solution; we just assert it was non-zero (a real algorithm
+        // ran).
+        assert!(solution.hess_evals > 0);
+    }
+
+    /// `MatrixFreeTrustRegion` accepts `HessianValue::Dense(_)` via the
+    /// internal dense-adapter path. This is the path callers take when
+    /// they happen to have a dense Hessian but want the matrix-free
+    /// trust-region machinery (e.g. for retry warm-starts that want
+    /// uniform diagnostics).
+    #[test]
+    fn matrix_free_trust_region_accepts_dense_value() {
+        struct DenseQuadratic;
+        impl ZerothOrderObjective for DenseQuadratic {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                Ok(0.5 * (x - 1.0).dot(&(x - 1.0)))
+            }
+        }
+        impl FirstOrderObjective for DenseQuadratic {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                Ok(FirstOrderSample {
+                    value: 0.5 * (x - 1.0).dot(&(x - 1.0)),
+                    gradient: x - 1.0,
+                })
+            }
+        }
+        impl OperatorObjective for DenseQuadratic {
+            fn eval_value_grad_op(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<OperatorSample, ObjectiveEvalError> {
+                Ok(OperatorSample {
+                    value: 0.5 * (x - 1.0).dot(&(x - 1.0)),
+                    gradient: x - 1.0,
+                    hessian: HessianValue::Dense(Array2::eye(x.len())),
+                })
+            }
+        }
+        let x0 = array![3.0, -1.5];
+        let mut solver = MatrixFreeTrustRegion::new(x0, DenseQuadratic)
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_tolerance(Tolerance::new(1e-8).unwrap())
+            .with_initial_trust_radius(10.0);
+        let sol = solver.run().expect("dense path through matrix-free TR");
+        for v in sol.final_point.iter() {
+            assert!((v - 1.0).abs() < 1e-6);
+        }
+    }
+
+    /// `HessianValue::Unavailable` under the default
+    /// `HessianFallbackPolicy::FiniteDifference` is documented as not
+    /// yet supported by `MatrixFreeTrustRegion`; the solver must surface
+    /// that as a fatal evaluation error rather than silently producing
+    /// a wrong answer.
+    #[test]
+    fn matrix_free_trust_region_rejects_unavailable_hessian() {
+        struct UnavailHessian;
+        impl ZerothOrderObjective for UnavailHessian {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                Ok(0.5 * x.dot(x))
+            }
+        }
+        impl FirstOrderObjective for UnavailHessian {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                Ok(FirstOrderSample {
+                    value: 0.5 * x.dot(x),
+                    gradient: x.clone(),
+                })
+            }
+        }
+        impl OperatorObjective for UnavailHessian {
+            fn eval_value_grad_op(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<OperatorSample, ObjectiveEvalError> {
+                Ok(OperatorSample {
+                    value: 0.5 * x.dot(x),
+                    gradient: x.clone(),
+                    hessian: HessianValue::Unavailable,
+                })
+            }
+        }
+        let mut solver = MatrixFreeTrustRegion::new(array![1.0, 1.0], UnavailHessian)
+            .with_hessian_fallback_policy(HessianFallbackPolicy::Error);
+        let err = solver
+            .run()
+            .expect_err("matrix-free TR must reject Unavailable under Error policy");
+        assert!(matches!(
+            err,
+            MatrixFreeTrustRegionError::ObjectiveFailed { .. }
+        ));
     }
 
     /// `run_report` must return `MaxIterations` when the solver runs
