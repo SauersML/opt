@@ -2383,6 +2383,11 @@ struct NewtonTrustRegionCore {
     history_cap: usize,
     hessian_fallback_policy: HessianFallbackPolicy,
     initial_sample: Option<(Array1<f64>, SecondOrderSample)>,
+    /// Final trust radius observed during the most recent `run`. Populated
+    /// at every exit path so callers (e.g. retry-warm-start) can pick up
+    /// the geometry the previous attempt had learned. `None` before
+    /// the first `run()`.
+    last_trust_radius: Option<f64>,
 }
 
 pub struct NewtonTrustRegion<ObjFn> {
@@ -2455,6 +2460,7 @@ impl NewtonTrustRegionCore {
             history_cap: 12,
             hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
             initial_sample: None,
+            last_trust_radius: None,
         }
     }
 
@@ -2799,10 +2805,12 @@ impl NewtonTrustRegionCore {
             });
         }
         let mut trust_radius = self.trust_radius.max(1e-8);
+        self.last_trust_radius = Some(trust_radius);
         let mut g_proj_k = self.projected_gradient(&x_k, &g_k);
         let mut h_model_workspace = Array2::<f64>::zeros((n, n));
 
         for k in 0..self.max_iterations {
+            self.last_trust_radius = Some(trust_radius);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
             if g_norm.is_finite() && g_norm <= self.tolerance {
                 return Ok(Solution::gradient_based(
@@ -5507,15 +5515,35 @@ where
         self
     }
 
+    /// Set the initial trust radius (default: 1.0). Useful when the
+    /// caller has scale information — e.g. warm-starting from a
+    /// previous run's `OptimizationDiagnostics.final_trust_radius`.
+    pub fn with_initial_trust_radius(mut self, radius: f64) -> Self {
+        self.core.trust_radius = radius;
+        self
+    }
+
+    /// Set the maximum trust radius (default: 1e6).
+    pub fn with_max_trust_radius(mut self, radius: f64) -> Self {
+        self.core.trust_radius_max = radius;
+        self
+    }
+
     /// Executes the Newton trust-region optimization.
     pub fn run(&mut self) -> Result<Solution, NewtonTrustRegionError> {
         self.core.run(&mut self.obj_fn)
     }
 
     /// Structured report variant of `run()`. See `Bfgs::run_report`.
+    ///
+    /// Populates `OptimizationDiagnostics.final_trust_radius` from the
+    /// solver's last observed trust radius so the caller can warm-start
+    /// a follow-up `NewtonTrustRegion::with_initial_trust_radius`.
     pub fn run_report(&mut self) -> OptimizationReport {
         let outcome = self.core.run(&mut self.obj_fn);
-        newton_outcome_into_report(&self.core.x0, outcome)
+        let mut report = newton_outcome_into_report(&self.core.x0, outcome);
+        report.diagnostics.final_trust_radius = self.core.last_trust_radius;
+        report
     }
 }
 
@@ -5582,6 +5610,31 @@ where
         self
     }
 
+    /// Set the initial cubic-regularization parameter `sigma` (the ARC
+    /// analogue of a trust radius). Default is `1.0`. Warm-start with
+    /// `OptimizationDiagnostics.final_regularization` from a previous
+    /// run when retrying with a larger budget.
+    pub fn with_initial_regularization(mut self, sigma: f64) -> Self {
+        self.core.sigma = sigma;
+        self
+    }
+
+    /// Set the floor for `sigma` (default: 1e-10). The solver does not
+    /// shrink below this; raising it forbids the regularization from
+    /// approaching pure Newton on benign iterations.
+    pub fn with_min_regularization(mut self, sigma: f64) -> Self {
+        self.core.sigma_min = sigma;
+        self
+    }
+
+    /// Set the ceiling for `sigma` (default: 1e12). The solver does
+    /// not grow beyond this on rejection; lowering it caps how
+    /// aggressively the cubic term can dominate the model.
+    pub fn with_max_regularization(mut self, sigma: f64) -> Self {
+        self.core.sigma_max = sigma;
+        self
+    }
+
     /// Executes ARC optimization.
     ///
     /// This implementation follows the practical ARC template in Euclidean spaces.
@@ -5594,9 +5647,16 @@ where
     }
 
     /// Structured report variant of `run()`. See `Bfgs::run_report`.
+    ///
+    /// Populates `OptimizationDiagnostics.final_regularization` from the
+    /// solver's last observed cubic-regularization parameter `sigma`,
+    /// which is the ARC analogue of a trust radius for warm-starting a
+    /// follow-up call.
     pub fn run_report(&mut self) -> OptimizationReport {
         let outcome = self.core.run(&mut self.obj_fn);
-        arc_outcome_into_report(&self.core.x0, outcome)
+        let mut report = arc_outcome_into_report(&self.core.x0, outcome);
+        report.diagnostics.final_regularization = Some(self.core.sigma);
+        report
     }
 }
 
@@ -5708,6 +5768,11 @@ struct MatrixFreeTrustRegionCore {
     cg_max_iter_factor: f64,
     initial_sample: Option<(Array1<f64>, OperatorSample)>,
     hessian_fallback_policy: HessianFallbackPolicy,
+    /// Final trust radius observed during the most recent `run`.
+    /// Populated at every loop exit so callers can warm-start a
+    /// follow-up solve with the geometry the previous attempt
+    /// already learned. `None` before the first `run()`.
+    last_trust_radius: Option<f64>,
 }
 
 /// Matrix-free Newton trust-region solver. Uses Steihaug-Toint
@@ -5733,6 +5798,7 @@ impl MatrixFreeTrustRegionCore {
             cg_max_iter_factor: 1.0,
             initial_sample: None,
             hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
+            last_trust_radius: None,
         }
     }
 
@@ -5809,8 +5875,10 @@ impl MatrixFreeTrustRegionCore {
         }
 
         let mut trust_radius = self.trust_radius.max(self.trust_radius_min).min(self.trust_radius_max);
+        self.last_trust_radius = Some(trust_radius);
 
         for k in 0..self.max_iterations {
+            self.last_trust_radius = Some(trust_radius);
             let g_proj = self.projected_gradient(&x_k, &sample.gradient);
             let g_proj_norm = g_proj.dot(&g_proj).sqrt();
             if g_proj_norm <= self.tolerance {
@@ -6285,7 +6353,9 @@ where
 
     pub fn run_report(&mut self) -> OptimizationReport {
         let outcome = self.core.run(&mut self.obj_fn);
-        matrix_free_outcome_into_report(&self.core.x0, outcome)
+        let mut report = matrix_free_outcome_into_report(&self.core.x0, outcome);
+        report.diagnostics.final_trust_radius = self.core.last_trust_radius;
+        report
     }
 }
 
@@ -10547,6 +10617,58 @@ mod tests {
             err,
             MatrixFreeTrustRegionError::ObjectiveFailed { .. }
         ));
+    }
+
+    /// `MatrixFreeTrustRegion::run_report` must populate
+    /// `final_trust_radius` so callers can warm-start a follow-up
+    /// solve with the geometry the previous attempt already learned.
+    /// Without this, a budget-exhaustion retry would have to start
+    /// from the default radius again, paying for the trust-region
+    /// adaptation work twice.
+    #[test]
+    fn matrix_free_trust_region_report_populates_final_trust_radius() {
+        let n = 2;
+        let x0 = array![3.0, -1.5];
+        let mut solver = MatrixFreeTrustRegion::new(x0, OperatorQuadratic { n })
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_initial_trust_radius(0.25);
+        let report = solver.run_report();
+        assert_eq!(report.status, OptimizationStatus::Converged);
+        assert!(
+            report.diagnostics.final_trust_radius.is_some(),
+            "matrix-free TR run_report must thread final_trust_radius into diagnostics"
+        );
+        let r = report.diagnostics.final_trust_radius.unwrap();
+        assert!(
+            r.is_finite() && r > 0.0,
+            "final trust radius should be a finite positive value, got {r}"
+        );
+    }
+
+    /// `NewtonTrustRegion::run_report` must populate
+    /// `final_trust_radius` so dense ARC/Newton retries can also
+    /// warm-start. Mirrors the matrix-free contract.
+    #[test]
+    fn newton_trust_region_report_populates_final_trust_radius() {
+        let x0 = array![5.0, -2.0];
+        let mut solver = NewtonTrustRegion::new(x0, CountingQuadratic::new(false))
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_initial_trust_radius(0.5);
+        let report = solver.run_report();
+        assert!(report.diagnostics.final_trust_radius.is_some());
+    }
+
+    /// `Arc::run_report` must populate `final_regularization` (ARC's
+    /// trust-radius analogue) so cubic-regularization retries can
+    /// warm-start from the prior `sigma`.
+    #[test]
+    fn arc_report_populates_final_regularization() {
+        let x0 = array![2.0, -1.0];
+        let mut solver = super::Arc::new(x0, CountingQuadratic::new(false))
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_initial_regularization(0.7);
+        let report = solver.run_report();
+        assert!(report.diagnostics.final_regularization.is_some());
     }
 
     /// `run_report` must return `MaxIterations` when the solver runs
