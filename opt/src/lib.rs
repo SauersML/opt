@@ -2866,7 +2866,9 @@ impl NewtonTrustRegionCore {
             if use_mask {
                 masked_hv_inplace(h_model, &d, active, &mut bd);
             } else {
-                bd.assign(&h_model.dot(&d));
+                // In-place GEMV: `bd = 1.0 * h_model * d + 0.0 * bd`,
+                // no fresh `Array1` allocation per CG iter.
+                ndarray::linalg::general_mat_vec_mul(1.0, h_model, &d, 0.0, &mut bd);
             }
             let d_bd = d.dot(&bd);
 
@@ -3447,7 +3449,7 @@ impl ArcCore {
         if let Some(active) = active {
             masked_hv_inplace(h, s, active, &mut hs);
         } else {
-            hs.assign(&h.dot(s));
+            ndarray::linalg::general_mat_vec_mul(1.0, h, s, 0.0, &mut hs);
         }
         let s_norm = s.dot(s).sqrt();
         let cubic = (sigma / 3.0) * s_norm.powi(3);
@@ -3479,7 +3481,7 @@ impl ArcCore {
         if let Some(active) = active {
             masked_hv_inplace(h, &d, active, &mut hd);
         } else {
-            hd.assign(&h.dot(&d));
+            ndarray::linalg::general_mat_vec_mul(1.0, h, &d, 0.0, &mut hd);
         }
         let d_hd = d.dot(&hd);
         let c = sigma * g_norm.powi(3);
@@ -4489,7 +4491,7 @@ impl BfgsCore {
         if use_mask {
             masked_hv_inplace(b_inv, g, active, &mut h_g);
         } else {
-            h_g.assign(&b_inv.dot(g));
+            ndarray::linalg::general_mat_vec_mul(1.0, b_inv, g, 0.0, &mut h_g);
         }
         let p_b = -h_g;
         let p_b_norm = p_b.dot(&p_b).sqrt();
