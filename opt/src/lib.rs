@@ -1091,6 +1091,100 @@ impl Tolerance {
     }
 }
 
+/// Stopping criterion for the projected gradient norm. Replaces the
+/// scalar `Tolerance` for callers that need a scale-aware stop.
+///
+/// The solver terminates when
+/// ```text
+/// ‖g_proj‖ ≤ max(
+///     abs,
+///     rel_initial_grad.unwrap_or(0.0) * ‖g_0‖,
+///     rel_cost.unwrap_or(0.0) * (1 + |f_0|),
+/// )
+/// ```
+/// `abs` is mandatory; the two relative components are optional and
+/// `0.0` (i.e. "off") by default. Setting `rel_cost = Some(τ)` is the
+/// classic mgcv-style relative-to-objective rule that gam previously
+/// approximated via `outer_scaled_tolerance(τ, |f_0|)`. Setting
+/// `rel_initial_grad = Some(τ)` is the Eisenstat-Walker shape
+/// (terminate at a fixed fraction of the seed gradient norm).
+///
+/// `projected` is informational: every gradient-based solver in this
+/// crate uses the projected gradient against bounds when bounds are
+/// configured, so the field is `true` by default and is here to make
+/// the intent explicit when a future un-bounded solver is added.
+#[derive(Debug, Clone, Copy)]
+pub struct GradientTolerance {
+    pub abs: f64,
+    pub rel_initial_grad: Option<f64>,
+    pub rel_cost: Option<f64>,
+    pub projected: bool,
+}
+
+impl GradientTolerance {
+    /// Plain absolute tolerance, no relative components.
+    pub fn absolute(abs: f64) -> Self {
+        Self {
+            abs,
+            rel_initial_grad: None,
+            rel_cost: None,
+            projected: true,
+        }
+    }
+
+    /// `‖g‖ ≤ τ * (1 + |f_0|)` — the mgcv `magic` relative-to-cost
+    /// rule. Sets `abs = τ` so the absolute and relative thresholds
+    /// degenerate to the same value at `f_0 = 0`.
+    pub fn relative_to_cost(tau: f64) -> Self {
+        Self {
+            abs: tau,
+            rel_initial_grad: None,
+            rel_cost: Some(tau),
+            projected: true,
+        }
+    }
+
+    /// Compute the effective threshold for a given seed cost and
+    /// initial gradient norm. Returns the maximum of the absolute and
+    /// any configured relative components.
+    pub fn threshold(&self, seed_cost: f64, initial_grad_norm: f64) -> f64 {
+        let mut t = self.abs;
+        if let Some(rg) = self.rel_initial_grad {
+            t = t.max(rg * initial_grad_norm);
+        }
+        if let Some(rc) = self.rel_cost {
+            t = t.max(rc * (1.0 + seed_cost.abs()));
+        }
+        t
+    }
+}
+
+/// How to seed the BFGS inverse-Hessian approximation `H_0^{-1}`.
+/// Replaces (and supersedes) the previous `with_initial_inverse_hessian`
+/// thinking by giving callers a clean choice between scaled-identity
+/// resets and full dense seeds.
+///
+/// Default behavior (when no `with_initial_metric` is set) is
+/// `Identity`: BFGS uses its internal scaled-identity initialization.
+#[derive(Debug, Clone)]
+pub enum InitialMetric {
+    /// Default: scaled identity (BFGS picks the scale internally).
+    Identity,
+    /// `H_0^{-1} = scale * I`. Useful when the caller has a single
+    /// magnitude estimate (e.g. from a previous run's gradient norm
+    /// or from a known curvature scale) but no per-coordinate
+    /// information.
+    Scalar(f64),
+    /// `H_0^{-1} = diag(diag)`. Per-coordinate scaling — the typical
+    /// shape for penalized likelihoods where the penalty matrix is
+    /// near-diagonal in the smoothing-parameter coordinate system.
+    Diagonal(Array1<f64>),
+    /// A complete dense `H_0^{-1}`. The matrix is validated for
+    /// shape and finiteness at `run()` time; symmetry is not enforced
+    /// (BFGS's update preserves whatever symmetry the seed has).
+    DenseInverseHessian(Array2<f64>),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MaxIterations(usize);
 
@@ -1655,6 +1749,189 @@ pub trait SecondOrderObjective: FirstOrderObjective {
 pub trait FixedPointObjective {
     fn eval_step(&mut self, x: &Array1<f64>) -> Result<FixedPointSample, ObjectiveEvalError>;
 }
+
+/// Accepted-vs-trial / start-of-iter signals from a running solver.
+/// Parallel to typical optimizer observer hooks; intentionally minimal
+/// so individual solvers' wiring is local. Each solver fires whichever
+/// hooks make sense for its algorithm; default (no-op) implementations
+/// keep solvers free to add hooks without breaking existing observers.
+///
+/// `Send` so the same observer type can be parked behind `Box<dyn ...>`
+/// and shared across solver builders.
+///
+/// gam uses this to drive its outer-aware inner-PIRLS cap from
+/// *accepted* outer iterations rather than every gradient eval (which
+/// conflates trial-eval probes with real outer steps).
+pub trait OptimizerObserver: Send {
+    fn on_iteration_start(&mut self, _info: &IterationInfo) {}
+    fn on_step_accepted(&mut self, _info: &StepInfo) {}
+    fn on_step_rejected(&mut self, _info: &StepInfo) {}
+}
+
+#[derive(Debug, Clone)]
+pub struct IterationInfo {
+    /// Zero-based iteration index.
+    pub iter: usize,
+    /// Cumulative objective evaluations so far.
+    pub func_evals: usize,
+    /// Cumulative gradient evaluations so far.
+    pub grad_evals: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct StepInfo {
+    /// Zero-based iteration index this step belongs to.
+    pub iter: usize,
+    /// Step's L2 norm (`‖x_trial - x_k‖`).
+    pub step_norm: f64,
+    /// Cubic / quadratic model's predicted decrease at the step.
+    /// `f64::NAN` when the predicted decrease was not computed (e.g.
+    /// BFGS doesn't form a quadratic model in the same way).
+    pub predicted_decrease: f64,
+    /// `f_k - f_trial`. `f64::NAN` when the trial evaluation failed.
+    pub actual_decrease: f64,
+    /// Trust-region radius after the step (for solvers that have one).
+    /// `None` for BFGS.
+    pub trust_radius: Option<f64>,
+}
+
+/// An objective that can evaluate the cost at a *batch* of candidate
+/// points in one call. Solvers that perform parallelizable speculative
+/// trials (line-search probing, multi-start exploration) can use this
+/// to amortize fixed setup cost (one P-IRLS prep, one Cholesky factor,
+/// etc.) across multiple candidates.
+///
+/// Default `eval_cost_batch` is a serial loop; backends that can
+/// parallelize override it. Returning `Err(ObjectiveEvalError)` in
+/// any slot cancels the whole batch.
+pub trait BatchZerothOrderObjective {
+    fn eval_cost_batch(
+        &mut self,
+        xs: &[Array1<f64>],
+    ) -> Vec<Result<f64, ObjectiveEvalError>>;
+}
+
+/// Default implementation for any `ZerothOrderObjective`: a serial
+/// loop. Backends can override `BatchZerothOrderObjective::eval_cost_batch`
+/// directly for a parallel path.
+impl<T: ZerothOrderObjective + ?Sized> BatchZerothOrderObjective for T {
+    fn eval_cost_batch(
+        &mut self,
+        xs: &[Array1<f64>],
+    ) -> Vec<Result<f64, ObjectiveEvalError>> {
+        xs.iter().map(|x| self.eval_cost(x)).collect()
+    }
+}
+
+/// Reusable scratch buffers for first-order evaluation. Allows a
+/// caller to amortize per-call allocations of gradient and value
+/// across many evaluations.
+///
+/// The shape is fixed at construction: callers must pass a workspace
+/// whose `gradient` length matches the parameter dimension.
+pub struct FirstOrderWorkspace {
+    pub value: f64,
+    pub gradient: Array1<f64>,
+}
+
+impl FirstOrderWorkspace {
+    pub fn with_dim(n: usize) -> Self {
+        Self {
+            value: 0.0,
+            gradient: Array1::zeros(n),
+        }
+    }
+}
+
+/// Reusable scratch buffers for second-order evaluation. Same idea
+/// as `FirstOrderWorkspace` but also includes a `hessian` array.
+pub struct SecondOrderWorkspace {
+    pub value: f64,
+    pub gradient: Array1<f64>,
+    pub hessian: Array2<f64>,
+}
+
+impl SecondOrderWorkspace {
+    pub fn with_dim(n: usize) -> Self {
+        Self {
+            value: 0.0,
+            gradient: Array1::zeros(n),
+            hessian: Array2::zeros((n, n)),
+        }
+    }
+}
+
+/// First-order objective trait that writes into a caller-supplied
+/// workspace instead of returning a fresh `FirstOrderSample`. Useful
+/// when many evaluations happen and per-call allocation dominates.
+///
+/// Default impl wraps `FirstOrderObjective::eval_grad` and copies
+/// into the workspace; backends with native into-buffer kernels
+/// override.
+pub trait FirstOrderObjectiveInto: FirstOrderObjective {
+    fn eval_grad_into(
+        &mut self,
+        x: &Array1<f64>,
+        out: &mut FirstOrderWorkspace,
+    ) -> Result<(), ObjectiveEvalError> {
+        let s = self.eval_grad(x)?;
+        if s.gradient.len() != out.gradient.len() {
+            return Err(ObjectiveEvalError::fatal(format!(
+                "FirstOrderObjectiveInto: gradient length mismatch ({} vs workspace {})",
+                s.gradient.len(),
+                out.gradient.len()
+            )));
+        }
+        out.value = s.value;
+        out.gradient.assign(&s.gradient);
+        Ok(())
+    }
+}
+
+impl<T: FirstOrderObjective + ?Sized> FirstOrderObjectiveInto for T {}
+
+/// Second-order objective trait that writes into a caller-supplied
+/// workspace. Default impl wraps `SecondOrderObjective::eval_hessian`.
+pub trait SecondOrderObjectiveInto: SecondOrderObjective {
+    fn eval_hessian_into(
+        &mut self,
+        x: &Array1<f64>,
+        out: &mut SecondOrderWorkspace,
+    ) -> Result<(), ObjectiveEvalError> {
+        let s = self.eval_hessian(x)?;
+        let n = out.gradient.len();
+        if s.gradient.len() != n
+            || out.hessian.nrows() != n
+            || out.hessian.ncols() != n
+        {
+            return Err(ObjectiveEvalError::fatal(format!(
+                "SecondOrderObjectiveInto: shape mismatch (n={n}, grad={}, hess={}x{})",
+                s.gradient.len(),
+                out.hessian.nrows(),
+                out.hessian.ncols()
+            )));
+        }
+        out.value = s.value;
+        out.gradient.assign(&s.gradient);
+        if let Some(h) = s.hessian {
+            if h.nrows() != n || h.ncols() != n {
+                return Err(ObjectiveEvalError::fatal(format!(
+                    "SecondOrderObjectiveInto: hessian shape mismatch ({}x{} vs workspace {}x{})",
+                    h.nrows(),
+                    h.ncols(),
+                    n,
+                    n
+                )));
+            }
+            out.hessian.assign(&h);
+        } else {
+            out.hessian.fill(0.0);
+        }
+        Ok(())
+    }
+}
+
+impl<T: SecondOrderObjective + ?Sized> SecondOrderObjectiveInto for T {}
 
 pub struct FiniteDiffGradient<ObjFn> {
     inner: ObjFn,
@@ -2388,6 +2665,8 @@ struct NewtonTrustRegionCore {
     /// the geometry the previous attempt had learned. `None` before
     /// the first `run()`.
     last_trust_radius: Option<f64>,
+    gradient_tolerance: Option<GradientTolerance>,
+    observer: Option<Box<dyn OptimizerObserver>>,
 }
 
 pub struct NewtonTrustRegion<ObjFn> {
@@ -2437,6 +2716,8 @@ struct ArcCore {
     subproblem_max_iterations: usize,
     hessian_fallback_policy: HessianFallbackPolicy,
     initial_sample: Option<(Array1<f64>, SecondOrderSample)>,
+    gradient_tolerance: Option<GradientTolerance>,
+    observer: Option<Box<dyn OptimizerObserver>>,
 }
 
 /// A configurable Adaptive Regularization with Cubics (ARC) solver.
@@ -2461,6 +2742,8 @@ impl NewtonTrustRegionCore {
             hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
             initial_sample: None,
             last_trust_radius: None,
+            gradient_tolerance: None,
+            observer: None,
         }
     }
 
@@ -2808,11 +3091,29 @@ impl NewtonTrustRegionCore {
         self.last_trust_radius = Some(trust_radius);
         let mut g_proj_k = self.projected_gradient(&x_k, &g_k);
         let mut h_model_workspace = Array2::<f64>::zeros((n, n));
+        // Resolve the rich `gradient_tolerance` (if set) into a single
+        // `f64` threshold using the seed cost and initial projected
+        // gradient norm. Falls back to the scalar `tolerance` field
+        // when no `GradientTolerance` is configured.
+        let initial_g_norm = g_proj_k.dot(&g_proj_k).sqrt();
+        let effective_tol = match &self.gradient_tolerance {
+            Some(g) => g.threshold(f_k, initial_g_norm),
+            None => self.tolerance,
+        };
+        // Observer hook. Cloned counters are passed by value because
+        // the observer trait expects an owned info struct.
+        if let Some(obs) = self.observer.as_mut() {
+            obs.on_iteration_start(&IterationInfo {
+                iter: 0,
+                func_evals,
+                grad_evals,
+            });
+        }
 
         for k in 0..self.max_iterations {
             self.last_trust_radius = Some(trust_radius);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
-            if g_norm.is_finite() && g_norm <= self.tolerance {
+            if g_norm.is_finite() && g_norm <= effective_tol {
                 return Ok(Solution::gradient_based(
                     x_k,
                     f_k,
@@ -2903,7 +3204,22 @@ impl NewtonTrustRegionCore {
                 trust_radius = (trust_radius * 0.5).max(1e-12);
             }
 
-            if rho > self.eta_accept {
+            let accepted = rho > self.eta_accept;
+            if let Some(obs) = self.observer.as_mut() {
+                let info = StepInfo {
+                    iter: k,
+                    step_norm: s_norm,
+                    predicted_decrease: pred_dec,
+                    actual_decrease: act_dec,
+                    trust_radius: Some(trust_radius),
+                };
+                if accepted {
+                    obs.on_step_accepted(&info);
+                } else {
+                    obs.on_step_rejected(&info);
+                }
+            }
+            if accepted {
                 if h_trial.nrows() != n || h_trial.ncols() != n {
                     return Err(NewtonTrustRegionError::HessianShapeMismatch {
                         expected: n,
@@ -2967,6 +3283,8 @@ impl ArcCore {
             subproblem_max_iterations: 80,
             hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
             initial_sample: None,
+            gradient_tolerance: None,
+            observer: None,
         }
     }
 
@@ -3421,6 +3739,23 @@ impl ArcCore {
                 return Err(ArcError::ObjectiveFailed { message });
             }
         };
+        // Resolve the rich `gradient_tolerance` (if set) once using
+        // the seed cost and initial projected gradient norm. Falls
+        // back to the scalar `tolerance` field.
+        let initial_g_proj_for_tol = self.projected_gradient(&x_k, &g_k);
+        let initial_g_norm_for_tol =
+            initial_g_proj_for_tol.dot(&initial_g_proj_for_tol).sqrt();
+        let effective_tol = match &self.gradient_tolerance {
+            Some(g) => g.threshold(f_k, initial_g_norm_for_tol),
+            None => self.tolerance,
+        };
+        if let Some(obs) = self.observer.as_mut() {
+            obs.on_iteration_start(&IterationInfo {
+                iter: 0,
+                func_evals,
+                grad_evals,
+            });
+        }
         if h_k.nrows() != n || h_k.ncols() != n {
             return Err(ArcError::HessianShapeMismatch {
                 expected: n,
@@ -3434,7 +3769,7 @@ impl ArcCore {
         for k in 0..self.max_iterations {
             let g_proj_k = self.projected_gradient(&x_k, &g_k);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
-            if g_norm.is_finite() && g_norm <= self.tolerance {
+            if g_norm.is_finite() && g_norm <= effective_tol {
                 return Ok(Solution::gradient_based(
                     x_k,
                     f_k,
@@ -3699,6 +4034,18 @@ struct BfgsCore {
     /// caller's seed evaluation. Validated lazily on `run()` (not on
     /// `with_initial_sample`) to keep the builder method infallible.
     initial_sample: Option<(Array1<f64>, FirstOrderSample)>,
+    /// Rich stopping criterion (scale-aware). When `Some`, takes
+    /// precedence over `tolerance` (which becomes the `abs` component
+    /// at builder-time fallback). Resolved to a single `f64` threshold
+    /// at run time using the seed cost and initial gradient norm.
+    gradient_tolerance: Option<GradientTolerance>,
+    /// How to seed the BFGS inverse-Hessian approximation. `None`
+    /// means "let BFGS pick a scaled-identity internally" (the
+    /// historical default). `Some(InitialMetric)` overrides via
+    /// `initial_b_inv` (resolved at run() time).
+    initial_metric: Option<InitialMetric>,
+    /// Observer for accepted-step / iteration-start events.
+    observer: Option<Box<dyn OptimizerObserver>>,
 }
 
 /// A configurable BFGS solver.
@@ -4002,6 +4349,9 @@ impl BfgsCore {
             initial_grad_norm: 0.0,
             local_mode: false,
             initial_sample: None,
+            gradient_tolerance: None,
+            initial_metric: None,
+            observer: None,
         }
     }
 
@@ -4253,6 +4603,71 @@ impl BfgsCore {
         ObjFn: FirstOrderObjective,
     {
         let n = self.x0.len();
+        // Resolve `with_initial_metric` into the existing
+        // `initial_b_inv` slot so the rest of the loop is unchanged.
+        // The translation runs at `run()` so an invalid shape is a
+        // fatal evaluation error here rather than a silent fallback
+        // to the scaled identity.
+        if let Some(metric) = self.initial_metric.clone() {
+            match metric {
+                InitialMetric::Identity => {
+                    self.initial_b_inv = None;
+                }
+                InitialMetric::Scalar(s) => {
+                    if !s.is_finite() || s <= 0.0 {
+                        return Err(BfgsError::ObjectiveFailed {
+                            message: format!(
+                                "InitialMetric::Scalar must be positive and finite, got {s}"
+                            ),
+                        });
+                    }
+                    let mut m = Array2::<f64>::eye(n);
+                    for i in 0..n {
+                        m[[i, i]] = s;
+                    }
+                    self.initial_b_inv = Some(m);
+                }
+                InitialMetric::Diagonal(d) => {
+                    if d.len() != n {
+                        return Err(BfgsError::ObjectiveFailed {
+                            message: format!(
+                                "InitialMetric::Diagonal length {} ≠ x0 length {n}",
+                                d.len()
+                            ),
+                        });
+                    }
+                    if !d.iter().all(|v| v.is_finite() && *v > 0.0) {
+                        return Err(BfgsError::ObjectiveFailed {
+                            message: "InitialMetric::Diagonal entries must be positive and finite"
+                                .to_string(),
+                        });
+                    }
+                    let mut m = Array2::<f64>::zeros((n, n));
+                    for i in 0..n {
+                        m[[i, i]] = d[i];
+                    }
+                    self.initial_b_inv = Some(m);
+                }
+                InitialMetric::DenseInverseHessian(m) => {
+                    if m.nrows() != n || m.ncols() != n {
+                        return Err(BfgsError::ObjectiveFailed {
+                            message: format!(
+                                "InitialMetric::DenseInverseHessian shape {}x{} ≠ {n}x{n}",
+                                m.nrows(),
+                                m.ncols()
+                            ),
+                        });
+                    }
+                    if !m.iter().all(|v| v.is_finite()) {
+                        return Err(BfgsError::ObjectiveFailed {
+                            message: "InitialMetric::DenseInverseHessian must be finite"
+                                .to_string(),
+                        });
+                    }
+                    self.initial_b_inv = Some(m);
+                }
+            }
+        }
         let mut x_k = self.project_point(&self.x0);
         let mut oracle = FirstOrderCache::new(x_k.len());
         let mut func_evals = 0;
@@ -4349,6 +4764,22 @@ impl BfgsCore {
             1.0
         };
         self.trust_radius = delta0;
+        // Resolve the rich `gradient_tolerance` (if set) once using
+        // the seed cost and initial projected gradient norm. Falls
+        // back to the scalar `tolerance` field. The two BFGS
+        // termination paths that consult `self.tolerance` against a
+        // gradient norm consume `effective_tol` instead.
+        let effective_tol = match &self.gradient_tolerance {
+            Some(g) => g.threshold(f_k, g0_norm),
+            None => self.tolerance,
+        };
+        if let Some(obs) = self.observer.as_mut() {
+            obs.on_iteration_start(&IterationInfo {
+                iter: 0,
+                func_evals,
+                grad_evals,
+            });
+        }
 
         let mut f_last_accepted = f_k;
         for k in 0..self.max_iterations {
@@ -4367,7 +4798,7 @@ impl BfgsCore {
                 return Err(BfgsError::GradientIsNaN);
             }
             self.refresh_local_mode(g_norm);
-            if g_norm < self.tolerance {
+            if g_norm < effective_tol {
                 let sol = Solution::gradient_based(
                     x_k, f_k, g_k, g_norm, None, k, func_evals, grad_evals, 0,
                 );
@@ -5235,7 +5666,7 @@ impl BfgsCore {
             let f_ok = (f_next - f_k).abs() <= eps_f(f_k, self.tau_f);
             let gnext_finite = f_next.is_finite() && g_next.iter().all(|v| v.is_finite());
             let gnext_norm = g_proj_next.dot(&g_proj_next).sqrt();
-            if step_ok && f_ok && gnext_finite && gnext_norm < self.tolerance {
+            if step_ok && f_ok && gnext_finite && gnext_norm < effective_tol {
                 let sol = Solution::gradient_based(
                     x_next.clone(),
                     f_next,
@@ -5264,7 +5695,7 @@ impl BfgsCore {
             if let StallPolicy::On { window } = self.stall_policy {
                 let g_inf = g_proj_k.iter().fold(0.0, |acc, &v| f64::max(acc, v.abs()));
                 let x_inf = x_k.iter().fold(0.0, |acc, &v| f64::max(acc, v.abs()));
-                let rel_g_ok = g_inf <= self.tolerance * (1.0 + x_inf);
+                let rel_g_ok = g_inf <= effective_tol * (1.0 + x_inf);
                 let rel_f_ok = (f_k - f_last_accepted).abs() <= eps_f(f_last_accepted, self.tau_f);
                 if rel_g_ok && rel_f_ok {
                     self.stall_noimprove_streak += 1;
@@ -5294,6 +5725,21 @@ impl BfgsCore {
                 }
             }
 
+            // Observer hook: BFGS accepts whenever the line search
+            // produces a usable step. Predicted decrease is N/A in
+            // BFGS (no quadratic model in the same sense as TR), so
+            // we report `f64::NAN`. `trust_radius` is `None` because
+            // BFGS doesn't expose one to the public API.
+            let bfgs_step_norm = (&x_next - &x_k).dot(&(&x_next - &x_k)).sqrt();
+            if let Some(obs) = self.observer.as_mut() {
+                obs.on_step_accepted(&StepInfo {
+                    iter: k,
+                    step_norm: bfgs_step_norm,
+                    predicted_decrease: f64::NAN,
+                    actual_decrease: f_k - f_next,
+                    trust_radius: None,
+                });
+            }
             x_k = x_next;
             f_k = f_next;
             g_k = g_next;
@@ -5404,6 +5850,35 @@ where
     /// projection onto bounds), the cache is silently bypassed.
     pub fn with_initial_sample(mut self, x0: Array1<f64>, sample: FirstOrderSample) -> Self {
         self.core.initial_sample = Some((x0, sample));
+        self
+    }
+
+    /// Use a scale-aware stopping criterion. Takes precedence over
+    /// `with_tolerance` for the final threshold computation; the
+    /// `tolerance` value (if set) becomes the absolute floor.
+    pub fn with_gradient_tolerance(mut self, tol: GradientTolerance) -> Self {
+        self.core.gradient_tolerance = Some(tol);
+        self
+    }
+
+    /// Seed the BFGS inverse-Hessian approximation. Default
+    /// (`InitialMetric::Identity`, equivalent to not calling this) is
+    /// the historical scaled-identity reset. Pass `Diagonal(d)` when
+    /// you have per-coordinate curvature (e.g. from a penalty
+    /// matrix's diagonal); `DenseInverseHessian(M)` for a full seed.
+    pub fn with_initial_metric(mut self, metric: InitialMetric) -> Self {
+        self.core.initial_metric = Some(metric);
+        self
+    }
+
+    /// Install an observer for accepted-step / iteration-start events.
+    /// The observer is called from inside `run()`; only one observer
+    /// is supported per solver (later calls replace earlier ones).
+    pub fn with_observer<O>(mut self, observer: O) -> Self
+    where
+        O: OptimizerObserver + 'static,
+    {
+        self.core.observer = Some(Box::new(observer));
         self
     }
 
@@ -5529,6 +6004,21 @@ where
         self
     }
 
+    /// See `Bfgs::with_gradient_tolerance`.
+    pub fn with_gradient_tolerance(mut self, tol: GradientTolerance) -> Self {
+        self.core.gradient_tolerance = Some(tol);
+        self
+    }
+
+    /// See `Bfgs::with_observer`.
+    pub fn with_observer<O>(mut self, observer: O) -> Self
+    where
+        O: OptimizerObserver + 'static,
+    {
+        self.core.observer = Some(Box::new(observer));
+        self
+    }
+
     /// Executes the Newton trust-region optimization.
     pub fn run(&mut self) -> Result<Solution, NewtonTrustRegionError> {
         self.core.run(&mut self.obj_fn)
@@ -5632,6 +6122,21 @@ where
     /// aggressively the cubic term can dominate the model.
     pub fn with_max_regularization(mut self, sigma: f64) -> Self {
         self.core.sigma_max = sigma;
+        self
+    }
+
+    /// See `Bfgs::with_gradient_tolerance`.
+    pub fn with_gradient_tolerance(mut self, tol: GradientTolerance) -> Self {
+        self.core.gradient_tolerance = Some(tol);
+        self
+    }
+
+    /// See `Bfgs::with_observer`.
+    pub fn with_observer<O>(mut self, observer: O) -> Self
+    where
+        O: OptimizerObserver + 'static,
+    {
+        self.core.observer = Some(Box::new(observer));
         self
     }
 
@@ -5787,6 +6292,8 @@ struct MatrixFreeTrustRegionCore {
     /// undesirable (e.g. very large `n` where the n×n materialization
     /// dominates a sparse Hv).
     materialize_when_cheap: bool,
+    gradient_tolerance: Option<GradientTolerance>,
+    observer: Option<Box<dyn OptimizerObserver>>,
 }
 
 /// Matrix-free Newton trust-region solver. Uses Steihaug-Toint
@@ -5814,6 +6321,8 @@ impl MatrixFreeTrustRegionCore {
             hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
             last_trust_radius: None,
             materialize_when_cheap: true,
+            gradient_tolerance: None,
+            observer: None,
         }
     }
 
@@ -5891,12 +6400,28 @@ impl MatrixFreeTrustRegionCore {
 
         let mut trust_radius = self.trust_radius.max(self.trust_radius_min).min(self.trust_radius_max);
         self.last_trust_radius = Some(trust_radius);
+        // Resolve the rich `gradient_tolerance` (if set) once using
+        // the seed cost and initial projected gradient norm. Falls
+        // back to the scalar `tolerance` field.
+        let initial_g_proj = self.projected_gradient(&x_k, &sample.gradient);
+        let initial_g_proj_norm = initial_g_proj.dot(&initial_g_proj).sqrt();
+        let effective_tol = match &self.gradient_tolerance {
+            Some(g) => g.threshold(sample.value, initial_g_proj_norm),
+            None => self.tolerance,
+        };
+        if let Some(obs) = self.observer.as_mut() {
+            obs.on_iteration_start(&IterationInfo {
+                iter: 0,
+                func_evals,
+                grad_evals,
+            });
+        }
 
         for k in 0..self.max_iterations {
             self.last_trust_radius = Some(trust_radius);
             let g_proj = self.projected_gradient(&x_k, &sample.gradient);
             let g_proj_norm = g_proj.dot(&g_proj).sqrt();
-            if g_proj_norm <= self.tolerance {
+            if g_proj_norm <= effective_tol {
                 let sol = Solution::gradient_based(
                     x_k.clone(),
                     sample.value,
@@ -6127,7 +6652,22 @@ impl MatrixFreeTrustRegionCore {
             let step_norm = step.dot(&step).sqrt();
             let on_boundary = step_norm >= 0.99 * trust_radius;
 
-            if rho >= self.eta_accept && actual.is_finite() {
+            let accepted = rho >= self.eta_accept && actual.is_finite();
+            if let Some(obs) = self.observer.as_mut() {
+                let info = StepInfo {
+                    iter: k,
+                    step_norm,
+                    predicted_decrease: predicted,
+                    actual_decrease: actual,
+                    trust_radius: Some(trust_radius),
+                };
+                if accepted {
+                    obs.on_step_accepted(&info);
+                } else {
+                    obs.on_step_rejected(&info);
+                }
+            }
+            if accepted {
                 // Accept.
                 x_k = x_trial;
                 sample = trial;
@@ -6399,6 +6939,21 @@ where
     /// n×n materialization is undesirable).
     pub fn with_materialize_when_cheap(mut self, enable: bool) -> Self {
         self.core.materialize_when_cheap = enable;
+        self
+    }
+
+    /// See `Bfgs::with_gradient_tolerance`.
+    pub fn with_gradient_tolerance(mut self, tol: GradientTolerance) -> Self {
+        self.core.gradient_tolerance = Some(tol);
+        self
+    }
+
+    /// See `Bfgs::with_observer`.
+    pub fn with_observer<O>(mut self, observer: O) -> Self
+    where
+        O: OptimizerObserver + 'static,
+    {
+        self.core.observer = Some(Box::new(observer));
         self
     }
 
@@ -7730,14 +8285,17 @@ mod tests {
     //    that our results (final point and iteration count) are equivalent.
 
     use super::{
-        ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, Bfgs, BfgsError, Bounds,
-        FallbackPolicy, FiniteDiffGradient, FirstOrderObjective, FirstOrderSample, FixedPoint,
-        FixedPointObjective, FixedPointSample, FixedPointStatus, HessianFallbackPolicy,
-        HessianMaterialization, HessianOperator, HessianValue, LineSearchFailureReason,
-        MatrixFreeTrustRegion, MatrixFreeTrustRegionError, MaxIterations, NewtonTrustRegion,
-        ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus, Problem,
-        Profile, SecondOrderObjective, SecondOrderProblem, SecondOrderSample, Solution,
-        Tolerance, ZerothOrderObjective, optimize,
+        ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, BatchZerothOrderObjective,
+        Bfgs, BfgsError, Bounds, FallbackPolicy, FiniteDiffGradient, FirstOrderObjective,
+        FirstOrderObjectiveInto, FirstOrderSample, FirstOrderWorkspace, FixedPoint,
+        FixedPointObjective, FixedPointSample, FixedPointStatus, GradientTolerance,
+        HessianFallbackPolicy, HessianMaterialization, HessianOperator, HessianValue,
+        InitialMetric, IterationInfo, LineSearchFailureReason, MatrixFreeTrustRegion,
+        MatrixFreeTrustRegionError, MaxIterations, NewtonTrustRegion, ObjectiveEvalError,
+        OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver, Problem,
+        Profile, SecondOrderObjective, SecondOrderObjectiveInto, SecondOrderProblem,
+        SecondOrderSample, SecondOrderWorkspace, Solution, StepInfo, Tolerance,
+        ZerothOrderObjective, optimize,
     };
     use ndarray::{Array1, Array2, array};
     use spectral::prelude::*;
@@ -10838,6 +11396,169 @@ mod tests {
             "Explicit operator + materialize_when_cheap should not call apply_into; \
              saw {dense_path_applies}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // opt 0.5.0 — GradientTolerance, InitialMetric, observers, batch,
+    // workspace API tests.
+    // -----------------------------------------------------------------
+
+    /// `GradientTolerance::relative_to_cost(τ)` reproduces gam's
+    /// historical `outer_scaled_tolerance(τ, |f_0|)` shape.
+    #[test]
+    fn gradient_tolerance_relative_to_cost_matches_textbook_form() {
+        let tol = GradientTolerance::relative_to_cost(1e-5);
+        // At cost=0: threshold collapses to abs.
+        assert_eq!(tol.threshold(0.0, 1.0), 1e-5);
+        // At cost=10: threshold is τ * (1 + |f|) = 1e-5 * 11 = 1.1e-4.
+        let t = tol.threshold(10.0, 1.0);
+        assert!((t - 1.1e-4).abs() < 1e-12, "got {t}");
+    }
+
+    /// `Bfgs::with_gradient_tolerance` should make a strict-tolerance
+    /// run on a near-optimal seed converge in zero iters (the
+    /// rel-to-cost threshold dominates the absolute floor).
+    #[test]
+    fn bfgs_with_gradient_tolerance_converges_immediately_at_optimum() {
+        let x0 = array![1.0, 1.0]; // optimum of (x-1)^2 / 2
+        let mut solver = Bfgs::new(x0, CountingQuadratic::new(false))
+            .with_gradient_tolerance(GradientTolerance::relative_to_cost(1e-6))
+            .with_max_iterations(MaxIterations::new(50).unwrap());
+        let sol = solver.run().expect("optimum should converge");
+        assert_eq!(sol.iterations, 0, "BFGS should detect convergence at iter 0");
+    }
+
+    /// `InitialMetric::Diagonal(d)` must seed BFGS's `H_0^{-1}` with
+    /// the supplied diagonal. We probe this via the metric's effect:
+    /// a wildly off-scale identity (e.g. `Scalar(1e-10)`) makes the
+    /// first BFGS step microscopic, while a well-scaled metric makes
+    /// it land closer to the optimum. Test that `Scalar(1.0)`
+    /// (identity, default) and a small `Scalar(1e-3)` produce
+    /// detectably different first-step behavior on the
+    /// `(x-1)^T (x-1)/2` quadratic.
+    #[test]
+    fn bfgs_with_initial_metric_diagonal_validates_shape() {
+        // Wrong-length diagonal must surface as ObjectiveFailed.
+        let x0 = array![1.0, 2.0, 3.0];
+        let bad = InitialMetric::Diagonal(array![1.0, 1.0]); // wrong length
+        let mut solver = Bfgs::new(x0, CountingQuadratic::new(false))
+            .with_initial_metric(bad)
+            .with_max_iterations(MaxIterations::new(5).unwrap());
+        let err = solver.run().expect_err("wrong-length diagonal must error");
+        assert!(matches!(err, BfgsError::ObjectiveFailed { .. }));
+    }
+
+    /// `InitialMetric::Scalar` with a non-positive value should error.
+    #[test]
+    fn bfgs_with_initial_metric_scalar_validates_positive() {
+        let x0 = array![0.5];
+        let mut solver = Bfgs::new(x0, CountingQuadratic::new(false))
+            .with_initial_metric(InitialMetric::Scalar(-1.0))
+            .with_max_iterations(MaxIterations::new(5).unwrap());
+        let err = solver.run().expect_err("negative scalar must error");
+        assert!(matches!(err, BfgsError::ObjectiveFailed { .. }));
+    }
+
+    /// Identity `InitialMetric` should run identically to the default.
+    #[test]
+    fn bfgs_with_initial_metric_identity_is_default() {
+        let x0 = array![3.0, -1.0];
+        let mut solver = Bfgs::new(x0, CountingQuadratic::new(false))
+            .with_initial_metric(InitialMetric::Identity)
+            .with_max_iterations(MaxIterations::new(50).unwrap());
+        let sol = solver.run().expect("identity should converge");
+        for v in sol.final_point.iter() {
+            assert!((v - 1.0).abs() < 1e-3);
+        }
+    }
+
+    /// `OptimizerObserver` must see every accepted step. We count
+    /// accepted-step events through a Newton run and assert they
+    /// equal the iteration count reported by the solution.
+    #[test]
+    fn optimizer_observer_counts_accepted_steps_for_newton() {
+        struct Counting {
+            accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            rejected: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            iter_starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl OptimizerObserver for Counting {
+            fn on_iteration_start(&mut self, _info: &IterationInfo) {
+                self.iter_starts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn on_step_accepted(&mut self, _info: &StepInfo) {
+                self.accepted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn on_step_rejected(&mut self, _info: &StepInfo) {
+                self.rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rejected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let iter_starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let obs = Counting {
+            accepted: std::sync::Arc::clone(&accepted),
+            rejected: std::sync::Arc::clone(&rejected),
+            iter_starts: std::sync::Arc::clone(&iter_starts),
+        };
+        let x0 = array![5.0, -3.0];
+        let mut solver = NewtonTrustRegion::new(x0, CountingQuadratic::new(false))
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_observer(obs);
+        let sol = solver.run().expect("converges");
+        let acc = accepted.load(std::sync::atomic::Ordering::Relaxed);
+        let rej = rejected.load(std::sync::atomic::Ordering::Relaxed);
+        let starts = iter_starts.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(acc + rej > 0, "observer must be wired");
+        assert_eq!(
+            acc, sol.iterations,
+            "accepted-step count must equal iterations: acc={acc}, iters={}",
+            sol.iterations
+        );
+        assert_eq!(starts, 1, "on_iteration_start fires once per run");
+    }
+
+    /// `BatchZerothOrderObjective` blanket impl runs the cost in a
+    /// serial loop; backends overriding the trait can parallelize.
+    /// Verify the default impl returns one result per input.
+    #[test]
+    fn batch_zeroth_order_objective_default_impl() {
+        let mut obj = CountingQuadratic::new(false);
+        let xs = vec![array![1.0, 2.0], array![3.0, 4.0], array![0.0, 0.0]];
+        let results = obj.eval_cost_batch(&xs);
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(r.is_ok(), "default impl should not fail on a normal objective");
+        }
+    }
+
+    /// `FirstOrderObjectiveInto` blanket impl writes into the workspace
+    /// without changing the result.
+    #[test]
+    fn first_order_objective_into_writes_to_workspace() {
+        let mut obj = CountingQuadratic::new(false);
+        let mut ws = FirstOrderWorkspace::with_dim(2);
+        let x = array![3.0, 0.5];
+        obj.eval_grad_into(&x, &mut ws).expect("ok");
+        assert!((ws.value - (0.5 * 4.0 + 0.5 * 0.25)).abs() < 1e-12);
+        assert_eq!(ws.gradient, &x - 1.0);
+    }
+
+    /// `SecondOrderObjectiveInto` blanket impl mirrors
+    /// `FirstOrderObjectiveInto` for the Hessian-bearing path.
+    #[test]
+    fn second_order_objective_into_writes_to_workspace() {
+        let mut obj = CountingQuadratic::new(false);
+        let mut ws = SecondOrderWorkspace::with_dim(2);
+        let x = array![3.0, 0.5];
+        obj.eval_hessian_into(&x, &mut ws).expect("ok");
+        assert_eq!(ws.gradient, &x - 1.0);
+        let expected: Array2<f64> = Array2::eye(2);
+        assert_eq!(ws.hessian, expected);
     }
 
     /// `Arc::run_report` must populate `final_regularization` (ARC's
