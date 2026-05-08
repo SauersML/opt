@@ -5773,6 +5773,20 @@ struct MatrixFreeTrustRegionCore {
     /// follow-up solve with the geometry the previous attempt
     /// already learned. `None` before the first `run()`.
     last_trust_radius: Option<f64>,
+    /// When the per-iteration `HessianValue::Operator(op)` advertises
+    /// `HessianMaterialization::Explicit` or `BatchedHvp`, materialize
+    /// once per outer iter and run the inner Steihaug-Toint CG against
+    /// the dense Hessian. This avoids paying one `apply_into` call per
+    /// CG iteration when the operator can produce a dense matrix in
+    /// roughly the same cost as a single (batched) Hv probe — the
+    /// classic case is a backend that propagates basis vectors in
+    /// parallel through one BLAS-3 multiply.
+    ///
+    /// Default `true`. Set to `false` (via
+    /// `with_materialize_when_cheap`) when the dense allocation is
+    /// undesirable (e.g. very large `n` where the n×n materialization
+    /// dominates a sparse Hv).
+    materialize_when_cheap: bool,
 }
 
 /// Matrix-free Newton trust-region solver. Uses Steihaug-Toint
@@ -5799,6 +5813,7 @@ impl MatrixFreeTrustRegionCore {
             initial_sample: None,
             hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
             last_trust_radius: None,
+            materialize_when_cheap: true,
         }
     }
 
@@ -5897,6 +5912,13 @@ impl MatrixFreeTrustRegionCore {
             }
 
             // Materialize a Hessian operator handle for the CG step.
+            // For operators that advertise cheap materialization
+            // (`Explicit` or `BatchedHvp`), materialize once and use
+            // the dense form for all CG iterations of this outer iter.
+            // The Hv-only path costs one `apply_into` per CG step;
+            // dense costs one allocation up front and reuses it. For
+            // backends with a fast batched mul_mat (BLAS-3, tangent
+            // propagation) this is consistently faster.
             let op_handle = match &sample.hessian {
                 HessianValue::Operator(op) => {
                     if op.dim() != n {
@@ -5905,7 +5927,40 @@ impl MatrixFreeTrustRegionCore {
                             got: op.dim(),
                         });
                     }
-                    OperatorHandle::Borrowed(StdArc::clone(op))
+                    let prefer_dense = self.materialize_when_cheap
+                        && matches!(
+                            op.materialization(),
+                            HessianMaterialization::Explicit
+                                | HessianMaterialization::BatchedHvp
+                        );
+                    if prefer_dense {
+                        match op.materialize_dense() {
+                            Ok(dense) => {
+                                if dense.nrows() != n || dense.ncols() != n {
+                                    // Materialization shape mismatch:
+                                    // surface as op dim mismatch so the
+                                    // caller sees a useful diagnostic.
+                                    return Err(
+                                        MatrixFreeTrustRegionError::OperatorDimensionMismatch {
+                                            expected: n,
+                                            got: dense.nrows(),
+                                        },
+                                    );
+                                }
+                                OperatorHandle::DenseAdapter(dense)
+                            }
+                            Err(_) => {
+                                // The operator declared cheap
+                                // materialization but failed to deliver.
+                                // Fall back to the Hv path rather than
+                                // aborting — the inner CG can still
+                                // make progress through `apply_into`.
+                                OperatorHandle::Borrowed(StdArc::clone(op))
+                            }
+                        }
+                    } else {
+                        OperatorHandle::Borrowed(StdArc::clone(op))
+                    }
                 }
                 HessianValue::Dense(h) => {
                     if h.nrows() != n || h.ncols() != n {
@@ -6332,6 +6387,18 @@ where
     /// Default `1.0` (n inner iterations); set higher when ill-conditioned.
     pub fn with_cg_max_iter_factor(mut self, factor: f64) -> Self {
         self.core.cg_max_iter_factor = factor;
+        self
+    }
+
+    /// Enable or disable the per-iter dense materialization path.
+    /// When `true` (default), an operator that advertises
+    /// `HessianMaterialization::Explicit` or `BatchedHvp` is
+    /// materialized once at the start of each outer iter and the
+    /// inner CG runs against the dense Hessian. Set to `false` to
+    /// always use the Hv-only path (for very large `n` where the
+    /// n×n materialization is undesirable).
+    pub fn with_materialize_when_cheap(mut self, enable: bool) -> Self {
+        self.core.materialize_when_cheap = enable;
         self
     }
 
@@ -10656,6 +10723,121 @@ mod tests {
             .with_initial_trust_radius(0.5);
         let report = solver.run_report();
         assert!(report.diagnostics.final_trust_radius.is_some());
+    }
+
+    /// When the operator advertises `HessianMaterialization::Explicit`,
+    /// `MatrixFreeTrustRegion` should materialize once per outer iter
+    /// and *not* loop `apply_into` for every CG step. We verify this
+    /// by counting `apply_into` calls: with materialization on, a
+    /// single-iter convergent run has zero Hv calls (CG runs entirely
+    /// against the dense matrix); with materialization off, every CG
+    /// step costs one `apply_into`.
+    #[test]
+    fn matrix_free_materializes_explicit_operator_once_per_iter() {
+        // `HessianOperator` requires `Send + Sync` so the counter
+        // lives in an `AtomicUsize` rather than a `Cell`.
+        struct CountingExplicitSync {
+            n: usize,
+            applies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl HessianOperator for CountingExplicitSync {
+            fn dim(&self) -> usize {
+                self.n
+            }
+            fn apply_into(
+                &self,
+                v: &Array1<f64>,
+                out: &mut Array1<f64>,
+            ) -> Result<(), ObjectiveEvalError> {
+                self.applies
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                out.assign(v);
+                Ok(())
+            }
+            fn materialization(&self) -> HessianMaterialization {
+                HessianMaterialization::Explicit
+            }
+            fn materialize_dense(&self) -> Result<Array2<f64>, ObjectiveEvalError> {
+                Ok(Array2::eye(self.n))
+            }
+        }
+
+        struct ExplicitObj {
+            n: usize,
+            applies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ZerothOrderObjective for ExplicitObj {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                Ok(0.5 * (x - 1.0).dot(&(x - 1.0)))
+            }
+        }
+        impl FirstOrderObjective for ExplicitObj {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                Ok(FirstOrderSample {
+                    value: 0.5 * (x - 1.0).dot(&(x - 1.0)),
+                    gradient: x - 1.0,
+                })
+            }
+        }
+        impl OperatorObjective for ExplicitObj {
+            fn eval_value_grad_op(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<OperatorSample, ObjectiveEvalError> {
+                Ok(OperatorSample {
+                    value: 0.5 * (x - 1.0).dot(&(x - 1.0)),
+                    gradient: x - 1.0,
+                    hessian: HessianValue::Operator(super::StdArc::new(CountingExplicitSync {
+                        n: self.n,
+                        applies: std::sync::Arc::clone(&self.applies),
+                    })),
+                })
+            }
+        }
+
+        let n = 3;
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut solver = MatrixFreeTrustRegion::new(
+            array![3.0, -1.0, 5.0],
+            ExplicitObj {
+                n,
+                applies: std::sync::Arc::clone(&counter),
+            },
+        )
+        .with_max_iterations(MaxIterations::new(20).unwrap())
+        .with_initial_trust_radius(20.0);
+        let _ = solver.run().expect("explicit-op convex problem should converge");
+        let dense_path_applies = counter.load(std::sync::atomic::Ordering::Relaxed);
+
+        // With materialization disabled, the inner CG calls
+        // `apply_into` at least once per CG step.
+        let counter2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut solver2 = MatrixFreeTrustRegion::new(
+            array![3.0, -1.0, 5.0],
+            ExplicitObj {
+                n,
+                applies: std::sync::Arc::clone(&counter2),
+            },
+        )
+        .with_max_iterations(MaxIterations::new(20).unwrap())
+        .with_initial_trust_radius(20.0)
+        .with_materialize_when_cheap(false);
+        let _ = solver2.run().expect("Hv path should also converge");
+        let hv_path_applies = counter2.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(
+            dense_path_applies < hv_path_applies,
+            "with_materialize_when_cheap(true) must save Hv applies; \
+             dense={dense_path_applies}, hv={hv_path_applies}"
+        );
+        assert_eq!(
+            dense_path_applies, 0,
+            "Explicit operator + materialize_when_cheap should not call apply_into; \
+             saw {dense_path_applies}"
+        );
     }
 
     /// `Arc::run_report` must populate `final_regularization` (ARC's
