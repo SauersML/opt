@@ -3862,6 +3862,38 @@ impl ArcCore {
         let mut model_failure_streak = 0usize;
         let mut h_model_workspace = Array2::<f64>::zeros((n, n));
 
+        // ── Cost-stagnation noise-floor detector ────────────────────────────
+        //
+        // ARC's stationarity criterion is `|g_proj| <= effective_tol`. With
+        // an objective whose evaluation has a noise floor (e.g. inner
+        // solver's β-precision propagating to outer LAML gradient), `|g|`
+        // oscillates above `effective_tol` indefinitely while `f_k`
+        // converges to its noise-limited value. Without this guard ARC
+        // burns through `max_iterations` evaluating essentially the same
+        // cost — at biobank-scale REML evaluations that is minutes of
+        // wasted work per fit.
+        //
+        // We declare `NumericallyConverged` once two coupled conditions
+        // hold for `STAGNATION_WINDOW` consecutive iterations:
+        //   (a) successive `f_k` values agree within a relative
+        //       tolerance scaled to the cost magnitude — the cost has
+        //       essentially stopped moving;
+        //   (b) `|g_proj|` has already dropped to a small fraction of
+        //       its initial value — the optimizer landed in the basin
+        //       of attraction of a stationary point before the noise
+        //       floor was reached.
+        //
+        // Both conditions are needed: (a) alone fires too early when an
+        // initial step rejects and f stays put; (b) alone fires when
+        // the optimizer is just starting and `g_norm` is naturally tiny
+        // because the seed is already near a flat plateau.
+        const STAGNATION_WINDOW: usize = 5;
+        const STAGNATION_TOL_F_REL: f64 = 1e-10;
+        const STAGNATION_GRAD_DROP_FACTOR: f64 = 1e-2;
+        const STAGNATION_MIN_ITERS: usize = 5;
+        let mut cost_stagnation_streak: usize = 0;
+        let mut f_k_iter_prev: f64 = f_k;
+
         for k in 0..self.max_iterations {
             // Per-iter observer notification. Mirrors `NewtonTrustRegionCore::run`;
             // without this hook, callers driving outer-loop bookkeeping
@@ -3891,6 +3923,41 @@ impl ArcCore {
                     hess_evals,
                 ));
             }
+
+            // Noise-floor convergence: cost-flat AND gradient-already-dropped
+            // for a window of consecutive iters. See the constants above
+            // for the rationale.
+            let cost_flat = (f_k - f_k_iter_prev).abs()
+                <= STAGNATION_TOL_F_REL * (1.0 + f_k.abs());
+            let grad_dropped = initial_g_norm_for_tol > 0.0
+                && g_norm.is_finite()
+                && g_norm <= STAGNATION_GRAD_DROP_FACTOR * initial_g_norm_for_tol;
+            if cost_flat && grad_dropped {
+                cost_stagnation_streak += 1;
+            } else {
+                cost_stagnation_streak = 0;
+            }
+            if cost_stagnation_streak >= STAGNATION_WINDOW && k >= STAGNATION_MIN_ITERS {
+                log::info!(
+                    "[ARC] Converged (cost-stagnation): iters={}, f={:.6e}, ||g||={:.3e}",
+                    k + 1,
+                    f_k,
+                    g_norm
+                );
+                return Ok(Solution::gradient_based_with_status(
+                    x_k,
+                    f_k,
+                    g_k,
+                    g_norm,
+                    Some(h_k),
+                    k + 1,
+                    func_evals,
+                    grad_evals,
+                    hess_evals,
+                    OptimizationStatus::NumericallyConverged,
+                ));
+            }
+            f_k_iter_prev = f_k;
 
             let h_model = if hessian_is_effectively_symmetric(&h_k) {
                 &h_k
