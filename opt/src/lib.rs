@@ -932,6 +932,29 @@ type LsResult = Result<(f64, f64, Array1<f64>, usize, usize, AcceptKind), LineSe
 const WOLFE_MAX_ATTEMPTS: usize = 20;
 const BACKTRACKING_MAX_ATTEMPTS: usize = 50;
 
+/// Multiplier on `(1 + |f_k|) * f64::EPSILON` below which the predicted
+/// decrease from a trust-region / cubic model is considered noise.
+///
+/// Rationale (rho-noise pathology): near a flat minimum (small |g|,
+/// small step) the predicted decrease scales like `½ gᵀH⁻¹g` and the
+/// actual decrease `f_k - f_trial` is dominated by the ULP noise on
+/// `f`, ~`ε|f|`. The ratio `rho = act/pred` then becomes chaotic and
+/// can land randomly inside the accept window, causing the trust radius
+/// (or `sigma`) to oscillate without making progress and the run to
+/// exhaust its iteration budget despite already being at a stationary
+/// point in finite precision.
+///
+/// The factor of 16 is a few orders of magnitude above raw machine
+/// epsilon (so the guard does not fire whenever `f` happens to be
+/// representable to within a few ULPs of the true value) but still well
+/// below any meaningful curvature-driven predicted decrease (which
+/// scales with `g²` and `H`, both of which are well above `ε|f|` in
+/// any non-degenerate problem). Values in `[1.0, 100.0]` are all
+/// defensible; 16.0 is the chosen default. ARC and matrix-free
+/// trust-region share this constant — both drive a rho test that is
+/// vulnerable to the same noise floor.
+const ARC_NUMERICAL_CONV_FACTOR: f64 = 16.0;
+
 /// An error type for clear diagnostics.
 #[derive(Debug, thiserror::Error)]
 pub enum BfgsError {
@@ -1449,6 +1472,13 @@ pub struct Solution {
     pub grad_evals: usize,
     /// The total number of times a Hessian was supplied directly by the objective.
     pub hess_evals: usize,
+    /// Optional status hint set by solvers that have a finer-grained
+    /// success classification than the default `Result<Solution, _>`
+    /// distinction. Currently used by `Arc` and `MatrixFreeTrustRegion`
+    /// to flag `OptimizationStatus::NumericallyConverged` (the cost-ratio
+    /// test fell below the cost's ULP noise floor). `None` means
+    /// "use the default mapping from the outcome variant".
+    pub status_hint: Option<OptimizationStatus>,
 }
 
 impl Solution {
@@ -1475,7 +1505,35 @@ impl Solution {
             func_evals,
             grad_evals,
             hess_evals,
+            status_hint: None,
         }
+    }
+
+    fn gradient_based_with_status(
+        final_point: Array1<f64>,
+        final_value: f64,
+        final_gradient: Array1<f64>,
+        final_gradient_norm: f64,
+        final_hessian: Option<Array2<f64>>,
+        iterations: usize,
+        func_evals: usize,
+        grad_evals: usize,
+        hess_evals: usize,
+        status: OptimizationStatus,
+    ) -> Self {
+        let mut s = Self::gradient_based(
+            final_point,
+            final_value,
+            final_gradient,
+            final_gradient_norm,
+            final_hessian,
+            iterations,
+            func_evals,
+            grad_evals,
+            hess_evals,
+        );
+        s.status_hint = Some(status);
+        s
     }
 
     fn fixed_point(
@@ -1497,6 +1555,7 @@ impl Solution {
             func_evals,
             grad_evals: 0,
             hess_evals: 0,
+            status_hint: None,
         }
     }
 }
@@ -1510,6 +1569,15 @@ pub enum OptimizationStatus {
     /// Stopped at a stationary point (gradient-norm criterion met for
     /// gradient-based solvers; step-norm for fixed-point).
     Converged,
+    /// Stopped because the cost-ratio (rho) test fell below the cost's
+    /// ULP noise floor: the predicted model decrease is smaller than
+    /// the ULP of the objective value, so `rho = act/pred` is dominated
+    /// by floating-point noise rather than real curvature information.
+    /// Treated as a success — the caller is at a stationary point in
+    /// the finite-precision sense — but distinguished from `Converged`
+    /// so callers that care can tell apart "gradient hit tol" from
+    /// "rho is now noise". See ARC / matrix-free TR run loops.
+    NumericallyConverged,
     /// Iteration cap reached before convergence. The `solution` on the
     /// report is the best point seen.
     MaxIterations,
@@ -1528,6 +1596,19 @@ pub enum OptimizationStatus {
     /// non-SPD model Hessian, etc.). `last_solution` may still be
     /// populated.
     NumericalFailure,
+}
+
+impl OptimizationStatus {
+    /// `true` for terminal statuses that represent a successful stop at
+    /// (or numerically indistinguishably close to) a stationary point.
+    /// `Converged` and `NumericallyConverged` are both successes; the
+    /// remaining variants are not.
+    pub fn is_success(self) -> bool {
+        matches!(
+            self,
+            OptimizationStatus::Converged | OptimizationStatus::NumericallyConverged
+        )
+    }
 }
 
 /// Counters and final-state values that the bare `Solution` does not
@@ -1586,6 +1667,7 @@ fn placeholder_solution(x0: &Array1<f64>) -> Solution {
         func_evals: 0,
         grad_evals: 0,
         hess_evals: 0,
+        status_hint: None,
     }
 }
 
@@ -1605,9 +1687,12 @@ fn bfgs_outcome_into_report(
     match outcome {
         Ok(solution) => {
             let diagnostics = diagnostics_from_solution(&solution);
+            let status = solution
+                .status_hint
+                .unwrap_or(OptimizationStatus::Converged);
             OptimizationReport {
                 solution,
-                status: OptimizationStatus::Converged,
+                status,
                 diagnostics,
             }
         }
@@ -1649,9 +1734,12 @@ fn newton_outcome_into_report(
     match outcome {
         Ok(solution) => {
             let diagnostics = diagnostics_from_solution(&solution);
+            let status = solution
+                .status_hint
+                .unwrap_or(OptimizationStatus::Converged);
             OptimizationReport {
                 solution,
-                status: OptimizationStatus::Converged,
+                status,
                 diagnostics,
             }
         }
@@ -1684,9 +1772,15 @@ fn arc_outcome_into_report(
     match outcome {
         Ok(solution) => {
             let diagnostics = diagnostics_from_solution(&solution);
+            // Honor any solver-set status hint (e.g.
+            // `NumericallyConverged` from the rho-noise-floor guard);
+            // otherwise the `Ok(_)` outcome maps to `Converged`.
+            let status = solution
+                .status_hint
+                .unwrap_or(OptimizationStatus::Converged);
             OptimizationReport {
                 solution,
-                status: OptimizationStatus::Converged,
+                status,
                 diagnostics,
             }
         }
@@ -3769,6 +3863,19 @@ impl ArcCore {
         let mut h_model_workspace = Array2::<f64>::zeros((n, n));
 
         for k in 0..self.max_iterations {
+            // Per-iter observer notification. Mirrors `NewtonTrustRegionCore::run`;
+            // without this hook, callers driving outer-loop bookkeeping
+            // off `on_iteration_start` see only the pre-loop call from
+            // the seed and miss every real ARC iteration.
+            if k > 0 {
+                if let Some(obs) = self.observer.as_mut() {
+                    obs.on_iteration_start(&IterationInfo {
+                        iter: k,
+                        func_evals,
+                        grad_evals,
+                    });
+                }
+            }
             let g_proj_k = self.projected_gradient(&x_k, &g_k);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
             if g_norm.is_finite() && g_norm <= effective_tol {
@@ -3913,6 +4020,28 @@ impl ArcCore {
                 continue;
             }
 
+            // Numerical-convergence guard: when the predicted reduction
+            // is below the ULP scale of the objective value, the rho
+            // test is dominated by floating-point noise on f_trial - f_k
+            // rather than real curvature. Continuing here just makes
+            // sigma oscillate. Declare numerical convergence instead.
+            // See `ARC_NUMERICAL_CONV_FACTOR` for the full rationale.
+            let f_scale = (1.0 + f_k.abs()) * f64::EPSILON;
+            if denom <= ARC_NUMERICAL_CONV_FACTOR * f_scale {
+                return Ok(Solution::gradient_based_with_status(
+                    x_k,
+                    f_k,
+                    g_k,
+                    g_norm,
+                    Some(h_k),
+                    k,
+                    func_evals,
+                    grad_evals,
+                    hess_evals,
+                    OptimizationStatus::NumericallyConverged,
+                ));
+            }
+
             let (f_trial, g_trial, h_trial) = match oracle.eval_cost_grad_hessian(
                 obj_fn,
                 &x_trial,
@@ -3930,11 +4059,61 @@ impl ArcCore {
                     return Err(ArcError::ObjectiveFailed { message });
                 }
             };
+            // Trial-point gradient short-circuit. If the projected
+            // gradient at the trial is already within tolerance, we are
+            // at a stationary point — accept regardless of the noisy
+            // rho ratio. Without this check, a good step at a flat
+            // minimum can be repeatedly rejected by an undefined rho
+            // and the run never registers the convergence it already
+            // produced.
+            let g_proj_trial = self.projected_gradient(&x_trial, &g_trial);
+            let g_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
+            if g_trial_norm.is_finite() && g_trial_norm <= effective_tol {
+                if h_trial.nrows() != n || h_trial.ncols() != n {
+                    return Err(ArcError::HessianShapeMismatch {
+                        expected: n,
+                        got_rows: h_trial.nrows(),
+                        got_cols: h_trial.ncols(),
+                    });
+                }
+                return Ok(Solution::gradient_based(
+                    x_trial,
+                    f_trial,
+                    g_trial,
+                    g_trial_norm,
+                    Some(h_trial),
+                    k + 1,
+                    func_evals,
+                    grad_evals,
+                    hess_evals,
+                ));
+            }
             let rho = (f_k - f_trial) / denom;
             model_failure_streak = 0;
             // ARC accept/reject decision:
             // accept trial point iff rho >= eta1.
-            if rho >= self.eta1 {
+            let accepted = rho >= self.eta1;
+            // Observer notification for the accept/reject decision.
+            // Mirrors the per-step hooks already wired into
+            // `NewtonTrustRegionCore::run`. `trust_radius` is `None`
+            // because ARC uses cubic regularization `sigma` rather than
+            // an explicit trust radius — `StepInfo.trust_radius` is the
+            // wrong field to surface `sigma` through.
+            if let Some(obs) = self.observer.as_mut() {
+                let info = StepInfo {
+                    iter: k,
+                    step_norm: s_norm,
+                    predicted_decrease: denom,
+                    actual_decrease: f_k - f_trial,
+                    trust_radius: None,
+                };
+                if accepted {
+                    obs.on_step_accepted(&info);
+                } else {
+                    obs.on_step_rejected(&info);
+                }
+            }
+            if accepted {
                 if h_trial.nrows() != n || h_trial.ncols() != n {
                     return Err(ArcError::HessianShapeMismatch {
                         expected: n,
@@ -6425,6 +6604,20 @@ impl MatrixFreeTrustRegionCore {
 
         for k in 0..self.max_iterations {
             self.last_trust_radius = Some(trust_radius);
+            // Per-iter observer notification. Mirrors NewtonTR / ARC.
+            // The pre-loop `on_iteration_start` only fires once at the
+            // seed; without this hook observers driving outer
+            // bookkeeping (e.g. iter-aware inner caps) miss every real
+            // outer iteration.
+            if k > 0 {
+                if let Some(obs) = self.observer.as_mut() {
+                    obs.on_iteration_start(&IterationInfo {
+                        iter: k,
+                        func_evals,
+                        grad_evals,
+                    });
+                }
+            }
             let g_proj = self.projected_gradient(&x_k, &sample.gradient);
             let g_proj_norm = g_proj.dot(&g_proj).sqrt();
             if g_proj_norm <= effective_tol {
@@ -6602,6 +6795,31 @@ impl MatrixFreeTrustRegionCore {
                 continue;
             }
 
+            // Numerical-convergence guard: when the predicted reduction
+            // from the Steihaug-Toint subsolve drops below the ULP scale
+            // of the objective, `rho = actual/predicted` becomes pure
+            // floating-point noise on `f_k - f_trial` and the trust
+            // radius oscillates. Declare numerical convergence rather
+            // than burning the iteration budget. Same pathology as ARC;
+            // see `ARC_NUMERICAL_CONV_FACTOR` for the constant's
+            // justification.
+            let f_scale = (1.0 + sample.value.abs()) * f64::EPSILON;
+            if predicted <= ARC_NUMERICAL_CONV_FACTOR * f_scale {
+                let sol = Solution::gradient_based_with_status(
+                    x_k.clone(),
+                    sample.value,
+                    sample.gradient.clone(),
+                    g_proj_norm,
+                    None,
+                    k,
+                    func_evals,
+                    grad_evals,
+                    hvp_evals,
+                    OptimizationStatus::NumericallyConverged,
+                );
+                return Ok(sol);
+            }
+
             // Step lives in `cg_scratch.p`. Form the trial point in
             // place via x_k + p, then project onto bounds.
             let x_trial = self.project_point(&(&x_k + &cg_scratch.p));
@@ -6653,6 +6871,28 @@ impl MatrixFreeTrustRegionCore {
                     });
                 }
                 continue;
+            }
+
+            // Trial-point gradient short-circuit. If the projected
+            // gradient at the trial is already within tolerance, we
+            // are at a stationary point — accept regardless of the
+            // (potentially noisy) rho ratio. Mirrors the ARC fix; same
+            // pathology applies to the matrix-free trust-region path.
+            let g_proj_trial = self.projected_gradient(&x_trial, &trial.gradient);
+            let g_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
+            if g_trial_norm.is_finite() && g_trial_norm <= effective_tol {
+                let sol = Solution::gradient_based(
+                    x_trial,
+                    trial.value,
+                    trial.gradient,
+                    g_trial_norm,
+                    None,
+                    k + 1,
+                    func_evals,
+                    grad_evals,
+                    hvp_evals,
+                );
+                return Ok(sol);
             }
 
             let actual = sample.value - trial.value;
@@ -7089,9 +7329,15 @@ fn matrix_free_outcome_into_report(
                 hvp_evals: solution.hess_evals,
                 ..OptimizationDiagnostics::default()
             };
+            // Honor any solver-set status hint (e.g.
+            // `NumericallyConverged` from the rho-noise-floor guard);
+            // otherwise the `Ok(_)` outcome maps to `Converged`.
+            let status = solution
+                .status_hint
+                .unwrap_or(OptimizationStatus::Converged);
             OptimizationReport {
                 solution,
-                status: OptimizationStatus::Converged,
+                status,
                 diagnostics,
             }
         }
@@ -11671,6 +11917,290 @@ mod tests {
 
     /// `run_report` must return `MaxIterations` when the solver runs
     /// out of budget, with the best-seen point in `solution`.
+    // ---------------------------------------------------------------
+    // ARC / MatrixFreeTR 0.5.3 fixes:
+    //   - per-iter observer hooks
+    //   - numerical-convergence detection at the rho-noise floor
+    //   - trial-point gradient short-circuit
+    // ---------------------------------------------------------------
+
+    /// `(x - 1)^T (x - 1) / 2 + offset` — a strictly convex quadratic
+    /// with an arbitrary additive offset. The huge offset (`1e16`) drags
+    /// `|f|` so high that the ULP of `f` (~`ε|f|` ≈ 2.2e0) dwarfs the
+    /// predicted reduction at any near-minimum step. This is the
+    /// canonical reproducer for the rho-noise pathology: the gradient
+    /// is still above the default convergence tolerance, but every
+    /// `rho = (f_k - f_trial) / pred` is computed from a `f_k - f_trial`
+    /// that is pure floating-point noise.
+    struct OffsetQuadratic {
+        offset: f64,
+    }
+    impl ZerothOrderObjective for OffsetQuadratic {
+        fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+            let mut s = 0.0;
+            for v in x.iter() {
+                let d = v - 1.0;
+                s += 0.5 * d * d;
+            }
+            Ok(self.offset + s)
+        }
+    }
+    impl FirstOrderObjective for OffsetQuadratic {
+        fn eval_grad(
+            &mut self,
+            x: &Array1<f64>,
+        ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+            let value = ZerothOrderObjective::eval_cost(self, x)?;
+            Ok(FirstOrderSample {
+                value,
+                gradient: x - 1.0,
+            })
+        }
+    }
+    impl SecondOrderObjective for OffsetQuadratic {
+        fn eval_hessian(
+            &mut self,
+            x: &Array1<f64>,
+        ) -> Result<SecondOrderSample, ObjectiveEvalError> {
+            let value = ZerothOrderObjective::eval_cost(self, x)?;
+            let n = x.len();
+            Ok(SecondOrderSample {
+                value,
+                gradient: x - 1.0,
+                hessian: Some(Array2::eye(n)),
+            })
+        }
+    }
+    impl OperatorObjective for OffsetQuadratic {
+        fn eval_value_grad_op(
+            &mut self,
+            x: &Array1<f64>,
+        ) -> Result<OperatorSample, ObjectiveEvalError> {
+            let value = ZerothOrderObjective::eval_cost(self, x)?;
+            Ok(OperatorSample {
+                value,
+                gradient: x - 1.0,
+                hessian: HessianValue::Dense(Array2::eye(x.len())),
+            })
+        }
+    }
+
+    /// ARC must not burn iterations at a flat minimum when the rho
+    /// ratio is dominated by ULP noise on `f`. With the 0.5.3
+    /// numerical-convergence guard the run terminates in O(1) iters
+    /// via `NumericallyConverged`; without the guard it would exhaust
+    /// the iteration budget while `sigma` oscillates.
+    #[test]
+    fn arc_terminates_at_flat_minimum_via_numerical_convergence() {
+        let x0 = array![1.001, 1.001];
+        let max_iters = 5;
+        let mut solver = super::Arc::new(x0, OffsetQuadratic { offset: 1e16 })
+            .with_max_iterations(MaxIterations::new(max_iters).unwrap())
+            .with_tolerance(Tolerance::new(1e-5).unwrap());
+        let report = solver.run_report();
+        assert_eq!(
+            report.status,
+            OptimizationStatus::NumericallyConverged,
+            "expected NumericallyConverged at the ULP noise floor, got {:?}",
+            report.status
+        );
+        assert!(report.status.is_success(), "NumericallyConverged is a success");
+        assert!(
+            report.solution.iterations < max_iters,
+            "must stop before exhausting the iteration budget: iters={}",
+            report.solution.iterations
+        );
+    }
+
+    /// ARC must drive the per-step observer hooks (`on_step_accepted` /
+    /// `on_step_rejected`) once per accept/reject decision and the
+    /// per-iter `on_iteration_start` for every loop pass — 0.5.2 wired
+    /// only the pre-loop `on_iteration_start`.
+    #[test]
+    fn arc_observer_counts_accepted_and_rejected_steps() {
+        struct Counting {
+            accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            rejected: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            iter_starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl OptimizerObserver for Counting {
+            fn on_iteration_start(&mut self, _info: &IterationInfo) {
+                self.iter_starts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn on_step_accepted(&mut self, _info: &StepInfo) {
+                self.accepted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn on_step_rejected(&mut self, _info: &StepInfo) {
+                self.rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rejected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let iter_starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let obs = Counting {
+            accepted: std::sync::Arc::clone(&accepted),
+            rejected: std::sync::Arc::clone(&rejected),
+            iter_starts: std::sync::Arc::clone(&iter_starts),
+        };
+        let x0 = array![5.0, -3.0];
+        let mut solver = super::Arc::new(x0, CountingQuadratic::new(false))
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_observer(obs);
+        let _sol = solver.run().expect("converges");
+        let acc = accepted.load(std::sync::atomic::Ordering::Relaxed);
+        let rej = rejected.load(std::sync::atomic::Ordering::Relaxed);
+        let starts = iter_starts.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            acc + rej > 0,
+            "ARC must drive observer accept/reject hooks: acc={acc}, rej={rej}"
+        );
+        assert!(
+            starts > 1,
+            "on_iteration_start must fire per-iter, not only pre-loop: starts={starts}"
+        );
+    }
+
+    /// ARC must accept a trial step when its projected gradient is
+    /// below the tolerance, regardless of the (possibly noisy) rho
+    /// ratio. From a seed slightly off the optimum on a clean
+    /// quadratic the Newton step lands at the minimum on iteration 0;
+    /// the trial-grad short-circuit returns Converged with the trial
+    /// point as the final point.
+    #[test]
+    fn arc_trial_gradient_short_circuit_accepts_stationary_trial() {
+        let x0 = array![1.0 + 1e-3, 1.0 - 1e-3];
+        let mut solver = super::Arc::new(x0.clone(), CountingQuadratic::new(false))
+            .with_max_iterations(MaxIterations::new(3).unwrap())
+            .with_tolerance(Tolerance::new(1e-8).unwrap());
+        let sol = solver.run().expect("converges in <= 2 iters");
+        assert!(
+            sol.iterations <= 2,
+            "trial-grad short-circuit should hit Converged within 1-2 iters, got {}",
+            sol.iterations
+        );
+        // Final point must be the trial (the minimum), not the seed.
+        for v in sol.final_point.iter() {
+            assert!(
+                (v - 1.0).abs() < 1e-6,
+                "expected to land near (1,1); got {v}"
+            );
+        }
+        let diff = &sol.final_point - &x0;
+        assert!(
+            diff.dot(&diff).sqrt() > 1e-6,
+            "must return the trial point, not the seed"
+        );
+    }
+
+    /// MatrixFreeTrustRegion variant of the flat-minimum / rho-noise
+    /// pathology. Same expectations as `arc_terminates_at_flat_minimum_*`.
+    #[test]
+    fn matrix_free_terminates_at_flat_minimum_via_numerical_convergence() {
+        let x0 = array![1.001, 1.001];
+        let max_iters = 5;
+        let mut solver = MatrixFreeTrustRegion::new(x0, OffsetQuadratic { offset: 1e16 })
+            .with_max_iterations(MaxIterations::new(max_iters).unwrap())
+            .with_tolerance(Tolerance::new(1e-5).unwrap())
+            .with_initial_trust_radius(1.0);
+        let report = solver.run_report();
+        assert_eq!(
+            report.status,
+            OptimizationStatus::NumericallyConverged,
+            "expected NumericallyConverged at the ULP noise floor, got {:?}",
+            report.status
+        );
+        assert!(
+            report.solution.iterations < max_iters,
+            "must stop before exhausting the iteration budget: iters={}",
+            report.solution.iterations
+        );
+    }
+
+    /// MatrixFreeTrustRegion observer hooks: per-iter
+    /// `on_iteration_start` and per-decision accept/reject. The
+    /// accept/reject hooks were already wired in 0.5.2; 0.5.3 adds the
+    /// per-iter `on_iteration_start` so observers driving outer
+    /// bookkeeping see real outer iterations, not just the seed.
+    #[test]
+    fn matrix_free_observer_counts_accepted_steps_and_iter_starts() {
+        struct Counting {
+            accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            rejected: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            iter_starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl OptimizerObserver for Counting {
+            fn on_iteration_start(&mut self, _info: &IterationInfo) {
+                self.iter_starts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn on_step_accepted(&mut self, _info: &StepInfo) {
+                self.accepted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn on_step_rejected(&mut self, _info: &StepInfo) {
+                self.rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rejected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let iter_starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let obs = Counting {
+            accepted: std::sync::Arc::clone(&accepted),
+            rejected: std::sync::Arc::clone(&rejected),
+            iter_starts: std::sync::Arc::clone(&iter_starts),
+        };
+        // Use a small initial trust radius so the trust-region adapts
+        // and we see multiple iterations (not a single Newton hit).
+        let x0 = array![3.0, -1.5];
+        let mut solver = MatrixFreeTrustRegion::new(x0, OffsetQuadratic { offset: 0.0 })
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_tolerance(Tolerance::new(1e-8).unwrap())
+            .with_initial_trust_radius(0.1)
+            .with_observer(obs);
+        let _sol = solver.run().expect("converges");
+        let acc = accepted.load(std::sync::atomic::Ordering::Relaxed);
+        let rej = rejected.load(std::sync::atomic::Ordering::Relaxed);
+        let starts = iter_starts.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            acc + rej > 0,
+            "MatrixFreeTR must drive observer accept/reject hooks: acc={acc}, rej={rej}"
+        );
+        assert!(
+            starts > 1,
+            "on_iteration_start must fire per-iter, not only pre-loop: starts={starts}"
+        );
+    }
+
+    /// MatrixFreeTrustRegion trial-grad short-circuit. Same contract as
+    /// the ARC variant — a Newton-equivalent step from a clean
+    /// quadratic seed must be accepted via the trial-gradient check.
+    #[test]
+    fn matrix_free_trial_gradient_short_circuit_accepts_stationary_trial() {
+        let x0 = array![1.0 + 1e-3, 1.0 - 1e-3];
+        let mut solver = MatrixFreeTrustRegion::new(x0.clone(), OffsetQuadratic { offset: 0.0 })
+            .with_max_iterations(MaxIterations::new(3).unwrap())
+            .with_tolerance(Tolerance::new(1e-8).unwrap())
+            .with_initial_trust_radius(10.0);
+        let sol = solver.run().expect("converges in <= 2 iters");
+        assert!(
+            sol.iterations <= 2,
+            "trial-grad short-circuit should hit Converged within 1-2 iters, got {}",
+            sol.iterations
+        );
+        for v in sol.final_point.iter() {
+            assert!((v - 1.0).abs() < 1e-6, "expected near (1,1), got {v}");
+        }
+        let diff = &sol.final_point - &x0;
+        assert!(
+            diff.dot(&diff).sqrt() > 1e-6,
+            "must return the trial point, not the seed"
+        );
+    }
+
     #[test]
     fn run_report_max_iterations_status() {
         let x0 = array![10.0, 10.0]; // far from the optimum
