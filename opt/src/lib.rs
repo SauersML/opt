@@ -6669,6 +6669,23 @@ impl MatrixFreeTrustRegionCore {
             });
         }
 
+        // ── Cost-stagnation noise-floor detector ────────────────────────────
+        //
+        // Same noise-floor convergence guard as ARC::run; see that loop for
+        // the full rationale. When the outer objective evaluation has a
+        // noise floor (e.g. inner solver's β-precision propagating to the
+        // outer LAML gradient), `|g|` oscillates above `effective_tol`
+        // indefinitely while `f_k` converges. Declare `NumericallyConverged`
+        // once successive `f_k` values agree to relative tolerance AND
+        // `|g_proj|` has dropped to a small fraction of its initial value,
+        // for a window of consecutive iterations.
+        const STAGNATION_WINDOW: usize = 5;
+        const STAGNATION_TOL_F_REL: f64 = 1e-10;
+        const STAGNATION_GRAD_DROP_FACTOR: f64 = 1e-2;
+        const STAGNATION_MIN_ITERS: usize = 5;
+        let mut cost_stagnation_streak: usize = 0;
+        let mut f_k_iter_prev: f64 = sample.value;
+
         for k in 0..self.max_iterations {
             self.last_trust_radius = Some(trust_radius);
             // Per-iter observer notification. Mirrors NewtonTR / ARC.
@@ -6701,6 +6718,41 @@ impl MatrixFreeTrustRegionCore {
                 );
                 return Ok(sol);
             }
+
+            // Noise-floor stagnation exit: cost-flat AND gradient-already-dropped
+            // for a window of consecutive iters.
+            let cost_flat = (sample.value - f_k_iter_prev).abs()
+                <= STAGNATION_TOL_F_REL * (1.0 + sample.value.abs());
+            let grad_dropped = initial_g_proj_norm > 0.0
+                && g_proj_norm.is_finite()
+                && g_proj_norm <= STAGNATION_GRAD_DROP_FACTOR * initial_g_proj_norm;
+            if cost_flat && grad_dropped {
+                cost_stagnation_streak += 1;
+            } else {
+                cost_stagnation_streak = 0;
+            }
+            if cost_stagnation_streak >= STAGNATION_WINDOW && k >= STAGNATION_MIN_ITERS {
+                log::info!(
+                    "[MFTR] Converged (cost-stagnation): iters={}, f={:.6e}, ||g||={:.3e}",
+                    k + 1,
+                    sample.value,
+                    g_proj_norm
+                );
+                let sol = Solution::gradient_based_with_status(
+                    x_k.clone(),
+                    sample.value,
+                    sample.gradient.clone(),
+                    g_proj_norm,
+                    None,
+                    k + 1,
+                    func_evals,
+                    grad_evals,
+                    hvp_evals,
+                    OptimizationStatus::NumericallyConverged,
+                );
+                return Ok(sol);
+            }
+            f_k_iter_prev = sample.value;
 
             // Materialize a Hessian operator handle for the CG step.
             // For operators that advertise cheap materialization
