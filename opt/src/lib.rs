@@ -6813,8 +6813,84 @@ impl MatrixFreeTrustRegionCore {
             }
 
             // Step lives in `cg_scratch.p`. Form the trial point in
-            // place via x_k + p, then project onto bounds.
+            // place via x_k + p, then project onto bounds. The CG step is
+            // bound-aware via the active-set mask but only zeros gradient
+            // components at the already-active face; an interior coord can
+            // still receive a step component that pushes it into the box,
+            // which `project_point` then clips. When that happens the
+            // `predicted` we computed for the CG step no longer describes
+            // the actually-feasible step — we recompute the quadratic
+            // model decrease at `s_feas = x_trial - x_k`. Without this
+            // recomputation `rho = actual / predicted` uses an
+            // over-optimistic denominator (the unclipped step's predicted
+            // decrease) and rejects legitimate descent steps, mirroring
+            // the ARC clipped-step bug fixed in 0.5.8.
             let x_trial = self.project_point(&(&x_k + &cg_scratch.p));
+            let s_feas = &x_trial - &x_k;
+            let s_feas_diff = &s_feas - &cg_scratch.p;
+            let s_feas_norm = s_feas.dot(&s_feas).sqrt();
+            let proj_changed =
+                s_feas_diff.dot(&s_feas_diff).sqrt() > 1e-12 * (1.0 + s_feas_norm);
+            let predicted = if proj_changed {
+                // One Hv apply to recompute the quadratic model decrease
+                // at the feasible step: predicted = -g·s − 0.5·s·H·s.
+                match op_handle.apply_into(&s_feas, &mut cg_scratch.hp) {
+                    Ok(()) => {
+                        hvp_evals += 1;
+                        let lin = -g_proj.dot(&s_feas);
+                        let quad = 0.5 * s_feas.dot(&cg_scratch.hp);
+                        let predicted_feas = lin - quad;
+                        if predicted_feas <= 0.0 || !predicted_feas.is_finite() {
+                            // Projected step is no longer a descent direction
+                            // for the quadratic model; shrink and retry.
+                            trust_radius *= 0.25;
+                            if trust_radius < self.trust_radius_min {
+                                let last = Box::new(Solution::gradient_based(
+                                    x_k.clone(),
+                                    sample.value,
+                                    sample.gradient.clone(),
+                                    g_proj_norm,
+                                    None,
+                                    k,
+                                    func_evals,
+                                    grad_evals,
+                                    hvp_evals,
+                                ));
+                                return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
+                                    last_solution: last,
+                                });
+                            }
+                            continue;
+                        }
+                        predicted_feas
+                    }
+                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                        trust_radius *= 0.5;
+                        if trust_radius < self.trust_radius_min {
+                            let last = Box::new(Solution::gradient_based(
+                                x_k.clone(),
+                                sample.value,
+                                sample.gradient.clone(),
+                                g_proj_norm,
+                                None,
+                                k,
+                                func_evals,
+                                grad_evals,
+                                hvp_evals,
+                            ));
+                            return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
+                                last_solution: last,
+                            });
+                        }
+                        continue;
+                    }
+                    Err(ObjectiveEvalError::Fatal { message }) => {
+                        return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
+                    }
+                }
+            } else {
+                predicted
+            };
             let trial_eval = obj_fn.eval_value_grad_op(&x_trial);
             let trial = match trial_eval {
                 Ok(t) => t,
@@ -12245,6 +12321,82 @@ mod tests {
         assert!(
             diff.dot(&diff).sqrt() > 1e-6,
             "must return the trial point, not the seed"
+        );
+    }
+
+    /// Regression test for the MatrixFreeTrustRegion clipped-step
+    /// pathology. The Steihaug-Toint CG returns a `predicted` reduction
+    /// for its unconstrained TR step `p`. When the unconstrained step
+    /// pushes interior coordinates into the box (the CG only zeros
+    /// already-active gradient components — it does not enforce box
+    /// constraints per coordinate), `project_point` clips them and the
+    /// actual feasible step `s = x_trial − x_k` differs from `p`. The
+    /// ρ-ratio `actual / predicted` is then comparing the cost decrease
+    /// at the clipped step against the model decrease at the unclipped
+    /// step, which is unfair: `predicted` is over-optimistic, ρ is
+    /// undersized, and legitimate descent steps are spuriously rejected.
+    /// This is the same root cause as the ARC clipped-step bug fixed in
+    /// the same commit; the fix is symmetric — recompute the quadratic
+    /// model decrease at the feasible step via one extra Hv apply.
+    ///
+    /// Test problem: bounded convex 2D quadratic with the unconstrained
+    /// minimum well outside the box. The TR step from an interior seed
+    /// at small trust radius lands cleanly in the box; from a larger
+    /// radius the unconstrained step pushes past the box bound on one
+    /// coordinate and gets clipped. ARC must converge to the
+    /// constrained minimum (on the box face) within a small iteration
+    /// budget.
+    #[test]
+    fn matrix_free_clipped_step_uses_recomputed_predicted_decrease() {
+        // f(x, y) = 0.5*(x - 10)² + 0.5*(y - 10)²
+        // Unconstrained min at (10, 10); box constrains to [-2, 2]^2;
+        // constrained min at (2, 2).
+        struct OffBoxQuadratic;
+        impl ZerothOrderObjective for OffBoxQuadratic {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                Ok(0.5 * (x[0] - 10.0).powi(2) + 0.5 * (x[1] - 10.0).powi(2))
+            }
+        }
+        impl FirstOrderObjective for OffBoxQuadratic {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                Ok(FirstOrderSample {
+                    value: 0.5 * (x[0] - 10.0).powi(2) + 0.5 * (x[1] - 10.0).powi(2),
+                    gradient: array![x[0] - 10.0, x[1] - 10.0],
+                })
+            }
+        }
+        impl OperatorObjective for OffBoxQuadratic {
+            fn eval_value_grad_op(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<OperatorSample, ObjectiveEvalError> {
+                Ok(OperatorSample {
+                    value: 0.5 * (x[0] - 10.0).powi(2) + 0.5 * (x[1] - 10.0).powi(2),
+                    gradient: array![x[0] - 10.0, x[1] - 10.0],
+                    hessian: HessianValue::Dense(Array2::eye(2)),
+                })
+            }
+        }
+        let lower = array![-2.0, -2.0];
+        let upper = array![2.0, 2.0];
+        let bounds = Bounds::new(lower, upper, 1e-9).unwrap();
+        let x0 = array![0.0, 0.0];
+        let mut solver = MatrixFreeTrustRegion::new(x0, OffBoxQuadratic)
+            .with_bounds(bounds)
+            .with_max_iterations(MaxIterations::new(10).unwrap())
+            .with_tolerance(Tolerance::new(1e-6).unwrap())
+            .with_initial_trust_radius(100.0); // large radius → step clips at box
+        let sol = solver
+            .run()
+            .expect("MFTR must accept clipped descent step via recomputed predicted");
+        assert!(
+            (sol.final_point[0] - 2.0).abs() < 1e-4 && (sol.final_point[1] - 2.0).abs() < 1e-4,
+            "constrained minimum is (2, 2); got {:?} (iters={})",
+            sol.final_point,
+            sol.iterations
         );
     }
 
