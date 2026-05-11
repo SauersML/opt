@@ -3887,9 +3887,29 @@ impl ArcCore {
         // initial step rejects and f stays put; (b) alone fires when
         // the optimizer is just starting and `g_norm` is naturally tiny
         // because the seed is already near a flat plateau.
-        const STAGNATION_WINDOW: usize = 5;
-        const STAGNATION_TOL_F_REL: f64 = 1e-10;
-        const STAGNATION_GRAD_DROP_FACTOR: f64 = 1e-2;
+        // Noise-floor convergence thresholds. The trio is calibrated for
+        // outer LAML / REML objectives where the inner solver's
+        // β-precision (typically 1e-5 relative) propagates to outer
+        // gradient noise around 1e-2..1e-3 relative to the seed-scale
+        // gradient. Tighter values miss the noise-floor regime and
+        // burn the iteration budget; looser ones cut convergence too
+        // early on objectives that have not yet stagnated.
+        //   * TOL_F_REL = 1e-6: an order of magnitude tighter than the
+        //     typical inner-solver β-noise floor, but loose enough that
+        //     successive accepted steps near the noise floor mark as
+        //     "flat" instead of as real progress.
+        //   * GRAD_DROP_FACTOR = 5e-2: 5% of the seed |g|. Strict enough
+        //     to require meaningful descent, loose enough that the
+        //     well-conditioned regime is reached within a few iters.
+        //   * WINDOW = 3 / MIN_ITERS = 5: identical to `StallPolicy::On
+        //     { window: 3 }` in `BfgsCore::run`. Window 3 is the
+        //     minimum that filters out single-iter noise spikes;
+        //     MIN_ITERS 5 prevents the streak from firing on the
+        //     first few iters of a fit that is still in the basin-
+        //     finding phase.
+        const STAGNATION_WINDOW: usize = 3;
+        const STAGNATION_TOL_F_REL: f64 = 1e-6;
+        const STAGNATION_GRAD_DROP_FACTOR: f64 = 5e-2;
         const STAGNATION_MIN_ITERS: usize = 5;
         let mut cost_stagnation_streak: usize = 0;
         let mut f_k_iter_prev: f64 = f_k;
@@ -6679,9 +6699,29 @@ impl MatrixFreeTrustRegionCore {
         // once successive `f_k` values agree to relative tolerance AND
         // `|g_proj|` has dropped to a small fraction of its initial value,
         // for a window of consecutive iterations.
-        const STAGNATION_WINDOW: usize = 5;
-        const STAGNATION_TOL_F_REL: f64 = 1e-10;
-        const STAGNATION_GRAD_DROP_FACTOR: f64 = 1e-2;
+        // Noise-floor convergence thresholds. The trio is calibrated for
+        // outer LAML / REML objectives where the inner solver's
+        // β-precision (typically 1e-5 relative) propagates to outer
+        // gradient noise around 1e-2..1e-3 relative to the seed-scale
+        // gradient. Tighter values miss the noise-floor regime and
+        // burn the iteration budget; looser ones cut convergence too
+        // early on objectives that have not yet stagnated.
+        //   * TOL_F_REL = 1e-6: an order of magnitude tighter than the
+        //     typical inner-solver β-noise floor, but loose enough that
+        //     successive accepted steps near the noise floor mark as
+        //     "flat" instead of as real progress.
+        //   * GRAD_DROP_FACTOR = 5e-2: 5% of the seed |g|. Strict enough
+        //     to require meaningful descent, loose enough that the
+        //     well-conditioned regime is reached within a few iters.
+        //   * WINDOW = 3 / MIN_ITERS = 5: identical to `StallPolicy::On
+        //     { window: 3 }` in `BfgsCore::run`. Window 3 is the
+        //     minimum that filters out single-iter noise spikes;
+        //     MIN_ITERS 5 prevents the streak from firing on the
+        //     first few iters of a fit that is still in the basin-
+        //     finding phase.
+        const STAGNATION_WINDOW: usize = 3;
+        const STAGNATION_TOL_F_REL: f64 = 1e-6;
+        const STAGNATION_GRAD_DROP_FACTOR: f64 = 5e-2;
         const STAGNATION_MIN_ITERS: usize = 5;
         let mut cost_stagnation_streak: usize = 0;
         let mut f_k_iter_prev: f64 = sample.value;
