@@ -3940,73 +3940,65 @@ impl ArcCore {
             let step_distortion = (&s_trial - &step).dot(&(&s_trial - &step)).sqrt();
             let step_norm_ref = step.dot(&step).sqrt();
             let proj_changed = step_distortion > 1e-8 * (1.0 + step_norm_ref);
-            if proj_changed {
-                // The unconstrained cubic model was solved for `step`, not the clipped
-                // projected step `s_trial`. Do not use ARC's rho/sigma update on the
-                // distorted step. Instead, refresh a coherent sample at the projected
-                // point and accept it only as a bound-activation progress step.
-                let projected = oracle.eval_cost_grad_hessian(
-                    obj_fn,
-                    &x_trial,
-                    self.bounds.as_ref(),
-                    &mut func_evals,
-                    &mut grad_evals,
-                    &mut hess_evals,
-                );
-                let (f_trial, g_trial, h_trial) = match projected {
-                    Ok(sample) => sample,
-                    Err(ObjectiveEvalError::Recoverable { .. }) => {
-                        self.escalate_sigma_on_failure(&mut model_failure_streak);
-                        continue;
-                    }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
-                        return Err(ArcError::ObjectiveFailed { message });
-                    }
-                };
-                if h_trial.nrows() != n || h_trial.ncols() != n {
-                    return Err(ArcError::HessianShapeMismatch {
-                        expected: n,
-                        got_rows: h_trial.nrows(),
-                        got_cols: h_trial.ncols(),
-                    });
-                }
-                let g_proj_trial = self.projected_gradient(&x_trial, &g_trial);
-                let g_proj_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
-                if f_trial <= f_k
-                    && (g_proj_trial_norm <= g_norm || g_proj_trial_norm <= self.tolerance)
-                {
-                    let y_k = &g_trial - &g_k;
-                    if s_norm > 1e-14 && y_k.dot(&y_k).sqrt() > 1e-14 {
-                        if history.len() == self.history_cap.max(2) {
-                            history.pop_front();
-                        }
-                        history.push_back((s_trial.clone(), y_k));
-                    }
-                    x_k = x_trial;
-                    f_k = f_trial;
-                    g_k = g_trial;
-                    h_k = h_trial;
-                    model_failure_streak = 0;
-                    // Bias the next cubic solve toward smaller feasible steps after
-                    // a bound-clipped move.
-                    self.sigma = (self.sigma * self.gamma2).min(self.sigma_max);
-                } else {
-                    self.escalate_sigma_on_failure(&mut model_failure_streak);
-                }
-                continue;
-            }
+
+            // Recompute the cubic-model decrease at the actually-feasible step
+            // `s_trial` (which may have been projected onto the box). The
+            // unconstrained subproblem solved for `step`, so when projection
+            // shrank or rotated it the previously-computed model decrease no
+            // longer applies — the ρ-ratio test must use `m(s_trial)`.
+            //
+            // The standard ARC subproblem-progress condition
+            // `‖∇m(s)‖ ≤ θ‖s‖²` certifies that `s` is near the cubic model's
+            // minimizer. After box projection that certificate does not hold
+            // by construction (clipping shoves us off the minimum), so we
+            // enforce it only when no projection occurred. The ρ-ratio
+            // acceptance below still gates whether the clipped step is taken.
+            //
+            // Earlier code (fb876b7f) instead diverted clipped steps into a
+            // special branch that accepted only when BOTH f_trial <= f_k AND
+            // |g_proj_trial| <= |g_proj_k|. The gradient half of that
+            // conjunction is wrong: at a near-stationary plateau with a
+            // near-singular Hessian direction (typical of LAML smoothing-
+            // parameter optimization at the saturation regime), a clipped
+            // step lands at a point with strictly lower cost but strictly
+            // larger gradient — moving off the plateau onto a steeper region
+            // of the surface is real descent. The conjunction rejected these
+            // legitimate steps and forced σ to grow doubling-by-doubling
+            // until the unconstrained step happened to fit inside the box.
+            // See `arc_clipped_step_accepts_when_cost_decreases_even_if_gradient_grows`.
+            // Recompute the cubic-model decrease at the actually-feasible step
+            // `s_trial` (which may have been projected onto the box). The
+            // unconstrained subproblem solved for `step`, so when projection
+            // shrank or rotated it the previously-computed model decrease no
+            // longer applies — the ρ-ratio test must use `m(s_trial)`.
+            //
+            // The standard ARC subproblem-progress condition
+            // `‖∇m(s)‖ ≤ θ‖s‖²` certifies that `s` is near the cubic model's
+            // minimizer. After box projection that certificate does not hold
+            // by construction (clipping shoves us off the minimum), so we
+            // enforce it only when no projection occurred. The ρ-ratio
+            // acceptance below still gates whether the clipped step is taken.
+            //
+            // Earlier code (fb876b7f) instead diverted clipped steps into a
+            // special branch that accepted only when BOTH f_trial <= f_k AND
+            // |g_proj_trial| <= |g_proj_k|. The gradient half of that
+            // conjunction is wrong: at a near-stationary plateau with a
+            // near-singular Hessian direction (typical of LAML smoothing-
+            // parameter optimization at the saturation regime), a clipped
+            // step can land at a point with strictly lower cost but strictly
+            // larger projected gradient — moving off the plateau onto a
+            // steeper region of the surface is real descent. The conjunction
+            // rejected these legitimate steps and forced σ to grow
+            // doubling-by-doubling until the unconstrained step happened to
+            // fit inside the box, burning ~10-15 iterations with no progress.
             let (m_delta_trial, _, grad_m_trial) =
                 self.arc_model_value(&g_proj_k, h_model, self.sigma, &s_trial, Some(&active));
-
-            // Enforce ARC first-order subproblem progress on the actual trial step
-            // (after possible box projection):
-            // m(s) <= m(0) and ||∇m(s)|| <= theta ||s||^2.
             let grad_m_norm = grad_m_trial.dot(&grad_m_trial).sqrt();
             let target_m = self.theta * s_norm * s_norm;
             if !m_delta_trial.is_finite()
                 || !grad_m_norm.is_finite()
                 || m_delta_trial > 0.0
-                || grad_m_norm > target_m.max(1e-14)
+                || (!proj_changed && grad_m_norm > target_m.max(1e-14))
             {
                 self.escalate_sigma_on_failure(&mut model_failure_streak);
                 continue;
@@ -10329,8 +10321,32 @@ mod tests {
         );
     }
 
+    /// On a materially-projected ARC step, the cubic-model decrease must be
+    /// recomputed at the feasible (clipped) step `s_trial` and ρ-ratio
+    /// acceptance applied — NOT the older heuristic that demanded both
+    /// `f_trial <= f_k` and `|g_proj_trial| <= |g_proj_k|`.
+    ///
+    /// Setup: convex `f(x) = 0.5*(x - 2)²` bounded to `[0, 1]`. The
+    /// unconstrained min is at x=2; the constrained min sits on the upper
+    /// bound at x=1. Starting from x=0.8 with `σ` deliberately driven to
+    /// the floor (1e-12), the unconstrained cubic step blows up to ~+∞
+    /// and projection clips it to `x_trial = 1`. With the fix the clipped
+    /// step is accepted: projected gradient at the bound is zero (descent
+    /// direction points out of the feasible region), so the trial-grad
+    /// short-circuit returns Converged immediately. The full
+    /// `eval_cost_grad_hessian` is still issued at the clipped point —
+    /// `eval_cost` (the ZerothOrder path) is never taken because ARC is a
+    /// second-order method that bundles cost into its Hessian eval.
+    ///
+    /// Earlier code (fb876b7f) instead diverted clipped steps into a
+    /// dual-criterion branch that rejected unless `|g_proj_trial| <=
+    /// |g_proj_k|`. On this test that rejection forced `MaxIterationsReached`
+    /// after one iteration; locking in that outcome via a test
+    /// (`arc_rejects_materially_projected_steps`) protected the bug from
+    /// regression checks. The test is rewritten to assert the correct
+    /// behavior.
     #[test]
-    fn arc_rejects_materially_projected_steps() {
+    fn arc_clipped_step_uses_rho_ratio_not_dual_criterion() {
         let x0 = array![0.8];
         let lower = array![0.0];
         let upper = array![1.0];
@@ -10392,15 +10408,14 @@ mod tests {
         solver.core.sigma_min = 1e-12;
         solver.core.sigma = 1e-12;
 
-        let err = solver
+        let sol = solver
             .run()
-            .expect_err("single projected iteration should exhaust the budget");
-        match err {
-            ArcError::MaxIterationsReached { last_solution } => {
-                assert!(last_solution.final_point[0] <= 1.0 + 1e-12);
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
+            .expect("clipped descent step must be accepted via ρ-ratio");
+        assert!(
+            (sol.final_point[0] - 1.0).abs() < 1e-9,
+            "clipped step should land at the upper bound (constrained minimum); got {}",
+            sol.final_point[0]
+        );
         let counts = clipped_counts.lock().expect("lock clipped counts");
         assert_eq!(
             counts.0, 0,
@@ -10408,7 +10423,7 @@ mod tests {
         );
         assert!(
             counts.1 > 0,
-            "materially projected ARC steps should refresh a coherent CostGradientHessian sample"
+            "materially projected ARC steps must refresh a coherent CostGradientHessian sample at the clipped point"
         );
     }
 
@@ -11983,6 +11998,141 @@ mod tests {
                 hessian: HessianValue::Dense(Array2::eye(x.len())),
             })
         }
+    }
+
+    /// Regression test for the clipped-step accept criterion.
+    ///
+    /// Pathology: the bounded ARC subproblem solves the *unconstrained* cubic
+    /// model to get `step`, then projects onto the box to get `s_trial`. The
+    /// previous code path (commit fb876b7f) required BOTH `f_trial <= f_k`
+    /// AND `|g_proj_trial| <= |g_proj_k|` to accept the clipped step. The
+    /// gradient half of that conjunction is wrong: at a near-stationary
+    /// plateau with a near-singular Hessian direction, a clipped step lands
+    /// at a point with strictly lower cost but strictly larger projected
+    /// gradient because we have moved off the plateau onto a steeper part
+    /// of the surface — typical of LAML smoothing-parameter optimization
+    /// near saturation. The standard ARC ρ-ratio criterion using
+    /// `m(s_trial)` (recomputed at the actually-feasible step) correctly
+    /// accepts.
+    ///
+    /// Concrete instance: 2D objective with a saddle-shaped y-direction
+    /// (negative curvature, gentle slope toward +∞) and an offset
+    /// quadratic in x. The seed sits at the saddle-axis x=offset where
+    /// |g_x|≈0, with y at the box-active region. The cubic step pushes y
+    /// to the upper bound (clipped) and simultaneously perturbs x to a
+    /// point where |g_x| is significantly NONZERO. At the clipped trial,
+    /// |g_proj_trial| > |g_proj_k| (gradient grew) but f_trial < f_k
+    /// (cost dropped). The old code rejected; the fix accepts via
+    /// ρ-ratio.
+    #[test]
+    fn arc_clipped_step_accepts_when_cost_decreases_even_if_gradient_grows() {
+        // f(x, y) = 0.5*(x - 0.05)² - 0.25*y² + 0.05*x*y
+        // g_x = (x - 0.05) + 0.05*y
+        // g_y = -0.5*y + 0.05*x
+        // H   = [[1, 0.05], [0.05, -0.5]]      (indefinite — saddle in y)
+        // At seed (0.05, 0): f = -0,  g = (0, 0.0025), |g| ≈ 0.0025 (near-stationary).
+        // At trial (x', 3): g_x = (x' - 0.05) + 0.15 = x' + 0.10
+        //                   g_y = -1.5 + 0.05*x'    (negative → at upper bound,
+        //                                            projection zeros it).
+        //                   |g_proj_trial| = |x' + 0.10|.
+        // For x' ≠ -0.10 the projected gradient at the clipped trial is
+        // strictly larger than |g_proj_k|, while f_trial is much smaller
+        // (the −0.25*y² term gives a 2.25 reduction at y=3).
+        struct SaddleBoxed;
+        impl ZerothOrderObjective for SaddleBoxed {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                Ok(0.5 * (x[0] - 0.05).powi(2) - 0.25 * x[1].powi(2) + 0.05 * x[0] * x[1])
+            }
+        }
+        impl FirstOrderObjective for SaddleBoxed {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                Ok(FirstOrderSample {
+                    value: 0.5 * (x[0] - 0.05).powi(2) - 0.25 * x[1].powi(2)
+                        + 0.05 * x[0] * x[1],
+                    gradient: array![(x[0] - 0.05) + 0.05 * x[1], -0.5 * x[1] + 0.05 * x[0]],
+                })
+            }
+        }
+        impl SecondOrderObjective for SaddleBoxed {
+            fn eval_hessian(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<SecondOrderSample, ObjectiveEvalError> {
+                Ok(SecondOrderSample {
+                    value: 0.5 * (x[0] - 0.05).powi(2) - 0.25 * x[1].powi(2)
+                        + 0.05 * x[0] * x[1],
+                    gradient: array![(x[0] - 0.05) + 0.05 * x[1], -0.5 * x[1] + 0.05 * x[0]],
+                    hessian: Some(array![[1.0, 0.05], [0.05, -0.5]]),
+                })
+            }
+        }
+        struct CountObs {
+            accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            rejected: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl OptimizerObserver for CountObs {
+            fn on_iteration_start(&mut self, _info: &IterationInfo) {}
+            fn on_step_accepted(&mut self, _info: &StepInfo) {
+                self.accepted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            fn on_step_rejected(&mut self, _info: &StepInfo) {
+                self.rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let lower = array![-3.0, -3.0];
+        let upper = array![3.0, 3.0];
+        let bounds = Bounds::new(lower, upper, 1e-6).unwrap();
+        let x0 = array![0.05, 0.0];
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rejected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let obs = CountObs {
+            accepted: std::sync::Arc::clone(&accepted),
+            rejected: std::sync::Arc::clone(&rejected),
+        };
+        let mut solver = super::Arc::new(x0, SaddleBoxed)
+            .with_bounds(bounds)
+            .with_max_iterations(MaxIterations::new(20).unwrap())
+            .with_tolerance(Tolerance::new(1e-5).unwrap())
+            .with_observer(obs);
+        let sol = solver
+            .run()
+            .expect("ARC must converge on saddle-bounded 2D problem");
+        let n_accepted = accepted.load(std::sync::atomic::Ordering::Relaxed);
+        let n_rejected = rejected.load(std::sync::atomic::Ordering::Relaxed);
+        // The constrained minimum is at one of the y-bounds (the saddle in
+        // y means both (x*, ±3) are local minima; ARC will find one).
+        assert!(
+            (sol.final_point[1].abs() - 3.0).abs() < 1e-3,
+            "y should be at a box bound; got y={} (iters={}, accepted={}, rejected={})",
+            sol.final_point[1],
+            sol.iterations,
+            n_accepted,
+            n_rejected
+        );
+        assert!(
+            sol.final_value < -2.0,
+            "expected f < -2 at saddle escape to box bound; got {} (iters={})",
+            sol.final_value,
+            sol.iterations
+        );
+        // With the fix, the clipped descent step is accepted via ρ-ratio
+        // even though |g_trial| > |g_k|. With the old dual-criterion that
+        // step is rejected, σ grows by doubling, the next trial step is
+        // shorter, may or may not clip, etc. — slow convergence with many
+        // rejections.
+        assert!(
+            n_rejected <= 4,
+            "expected ≤4 rejections; got rejected={} accepted={} iters={} — \
+             suggests the clipped-descent dual-criterion bug is back",
+            n_rejected,
+            n_accepted,
+            sol.iterations
+        );
     }
 
     /// ARC must not burn iterations at a flat minimum when the rho
