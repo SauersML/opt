@@ -3862,58 +3862,6 @@ impl ArcCore {
         let mut model_failure_streak = 0usize;
         let mut h_model_workspace = Array2::<f64>::zeros((n, n));
 
-        // ── Cost-stagnation noise-floor detector ────────────────────────────
-        //
-        // ARC's stationarity criterion is `|g_proj| <= effective_tol`. With
-        // an objective whose evaluation has a noise floor (e.g. inner
-        // solver's β-precision propagating to outer LAML gradient), `|g|`
-        // oscillates above `effective_tol` indefinitely while `f_k`
-        // converges to its noise-limited value. Without this guard ARC
-        // burns through `max_iterations` evaluating essentially the same
-        // cost — at biobank-scale REML evaluations that is minutes of
-        // wasted work per fit.
-        //
-        // We declare `NumericallyConverged` once two coupled conditions
-        // hold for `STAGNATION_WINDOW` consecutive iterations:
-        //   (a) successive `f_k` values agree within a relative
-        //       tolerance scaled to the cost magnitude — the cost has
-        //       essentially stopped moving;
-        //   (b) `|g_proj|` has already dropped to a small fraction of
-        //       its initial value — the optimizer landed in the basin
-        //       of attraction of a stationary point before the noise
-        //       floor was reached.
-        //
-        // Both conditions are needed: (a) alone fires too early when an
-        // initial step rejects and f stays put; (b) alone fires when
-        // the optimizer is just starting and `g_norm` is naturally tiny
-        // because the seed is already near a flat plateau.
-        // Noise-floor convergence thresholds. The trio is calibrated for
-        // outer LAML / REML objectives where the inner solver's
-        // β-precision (typically 1e-5 relative) propagates to outer
-        // gradient noise around 1e-2..1e-3 relative to the seed-scale
-        // gradient. Tighter values miss the noise-floor regime and
-        // burn the iteration budget; looser ones cut convergence too
-        // early on objectives that have not yet stagnated.
-        //   * TOL_F_REL = 1e-6: an order of magnitude tighter than the
-        //     typical inner-solver β-noise floor, but loose enough that
-        //     successive accepted steps near the noise floor mark as
-        //     "flat" instead of as real progress.
-        //   * GRAD_DROP_FACTOR = 5e-2: 5% of the seed |g|. Strict enough
-        //     to require meaningful descent, loose enough that the
-        //     well-conditioned regime is reached within a few iters.
-        //   * WINDOW = 3 / MIN_ITERS = 5: identical to `StallPolicy::On
-        //     { window: 3 }` in `BfgsCore::run`. Window 3 is the
-        //     minimum that filters out single-iter noise spikes;
-        //     MIN_ITERS 5 prevents the streak from firing on the
-        //     first few iters of a fit that is still in the basin-
-        //     finding phase.
-        const STAGNATION_WINDOW: usize = 3;
-        const STAGNATION_TOL_F_REL: f64 = 1e-6;
-        const STAGNATION_GRAD_DROP_FACTOR: f64 = 5e-2;
-        const STAGNATION_MIN_ITERS: usize = 5;
-        let mut cost_stagnation_streak: usize = 0;
-        let mut f_k_iter_prev: f64 = f_k;
-
         for k in 0..self.max_iterations {
             // Per-iter observer notification. Mirrors `NewtonTrustRegionCore::run`;
             // without this hook, callers driving outer-loop bookkeeping
@@ -3943,41 +3891,6 @@ impl ArcCore {
                     hess_evals,
                 ));
             }
-
-            // Noise-floor convergence: cost-flat AND gradient-already-dropped
-            // for a window of consecutive iters. See the constants above
-            // for the rationale.
-            let cost_flat = (f_k - f_k_iter_prev).abs()
-                <= STAGNATION_TOL_F_REL * (1.0 + f_k.abs());
-            let grad_dropped = initial_g_norm_for_tol > 0.0
-                && g_norm.is_finite()
-                && g_norm <= STAGNATION_GRAD_DROP_FACTOR * initial_g_norm_for_tol;
-            if cost_flat && grad_dropped {
-                cost_stagnation_streak += 1;
-            } else {
-                cost_stagnation_streak = 0;
-            }
-            if cost_stagnation_streak >= STAGNATION_WINDOW && k >= STAGNATION_MIN_ITERS {
-                log::info!(
-                    "[ARC] Converged (cost-stagnation): iters={}, f={:.6e}, ||g||={:.3e}",
-                    k + 1,
-                    f_k,
-                    g_norm
-                );
-                return Ok(Solution::gradient_based_with_status(
-                    x_k,
-                    f_k,
-                    g_k,
-                    g_norm,
-                    Some(h_k),
-                    k + 1,
-                    func_evals,
-                    grad_evals,
-                    hess_evals,
-                    OptimizationStatus::NumericallyConverged,
-                ));
-            }
-            f_k_iter_prev = f_k;
 
             let h_model = if hessian_is_effectively_symmetric(&h_k) {
                 &h_k
@@ -6689,43 +6602,6 @@ impl MatrixFreeTrustRegionCore {
             });
         }
 
-        // ── Cost-stagnation noise-floor detector ────────────────────────────
-        //
-        // Same noise-floor convergence guard as ARC::run; see that loop for
-        // the full rationale. When the outer objective evaluation has a
-        // noise floor (e.g. inner solver's β-precision propagating to the
-        // outer LAML gradient), `|g|` oscillates above `effective_tol`
-        // indefinitely while `f_k` converges. Declare `NumericallyConverged`
-        // once successive `f_k` values agree to relative tolerance AND
-        // `|g_proj|` has dropped to a small fraction of its initial value,
-        // for a window of consecutive iterations.
-        // Noise-floor convergence thresholds. The trio is calibrated for
-        // outer LAML / REML objectives where the inner solver's
-        // β-precision (typically 1e-5 relative) propagates to outer
-        // gradient noise around 1e-2..1e-3 relative to the seed-scale
-        // gradient. Tighter values miss the noise-floor regime and
-        // burn the iteration budget; looser ones cut convergence too
-        // early on objectives that have not yet stagnated.
-        //   * TOL_F_REL = 1e-6: an order of magnitude tighter than the
-        //     typical inner-solver β-noise floor, but loose enough that
-        //     successive accepted steps near the noise floor mark as
-        //     "flat" instead of as real progress.
-        //   * GRAD_DROP_FACTOR = 5e-2: 5% of the seed |g|. Strict enough
-        //     to require meaningful descent, loose enough that the
-        //     well-conditioned regime is reached within a few iters.
-        //   * WINDOW = 3 / MIN_ITERS = 5: identical to `StallPolicy::On
-        //     { window: 3 }` in `BfgsCore::run`. Window 3 is the
-        //     minimum that filters out single-iter noise spikes;
-        //     MIN_ITERS 5 prevents the streak from firing on the
-        //     first few iters of a fit that is still in the basin-
-        //     finding phase.
-        const STAGNATION_WINDOW: usize = 3;
-        const STAGNATION_TOL_F_REL: f64 = 1e-6;
-        const STAGNATION_GRAD_DROP_FACTOR: f64 = 5e-2;
-        const STAGNATION_MIN_ITERS: usize = 5;
-        let mut cost_stagnation_streak: usize = 0;
-        let mut f_k_iter_prev: f64 = sample.value;
-
         for k in 0..self.max_iterations {
             self.last_trust_radius = Some(trust_radius);
             // Per-iter observer notification. Mirrors NewtonTR / ARC.
@@ -6758,41 +6634,6 @@ impl MatrixFreeTrustRegionCore {
                 );
                 return Ok(sol);
             }
-
-            // Noise-floor stagnation exit: cost-flat AND gradient-already-dropped
-            // for a window of consecutive iters.
-            let cost_flat = (sample.value - f_k_iter_prev).abs()
-                <= STAGNATION_TOL_F_REL * (1.0 + sample.value.abs());
-            let grad_dropped = initial_g_proj_norm > 0.0
-                && g_proj_norm.is_finite()
-                && g_proj_norm <= STAGNATION_GRAD_DROP_FACTOR * initial_g_proj_norm;
-            if cost_flat && grad_dropped {
-                cost_stagnation_streak += 1;
-            } else {
-                cost_stagnation_streak = 0;
-            }
-            if cost_stagnation_streak >= STAGNATION_WINDOW && k >= STAGNATION_MIN_ITERS {
-                log::info!(
-                    "[MFTR] Converged (cost-stagnation): iters={}, f={:.6e}, ||g||={:.3e}",
-                    k + 1,
-                    sample.value,
-                    g_proj_norm
-                );
-                let sol = Solution::gradient_based_with_status(
-                    x_k.clone(),
-                    sample.value,
-                    sample.gradient.clone(),
-                    g_proj_norm,
-                    None,
-                    k + 1,
-                    func_evals,
-                    grad_evals,
-                    hvp_evals,
-                    OptimizationStatus::NumericallyConverged,
-                );
-                return Ok(sol);
-            }
-            f_k_iter_prev = sample.value;
 
             // Materialize a Hessian operator handle for the CG step.
             // For operators that advertise cheap materialization
@@ -12145,10 +11986,13 @@ mod tests {
     }
 
     /// ARC must not burn iterations at a flat minimum when the rho
-    /// ratio is dominated by ULP noise on `f`. With the 0.5.3
-    /// numerical-convergence guard the run terminates in O(1) iters
-    /// via `NumericallyConverged`; without the guard it would exhaust
-    /// the iteration budget while `sigma` oscillates.
+    /// ratio is dominated by ULP noise on `f`. The numerical-convergence
+    /// guard fires when the trust-region predicted reduction itself is
+    /// below the cost's ULP scale (`ARC_NUMERICAL_CONV_FACTOR * eps * |f|`),
+    /// meaning the cubic model has nothing more to extract. The run then
+    /// terminates in O(1) iters via `NumericallyConverged`; without the
+    /// guard it would exhaust the iteration budget while `sigma`
+    /// oscillates.
     #[test]
     fn arc_terminates_at_flat_minimum_via_numerical_convergence() {
         let x0 = array![1.001, 1.001];
