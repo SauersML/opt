@@ -4219,6 +4219,16 @@ struct BfgsCore {
     initial_metric: Option<InitialMetric>,
     /// Observer for accepted-step / iteration-start events.
     observer: Option<Box<dyn OptimizerObserver>>,
+    /// Per-axis L∞ trust budget. When set, the BFGS direction is uniformly
+    /// scaled at the start of each iteration so that `|d[i]| ≤ caps[i]` on
+    /// every axis with a finite cap. Use `f64::INFINITY` (or any non-finite
+    /// value) for axes that should not be capped. This is the native
+    /// equivalent of the historical "objective-side fake-finite-cost"
+    /// pattern: shortening the BFGS direction here keeps the line search
+    /// honest (no fake costs poisoning Wolfe brackets) while letting the
+    /// caller impose per-axis budgets that differ wildly across parameter
+    /// blocks (e.g. log-λ wants `|d|≤5` but log-κ wants `|d|≤ln 2`).
+    axis_step_caps: Option<Array1<f64>>,
 }
 
 /// A configurable BFGS solver.
@@ -4525,6 +4535,7 @@ impl BfgsCore {
             gradient_tolerance: None,
             initial_metric: None,
             observer: None,
+            axis_step_caps: None,
         }
     }
 
@@ -5003,6 +5014,35 @@ impl BfgsCore {
                     if present_d_k[i] > 0.0 && x_k[i] >= bounds.upper[i] - bounds.tol {
                         present_d_k[i] = 0.0;
                     }
+                }
+            }
+            // Per-axis L∞ trust budget (see `Bfgs::with_axis_step_caps`).
+            // Applied AFTER bounds projection so the cap acts on the actual
+            // line-search direction. We uniformly shorten the direction by
+            // the tightest binding ratio — descent sign is preserved (the
+            // scale is positive), and the line search can still pick α ≤ 1
+            // if Wolfe / cost conditions need a smaller step.
+            if let Some(caps) = self.axis_step_caps.as_ref() {
+                if caps.len() != present_d_k.len() {
+                    return Err(BfgsError::InternalInvariant {
+                        message: format!(
+                            "axis_step_caps length {} does not match parameter dimension {}",
+                            caps.len(),
+                            present_d_k.len()
+                        ),
+                    });
+                }
+                let mut scale = 1.0_f64;
+                for (i, cap) in caps.iter().enumerate() {
+                    if cap.is_finite() && *cap > 0.0 {
+                        let d_abs = present_d_k[i].abs();
+                        if d_abs > *cap {
+                            scale = scale.min(*cap / d_abs);
+                        }
+                    }
+                }
+                if scale < 1.0 && scale.is_finite() {
+                    present_d_k.mapv_inplace(|v| v * scale);
                 }
             }
             // Enforce descent direction; reset if needed
@@ -6052,6 +6092,32 @@ where
         O: OptimizerObserver + 'static,
     {
         self.core.observer = Some(Box::new(observer));
+        self
+    }
+
+    /// Cap the BFGS search direction component-wise. At the start of each
+    /// iteration, after the descent direction `d = -B_inv · g` is computed
+    /// (and any bound-active components are zeroed), if any axis with a
+    /// finite cap has `|d[i]| > caps[i]` the direction is uniformly scaled
+    /// by the tightest binding ratio so every per-axis budget is respected.
+    /// The line search consumes the shortened direction; α can still
+    /// backtrack further if Wolfe / cost conditions need it.
+    ///
+    /// Pass `f64::INFINITY` (or any non-finite value) on axes that should
+    /// not be capped. Calling this method twice replaces the previous caps;
+    /// the array length is validated lazily during `run()` against the
+    /// parameter dimension.
+    ///
+    /// Use this when different parameter blocks have very different natural
+    /// step magnitudes — e.g. a joint solver over log-λ (natural step ≈ 5)
+    /// and log-κ (natural step ≈ ln 2): a single isotropic trust radius
+    /// can't simultaneously give λ headroom while keeping κ from
+    /// oscillating across orders of magnitude per iter. This is the
+    /// principled replacement for "objective-side fake-finite-cost on
+    /// overreach" patterns: shortening the BFGS direction up front keeps
+    /// the line search honest (no sentinel costs poisoning Wolfe brackets).
+    pub fn with_axis_step_caps(mut self, caps: Array1<f64>) -> Self {
+        self.core.axis_step_caps = Some(caps);
         self
     }
 
