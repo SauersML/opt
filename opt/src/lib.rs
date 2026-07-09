@@ -101,6 +101,150 @@ use ndarray::{Array1, Array2, ArrayView2};
 use std::collections::VecDeque;
 use std::sync::Arc as StdArc;
 
+/// Shared constants for generic backtracking and ridge-escalation policies.
+pub mod constants {
+    /// Armijo sufficient-decrease parameter `c1`.
+    pub const ARMIJO_C1: f64 = 1.0e-4;
+    /// Multiplicative step factor applied to a rejected trial.
+    pub const BACKTRACK_CONTRACTION: f64 = 0.5;
+    /// Default cap on backtracking trials.
+    pub const MAX_BACKTRACK_HALVINGS: usize = 60;
+    /// Round-off cushion in units of `f64::EPSILON`.
+    pub const ARMIJO_ROUNDOFF_EPS_MULTIPLE: f64 = 8.0;
+    /// Geometric growth factor for ridge / Levenberg-Marquardt escalation.
+    pub const RIDGE_GROWTH: f64 = 10.0;
+}
+
+/// Round-off cushion added to an Armijo sufficient-decrease threshold.
+#[inline]
+#[must_use]
+pub fn armijo_roundoff_cushion(current_value: f64) -> f64 {
+    constants::ARMIJO_ROUNDOFF_EPS_MULTIPLE * f64::EPSILON * (1.0 + current_value.abs())
+}
+
+/// A trial accepted by [`backtracking_line_search`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AcceptedStep<P> {
+    /// Accepted step scale.
+    pub step: f64,
+    /// Objective or merit value at the accepted trial.
+    pub value: f64,
+    /// Caller-produced data associated with the accepted trial.
+    pub payload: P,
+}
+
+/// Geometric backtracking schedule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BacktrackConfig {
+    /// Initial step scale.
+    pub initial_step: f64,
+    /// Multiplier applied after a rejected or invalid trial.
+    pub contraction: f64,
+    /// Maximum number of trials.
+    pub max_steps: usize,
+}
+
+impl Default for BacktrackConfig {
+    fn default() -> Self {
+        Self {
+            initial_step: 1.0,
+            contraction: constants::BACKTRACK_CONTRACTION,
+            max_steps: constants::MAX_BACKTRACK_HALVINGS,
+        }
+    }
+}
+
+/// Evaluate geometrically contracted trial steps until one is accepted.
+///
+/// `trial` returns `Ok(None)` for a recoverably invalid point; such a point is
+/// contracted without invoking `accept`. An `Err` aborts immediately. The
+/// payload from the first accepted trial is returned without recomputation.
+pub fn backtracking_line_search<P, E>(
+    config: BacktrackConfig,
+    mut trial: impl FnMut(f64) -> Result<Option<(f64, P)>, E>,
+    accept: impl Fn(f64, f64) -> bool,
+) -> Result<Option<AcceptedStep<P>>, E> {
+    let mut step = config.initial_step;
+    for _ in 0..config.max_steps {
+        if let Some((value, payload)) = trial(step)?
+            && accept(step, value)
+        {
+            return Ok(Some(AcceptedStep {
+                step,
+                value,
+                payload,
+            }));
+        }
+        step *= config.contraction;
+    }
+    Ok(None)
+}
+
+/// Geometric ridge / Levenberg-Marquardt escalation schedule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RidgeSchedule {
+    /// First ridge attempted.
+    pub initial: f64,
+    /// Multiplier applied after a failed attempt.
+    pub growth: f64,
+    /// Maximum number of ridge values attempted.
+    pub max_escalations: usize,
+}
+
+impl RidgeSchedule {
+    /// Build a schedule using [`constants::RIDGE_GROWTH`].
+    #[must_use]
+    pub fn geometric(initial: f64, max_escalations: usize) -> Self {
+        Self {
+            initial,
+            growth: constants::RIDGE_GROWTH,
+            max_escalations,
+        }
+    }
+}
+
+/// Successful result from [`escalate_ridge`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RidgeSuccess<T> {
+    /// Caller-produced result.
+    pub value: T,
+    /// Ridge at which the operation succeeded.
+    pub ridge: f64,
+    /// One-based attempt index.
+    pub escalations: usize,
+}
+
+/// Exhausted result from [`escalate_ridge`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RidgeExhausted {
+    /// Ridge the schedule would attempt next.
+    pub next_ridge: f64,
+    /// Number of attempted ridge values.
+    pub escalations: usize,
+}
+
+/// Try an operation over a geometric sequence of ridge values.
+pub fn escalate_ridge<T>(
+    schedule: RidgeSchedule,
+    mut attempt: impl FnMut(f64) -> Option<T>,
+) -> Result<RidgeSuccess<T>, RidgeExhausted> {
+    let mut ridge = schedule.initial;
+    for escalation in 1..=schedule.max_escalations {
+        if let Some(value) = attempt(ridge) {
+            return Ok(RidgeSuccess {
+                value,
+                ridge,
+                escalations: escalation,
+            });
+        }
+        ridge *= schedule.growth;
+    }
+    Err(RidgeExhausted {
+        next_ridge: ridge,
+        escalations: schedule.max_escalations,
+    })
+}
+
 // Numerical helpers and small utilities
 const EPS: f64 = f64::EPSILON;
 #[inline]
@@ -1316,9 +1460,9 @@ pub struct SecondOrderSample {
 /// products through `apply_into`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HessianMaterialization {
-    /// Operator cannot produce a dense matrix; only Hv products are
-    /// available. Solvers that require a dense Hessian must error or
-    /// fall back to a matrix-free step (Steihaug-Toint, etc.).
+    /// Automatic dense materialization is not part of the operator's work
+    /// model. Explicit diagnostic callers may still probe the basis through
+    /// [`HessianOperator::materialize_dense`], but solvers stay matrix-free.
     Unavailable,
     /// Materialization is possible but expensive: it costs one
     /// `apply_into` per column. Solvers should prefer matrix-free
@@ -1368,6 +1512,24 @@ pub trait HessianOperator: Send + Sync {
     /// the run.
     fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), ObjectiveEvalError>;
 
+    /// Compute `H * v` into a newly allocated vector.
+    ///
+    /// Iterative solvers should use [`Self::apply_into`] with reusable storage;
+    /// this convenience method is for one-off probes and diagnostics.
+    fn apply(&self, v: &Array1<f64>) -> Result<Array1<f64>, ObjectiveEvalError> {
+        let n = self.dim();
+        if v.len() != n {
+            return Err(ObjectiveEvalError::fatal(format!(
+                "HessianOperator::apply: input has length {}, operator has dim {}",
+                v.len(),
+                n
+            )));
+        }
+        let mut out = Array1::<f64>::zeros(n);
+        self.apply_into(v, &mut out)?;
+        Ok(out)
+    }
+
     /// Apply the operator to a stack of column vectors `H * X`. The
     /// default implementation is a column-by-column loop using
     /// `apply_into`; backends with an efficient batched path (e.g.
@@ -1400,44 +1562,57 @@ pub trait HessianOperator: Send + Sync {
         Ok(out)
     }
 
-    /// Reports whether `materialize_dense` is supported and how
-    /// expensive it is. Default: `Unavailable`.
+    /// Reports whether a solver should materialize automatically and how
+    /// expensive that route is. Default: `Unavailable` keeps solver policy
+    /// matrix-free; explicit callers can still request basis probing through
+    /// [`Self::materialize_dense`].
     fn materialization(&self) -> HessianMaterialization {
         HessianMaterialization::Unavailable
     }
 
-    /// Produce an explicit dense Hessian. The default implementation
-    /// uses `apply_mat` against the identity, costing `dim()` Hv
-    /// products. Operators that already hold a dense matrix should
-    /// override to return it directly.
+    /// Produce an explicit dense Hessian on explicit request. The default
+    /// implementation uses `apply_mat` against the identity, costing `dim()`
+    /// Hv products, regardless of the automatic work-model declaration.
+    /// Operators that already hold a dense matrix should override to return it
+    /// directly.
     fn materialize_dense(&self) -> Result<Array2<f64>, ObjectiveEvalError> {
-        match self.materialization() {
-            HessianMaterialization::Unavailable => Err(ObjectiveEvalError::fatal(
-                "HessianOperator::materialize_dense called on an operator that reports \
-                 HessianMaterialization::Unavailable",
-            )),
-            _ => {
-                let n = self.dim();
-                let identity = Array2::<f64>::eye(n);
-                self.apply_mat(identity.view())
-            }
-        }
+        let n = self.dim();
+        let identity = Array2::<f64>::eye(n);
+        let dense = self.apply_mat(identity.view())?;
+        validate_and_symmetrize_hessian(dense, n)
     }
 }
 
-/// Explicit Hessian payload exposed alongside `SecondOrderSample.hessian`
-/// for callers that want to declare exact-Hessian intent without going
-/// through `Option<Array2<f64>>`.
-///
-/// The `Option<Array2<f64>>` field on `SecondOrderSample` is preserved
-/// for backward compatibility; this richer type is what gam-style
-/// callers use to declare matrix-free / unavailable Hessians without
-/// inviting finite-difference fallback.
-///
-/// In opt 0.3 this type is publicly available but the dense solvers
-/// (`NewtonTrustRegion` and `Arc`) still consume the dense
-/// `Option<Array2<f64>>` form. A future minor will add operator-aware
-/// trust-region/ARC paths that consume `Operator(_)` directly.
+fn validate_and_symmetrize_hessian(
+    mut hessian: Array2<f64>,
+    expected_dim: usize,
+) -> Result<Array2<f64>, ObjectiveEvalError> {
+    if hessian.dim() != (expected_dim, expected_dim) {
+        return Err(ObjectiveEvalError::fatal(format!(
+            "Hessian materialization returned {}x{}, expected {}x{}",
+            hessian.nrows(),
+            hessian.ncols(),
+            expected_dim,
+            expected_dim
+        )));
+    }
+    if !hessian.iter().all(|value| value.is_finite()) {
+        return Err(ObjectiveEvalError::fatal(
+            "Hessian materialization produced non-finite entries",
+        ));
+    }
+    for row in 0..expected_dim {
+        for col in (row + 1)..expected_dim {
+            let symmetric = 0.5 * (hessian[[row, col]] + hessian[[col, row]]);
+            hessian[[row, col]] = symmetric;
+            hessian[[col, row]] = symmetric;
+        }
+    }
+    Ok(hessian)
+}
+
+/// Exact Hessian payload used by operator-aware optimizers and objective
+/// contracts.
 pub enum HessianValue {
     /// An explicit dense Hessian.
     Dense(Array2<f64>),
@@ -1477,6 +1652,33 @@ impl std::fmt::Debug for HessianValue {
                 ))
                 .finish(),
             Self::Unavailable => f.write_str("Unavailable"),
+        }
+    }
+}
+
+impl HessianValue {
+    /// Whether this value contains exact analytic curvature.
+    pub fn is_analytic(&self) -> bool {
+        matches!(self, Self::Dense(_) | Self::Operator(_))
+    }
+
+    /// Dimension of the represented Hessian, if one is available.
+    pub fn dim(&self) -> Option<usize> {
+        match self {
+            Self::Dense(hessian) => Some(hessian.nrows()),
+            Self::Operator(operator) => Some(operator.dim()),
+            Self::Unavailable => None,
+        }
+    }
+
+    /// Materialize exact curvature when present.
+    pub fn materialize_dense(&self) -> Result<Option<Array2<f64>>, ObjectiveEvalError> {
+        match self {
+            Self::Dense(hessian) => {
+                validate_and_symmetrize_hessian(hessian.clone(), hessian.nrows()).map(Some)
+            }
+            Self::Operator(operator) => operator.materialize_dense().map(Some),
+            Self::Unavailable => Ok(None),
         }
     }
 }
@@ -1861,9 +2063,11 @@ fn arc_outcome_into_report(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ObjectiveEvalError {
+    #[error("recoverable objective evaluation failure: {message}")]
     Recoverable { message: String },
+    #[error("fatal objective evaluation failure: {message}")]
     Fatal { message: String },
 }
 
@@ -1889,6 +2093,96 @@ pub trait FirstOrderObjective: ZerothOrderObjective {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError>;
 
     fn set_finite_difference_bounds(&mut self, _bounds: Option<&Bounds>) {}
+}
+
+/// Adapts an objective that naturally computes value and gradient together to
+/// the split [`ZerothOrderObjective`] / [`FirstOrderObjective`] interface used
+/// by the solvers.
+///
+/// Many expensive objectives produce the scalar value and gradient from the
+/// same factorization or device launch. A line search asks for the value first
+/// and, when the trial is usable, asks for the gradient at the identical point.
+/// Implementing the two objective traits independently would repeat that
+/// expensive work. `FusedObjective` evaluates the closure once, retains the
+/// complete sample after a value request, and moves it into the following
+/// gradient request without cloning the gradient.
+///
+/// The cache deliberately matches points bit-for-bit. Reusing a sample at a
+/// merely nearby point changes the objective observed by the line search and
+/// can invalidate Wolfe/Armijo decisions.
+pub struct FusedObjective<F> {
+    evaluator: F,
+    cached: Option<(Array1<f64>, FirstOrderSample)>,
+}
+
+impl<F> FusedObjective<F> {
+    /// Wrap a fused `(value, gradient)` evaluator.
+    pub fn new(evaluator: F) -> Self {
+        Self {
+            evaluator,
+            cached: None,
+        }
+    }
+
+    /// Consume the adapter and return its evaluator.
+    pub fn into_inner(self) -> F {
+        self.evaluator
+    }
+}
+
+impl<F> FusedObjective<F>
+where
+    F: FnMut(&Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError>,
+{
+    fn evaluate(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+        let sample = sanitize_first_order_sample((self.evaluator)(x)?)?;
+        if sample.gradient.len() != x.len() {
+            return Err(ObjectiveEvalError::fatal(format!(
+                "fused objective returned gradient length {}, expected {}",
+                sample.gradient.len(),
+                x.len(),
+            )));
+        }
+        Ok(sample)
+    }
+}
+
+impl<F> ZerothOrderObjective for FusedObjective<F>
+where
+    F: FnMut(&Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError>,
+{
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        if let Some((cached_x, sample)) = self.cached.as_ref()
+            && same_point_bits(cached_x, x)
+        {
+            return Ok(sample.value);
+        }
+        let sample = self.evaluate(x)?;
+        let value = sample.value;
+        self.cached = Some((x.clone(), sample));
+        Ok(value)
+    }
+}
+
+impl<F> FirstOrderObjective for FusedObjective<F>
+where
+    F: FnMut(&Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError>,
+{
+    fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+        if self
+            .cached
+            .as_ref()
+            .is_some_and(|(cached_x, _)| same_point_bits(cached_x, x))
+        {
+            return Ok(self
+                .cached
+                .take()
+                .expect("fused objective cache was checked as populated")
+                .1);
+        }
+        self.cached = None;
+        self.evaluate(x)
+    }
 }
 
 pub trait SecondOrderObjective: FirstOrderObjective {
@@ -2359,6 +2653,15 @@ where
 }
 
 const CACHE_POINT_EPS: f64 = 1e-14;
+
+#[inline]
+fn same_point_bits(lhs: &Array1<f64>, rhs: &Array1<f64>) -> bool {
+    lhs.len() == rhs.len()
+        && lhs
+            .iter()
+            .zip(rhs.iter())
+            .all(|(&l, &r)| l.to_bits() == r.to_bits())
+}
 
 #[inline]
 fn approx_scalar(lhs: f64, rhs: f64) -> bool {
@@ -5126,7 +5429,7 @@ impl BfgsCore {
                         self.c1_adapt,
                         self.c2_adapt,
                     ),
-                    LineSearchStrategy::Backtracking => backtracking_line_search(
+                    LineSearchStrategy::Backtracking => bfgs_backtracking_line_search(
                         self,
                         obj_fn,
                         &mut oracle,
@@ -5206,7 +5509,7 @@ impl BfgsCore {
                             if self.ls_failures_in_row >= 2 {
                                 self.gll.set_cap(10);
                             }
-                            let fallback_result = backtracking_line_search(
+                            let fallback_result = bfgs_backtracking_line_search(
                                 self,
                                 obj_fn,
                                 &mut oracle,
@@ -5401,7 +5704,7 @@ impl BfgsCore {
                             let g_proj_now = self.projected_gradient(&x_k, &g_k);
                             present_d_k = -g_proj_now;
                             self.constrain_search_direction(&x_k, &active_mask, &mut present_d_k)?;
-                            let fallback_result = backtracking_line_search(
+                            let fallback_result = bfgs_backtracking_line_search(
                                 self,
                                 obj_fn,
                                 &mut oracle,
@@ -7855,7 +8158,8 @@ where
                 false
             };
             if kink_lo || kinked {
-                let fallback = backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
+                let fallback =
+                    bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
                 return fallback
                     .map(|(a, f, g, fe, ge, kind)| {
                         (a, f, g, fe + func_evals, ge + grad_evals, kind)
@@ -7945,7 +8249,8 @@ where
                 false
             };
             if kink_lo || kinked {
-                let fallback = backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
+                let fallback =
+                    bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
                 return fallback
                     .map(|(a, f, g, fe, ge, kind)| {
                         (a, f, g, fe + func_evals, ge + grad_evals, kind)
@@ -8087,7 +8392,7 @@ where
 }
 
 /// A backtracking line search that shrinks trial steps until a Wolfe-safe acceptance fires.
-fn backtracking_line_search<ObjFn>(
+fn bfgs_backtracking_line_search<ObjFn>(
     core: &mut BfgsCore,
     obj_fn: &mut ObjFn,
     oracle: &mut FirstOrderCache,
@@ -8383,7 +8688,7 @@ where
             false
         };
         if kink_lo || kink_hi {
-            let fallback = backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
+            let fallback = bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
             return fallback
                 .map(|(a, f, g, fe, ge, kind)| (a, f, g, fe + func_evals, ge + grad_evals, kind));
         }
@@ -8423,7 +8728,8 @@ where
                 });
             }
             if kink_mid {
-                let fallback = backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
+                let fallback =
+                    bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
                 return fallback
                     .map(|(a, f, g, fe, ge, kind)| {
                         (a, f, g, fe + func_evals, ge + grad_evals, kind)
@@ -8514,7 +8820,8 @@ where
                 });
             }
             if kink_mid {
-                let fallback = backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
+                let fallback =
+                    bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
                 return fallback
                     .map(|(a, f, g, fe, ge, kind)| {
                         (a, f, g, fe + func_evals, ge + grad_evals, kind)
@@ -8675,7 +8982,7 @@ where
             });
         }
         if kink_j {
-            let fallback = backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
+            let fallback = bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
             return fallback
                 .map(|(a, f, g, fe, ge, kind)| (a, f, g, fe + func_evals, ge + grad_evals, kind));
         }
@@ -8947,16 +9254,17 @@ mod tests {
     //    that our results (final point and iteration count) are equivalent.
 
     use super::{
-        ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, BatchZerothOrderObjective,
-        Bfgs, BfgsError, Bounds, FallbackPolicy, FiniteDiffGradient, FirstOrderObjective,
-        FirstOrderObjectiveInto, FirstOrderSample, FirstOrderWorkspace, FixedPoint,
-        FixedPointObjective, FixedPointSample, FixedPointStatus, GradientTolerance,
-        HessianFallbackPolicy, HessianMaterialization, HessianOperator, HessianValue,
-        InitialMetric, IterationInfo, LineSearchFailureReason, MatrixFreeTrustRegion,
+        AcceptedStep, ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, BacktrackConfig,
+        BatchZerothOrderObjective, Bfgs, BfgsError, Bounds, FallbackPolicy, FiniteDiffGradient,
+        FirstOrderObjective, FirstOrderObjectiveInto, FirstOrderSample, FirstOrderWorkspace,
+        FixedPoint, FixedPointObjective, FixedPointSample, FixedPointStatus, FusedObjective,
+        GradientTolerance, HessianFallbackPolicy, HessianMaterialization, HessianOperator,
+        HessianValue, InitialMetric, IterationInfo, LineSearchFailureReason, MatrixFreeTrustRegion,
         MatrixFreeTrustRegionError, MaxIterations, NewtonTrustRegion, ObjectiveEvalError,
         OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver, Problem, Profile,
-        SecondOrderObjective, SecondOrderObjectiveInto, SecondOrderProblem, SecondOrderSample,
-        SecondOrderWorkspace, Solution, StepInfo, Tolerance, ZerothOrderObjective, optimize,
+        RidgeSchedule, SecondOrderObjective, SecondOrderObjectiveInto, SecondOrderProblem,
+        SecondOrderSample, SecondOrderWorkspace, Solution, StepInfo, Tolerance,
+        ZerothOrderObjective, backtracking_line_search, escalate_ridge, optimize,
     };
     use ndarray::{Array1, Array2, array};
     use spectral::prelude::*;
@@ -9262,6 +9570,110 @@ mod tests {
 
     fn bounds(lower: Array1<f64>, upper: Array1<f64>, tol: f64) -> Bounds {
         Bounds::new(lower, upper, tol).unwrap()
+    }
+
+    #[test]
+    fn generic_backtracking_accepts_first_valid_trial() {
+        let accepted = backtracking_line_search::<f64, ()>(
+            BacktrackConfig::default(),
+            |step| Ok((step <= 0.3).then_some((step, step))),
+            |_step, _value| true,
+        )
+        .unwrap()
+        .expect("a valid trial should be accepted");
+
+        assert_eq!(accepted.step, 0.25);
+        assert_eq!(accepted.payload, 0.25);
+    }
+
+    #[test]
+    fn generic_backtracking_exhausts_and_propagates_errors() {
+        let exhausted = backtracking_line_search::<(), ()>(
+            BacktrackConfig {
+                max_steps: 3,
+                ..BacktrackConfig::default()
+            },
+            |_step| Ok(Some((0.0, ()))),
+            |_step, _value| false,
+        )
+        .unwrap();
+        assert!(exhausted.is_none());
+
+        let error: Result<Option<AcceptedStep<()>>, &str> = backtracking_line_search(
+            BacktrackConfig::default(),
+            |_step| Err("boom"),
+            |_step, _value| true,
+        );
+        assert_eq!(error, Err("boom"));
+    }
+
+    #[test]
+    fn generic_ridge_escalation_reports_success_and_exhaustion() {
+        let success = escalate_ridge(RidgeSchedule::geometric(1.0, 4), |ridge| {
+            (ridge >= 5.0).then_some(ridge)
+        })
+        .expect("second ridge should succeed");
+        assert_eq!(success.ridge, 10.0);
+        assert_eq!(success.escalations, 2);
+
+        let exhausted = escalate_ridge::<f64>(RidgeSchedule::geometric(1.0, 3), |_ridge| None)
+            .expect_err("schedule should exhaust");
+        assert_eq!(exhausted.next_ridge, 1000.0);
+        assert_eq!(exhausted.escalations, 3);
+    }
+
+    #[test]
+    fn fused_objective_reuses_value_evaluation_for_gradient() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_for_objective = Arc::clone(&calls);
+        let mut objective = FusedObjective::new(move |x: &Array1<f64>| {
+            *calls_for_objective.lock().expect("lock call count") += 1;
+            Ok(FirstOrderSample {
+                value: x.dot(x),
+                gradient: x * 2.0,
+            })
+        });
+        let x = array![1.0, -2.0];
+
+        assert_eq!(objective.eval_cost(&x).unwrap(), 5.0);
+        let sample = objective.eval_grad(&x).unwrap();
+
+        assert_eq!(sample.gradient, array![2.0, -4.0]);
+        assert_eq!(*calls.lock().expect("lock call count"), 1);
+    }
+
+    #[test]
+    fn fused_objective_does_not_reuse_nearby_point() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_for_objective = Arc::clone(&calls);
+        let mut objective = FusedObjective::new(move |x: &Array1<f64>| {
+            *calls_for_objective.lock().expect("lock call count") += 1;
+            Ok(FirstOrderSample {
+                value: x.dot(x),
+                gradient: x * 2.0,
+            })
+        });
+
+        objective.eval_cost(&array![1.0]).unwrap();
+        objective.eval_grad(&array![1.0 + 1.0e-15]).unwrap();
+
+        assert_eq!(*calls.lock().expect("lock call count"), 2);
+    }
+
+    #[test]
+    fn fused_objective_rejects_wrong_gradient_shape() {
+        let mut objective = FusedObjective::new(|_x: &Array1<f64>| {
+            Ok(FirstOrderSample {
+                value: 0.0,
+                gradient: Array1::zeros(2),
+            })
+        });
+
+        let err = objective
+            .eval_cost(&array![0.0])
+            .expect_err("shape mismatch must fail");
+
+        assert!(matches!(err, ObjectiveEvalError::Fatal { .. }));
     }
 
     /// The Rosenbrock function, a classic non-convex benchmark with a minimum at [1, 1].
@@ -10319,7 +10731,7 @@ mod tests {
         let g_k = 2.0 * x_k.clone();
         let d_k = -g_k.clone();
 
-        let (alpha, f_new, g_new, _, _, kind) = super::backtracking_line_search(
+        let (alpha, f_new, g_new, _, _, kind) = super::bfgs_backtracking_line_search(
             &mut core,
             &mut bfgs_oracle(|x: &Array1<f64>| (x.dot(x), 2.0 * x)),
             &mut oracle,
@@ -10344,7 +10756,7 @@ mod tests {
         let (f_k, g_k) = non_convex_max(&x_k);
         let d_k = array![1.0];
 
-        let r = super::backtracking_line_search(
+        let r = super::bfgs_backtracking_line_search(
             &mut core,
             &mut bfgs_oracle(non_convex_max),
             &mut oracle,
@@ -11293,7 +11705,7 @@ mod tests {
         let d_k = -g_k.clone();
         let mut core = super::BfgsCore::new(x0.clone());
         let mut oracle = super::FirstOrderCache::new(x0.len());
-        let err = super::backtracking_line_search(
+        let err = super::bfgs_backtracking_line_search(
             &mut core,
             &mut AlwaysRecoverableTrials,
             &mut oracle,

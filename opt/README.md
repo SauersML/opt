@@ -19,6 +19,8 @@ This work is a rewrite of the original `bfgs` crate by Paul Kernfeld.
 
 - Strong Wolfe line search with practical fallback behavior for difficult first-order problems
 - Dense BFGS with inverse-Hessian updates and stability safeguards
+- Fused value+gradient objectives that avoid duplicate work at accepted line-search points
+- Reusable backtracking line-search and geometric ridge-escalation primitives
 - Newton trust-region steps using supplied Hessians
 - ARC with adaptive cubic regularization updates
 - Fixed-point iteration with projection and step-norm termination
@@ -33,7 +35,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-opt = "0.2.0"
+opt = "0.5.12"
 ```
 
 ### Example: First-Order Optimization

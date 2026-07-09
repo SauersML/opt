@@ -13,6 +13,7 @@ This crate exposes the first-order API only:
 - `Problem`
 - `optimize`
 - `FirstOrderObjective`
+- `FusedObjective` for value+gradient evaluators backed by one expensive computation
 - `ZerothOrderObjective`
 - `FiniteDiffGradient`
 - `Solution`
@@ -27,7 +28,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-wolfe_bfgs = "0.4.0"
+wolfe_bfgs = "0.6.3"
 ```
 
 ## Example
