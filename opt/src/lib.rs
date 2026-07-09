@@ -245,6 +245,1000 @@ pub fn escalate_ridge<T>(
     })
 }
 
+// =====================================================================
+// Trust-region radius policy
+// =====================================================================
+
+/// Rich classification of the branch a [`TrustRegionPolicy::update`]
+/// took on a single trust-region step. Surfaced so callers can log at a
+/// glance whether the solver is being throttled by the region
+/// (`ShrinkOnRejection` / `RejectFloor`), sitting well inside it
+/// (`HoldInside`), or expanding into freshly available room
+/// (`GrowAtBoundary`).
+///
+/// The four `Accepted`-family variants (`GrowAtBoundary`, `HoldInside`,
+/// `HoldModerate`, `ShrinkOnMarginalAccept`) all correspond to accepted
+/// steps; the remaining two to rejected ones. Two orthogonal signals —
+/// whether the realized reduction was within the objective's round-off
+/// noise floor, and whether the model's predicted reduction was
+/// non-positive — are reported as booleans on [`TrustRegionStep`] rather
+/// than stealing a decision label, so the classification above stays a
+/// faithful superset of every consumer's existing telemetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustRegionDecision {
+    /// `rho > eta_expand` AND the step reached the region boundary — the
+    /// model is excellent and the radius was the binding constraint, so
+    /// the radius was expanded.
+    GrowAtBoundary,
+    /// `rho > eta_expand` but the step sits inside the region; radius
+    /// held (no evidence the region constrained the step).
+    HoldInside,
+    /// `eta_shrink <= rho <= eta_expand` (moderate fidelity) — radius held.
+    HoldModerate,
+    /// Step accepted (`rho > eta_accept`) but `rho < eta_shrink`; radius
+    /// shrunk to be more conservative next iteration.
+    ShrinkOnMarginalAccept,
+    /// Step rejected — radius shrunk (and, when a rejection step cap is
+    /// configured, additionally capped to a fraction of the proposed step
+    /// norm so a re-proposal stays inside the rejected region).
+    ShrinkOnRejection,
+    /// A shrink landed the radius at (or below) `min_radius`. Persistent
+    /// `RejectFloor` is the unambiguous signal that no descent direction
+    /// exists at the smallest admissible radius.
+    RejectFloor,
+}
+
+impl TrustRegionDecision {
+    /// Stable, lower-snake-case label for structured logs.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GrowAtBoundary => "grow_at_boundary",
+            Self::HoldInside => "hold_inside",
+            Self::HoldModerate => "hold_moderate",
+            Self::ShrinkOnMarginalAccept => "shrink_marginal_accept",
+            Self::ShrinkOnRejection => "shrink_reject",
+            Self::RejectFloor => "reject_floor",
+        }
+    }
+
+    /// `true` for the decisions that correspond to an accepted step.
+    #[must_use]
+    pub fn is_accepted(self) -> bool {
+        matches!(
+            self,
+            Self::GrowAtBoundary
+                | Self::HoldInside
+                | Self::HoldModerate
+                | Self::ShrinkOnMarginalAccept
+        )
+    }
+}
+
+/// Outcome of a single [`TrustRegionPolicy::update`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrustRegionStep {
+    /// The ratio `actual_reduction / predicted_reduction` used to drive
+    /// the update. `1.0` when the realized reduction was within the
+    /// noise floor (a numerically neutral step) and `f64::NEG_INFINITY`
+    /// when the predicted reduction was not finite-positive.
+    pub rho: f64,
+    /// The radius to use on the next iteration, already clamped to
+    /// `[min_radius, max_radius]`.
+    pub new_radius: f64,
+    /// Whether the trial step should be accepted (the caller keeps the
+    /// trial iterate) or rejected (the caller restores the incumbent).
+    pub accepted: bool,
+    /// `true` when `|actual_reduction|` was within the objective's
+    /// round-off noise floor, so `rho` was forced to `1.0` (neutral
+    /// step) rather than dividing two round-off-level quantities.
+    pub within_noise_floor: bool,
+    /// `true` when the model's predicted reduction was not
+    /// finite-positive (above the noise floor), so no meaningful `rho`
+    /// could be formed. A caller that detects this pre-trial can shrink
+    /// and retry without evaluating a trial point at all.
+    pub predicted_nonpositive: bool,
+    /// The branch of the policy that fired.
+    pub decision: TrustRegionDecision,
+}
+
+/// A configurable trust-region radius controller.
+///
+/// Given the realized and model-predicted reductions of a proposed step,
+/// [`update`](TrustRegionPolicy::update) decides whether to accept the
+/// step and how to adapt the radius, returning a [`TrustRegionStep`] with
+/// a rich [`TrustRegionDecision`]. The controller is a pure function of
+/// its configuration and the per-step scalars — it holds no state, so a
+/// single policy value can drive many independent solves.
+///
+/// # Acceptance and radius rules
+///
+/// Let `nf = |objective_scale|.max(1) * noise_floor_rel` be the round-off
+/// noise floor. Then:
+/// - `rho = 1` if `|actual_reduction| <= nf` (numerically neutral step);
+///   else `rho = actual/predicted` if `predicted` is finite and `> nf`;
+///   else `rho = -inf`.
+/// - The step is **accepted** iff `rho` is finite, `rho > eta_accept`,
+///   and `actual_reduction >= -nf`.
+/// - **Rejected** ⇒ radius `*= shrink_factor`, then (if
+///   `rejection_step_cap_fraction = Some(f)`) `radius = min(radius,
+///   f * step_norm)`.
+/// - Accepted with `rho < eta_shrink` ⇒ radius `*= shrink_factor`.
+/// - Accepted with `rho > eta_expand` AND `hit_boundary` ⇒ radius
+///   `*= expand_factor`.
+/// - Otherwise the radius is held.
+///
+/// The result is clamped to `[min_radius, max_radius]` (a non-finite or
+/// non-positive radius collapses to `min_radius` first), and a shrink
+/// that lands at the floor is promoted to
+/// [`TrustRegionDecision::RejectFloor`].
+///
+/// # Consumers
+///
+/// [`classic`](TrustRegionPolicy::classic) reproduces a boundary-driven
+/// controller with an absolute noise floor of zero (`eta_accept = 0.1`,
+/// no rejection step cap): the caller passes the `hit_boundary` flag its
+/// subproblem solver reports. [`noise_aware`](TrustRegionPolicy::noise_aware)
+/// reproduces a controller with a relative round-off floor, a `0.5`
+/// rejection step cap, and `eta_accept = 0` (accept any real descent):
+/// the caller supplies `hit_boundary = step_norm >= 0.99 * radius`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrustRegionPolicy {
+    /// Accept the step iff `rho > eta_accept` (and the reduction is not
+    /// worse than the noise floor). Typically in `[0, 0.25)`.
+    pub eta_accept: f64,
+    /// `rho` below this shrinks the radius even on an accepted step.
+    pub eta_shrink: f64,
+    /// `rho` above this expands the radius when the step hit the boundary.
+    pub eta_expand: f64,
+    /// Multiplier applied to the radius on a shrink (`< 1`).
+    pub shrink_factor: f64,
+    /// Multiplier applied to the radius on an expansion (`> 1`).
+    pub expand_factor: f64,
+    /// Lower clamp on the radius, and the value a non-finite/non-positive
+    /// radius collapses to.
+    pub min_radius: f64,
+    /// Upper clamp on the radius (the advertised hard cap).
+    pub max_radius: f64,
+    /// Relative round-off noise floor: the absolute floor is
+    /// `|objective_scale|.max(1) * noise_floor_rel`. `0.0` disables the
+    /// neutral-step guard entirely.
+    pub noise_floor_rel: f64,
+    /// When `Some(f)`, a rejected step additionally caps the radius at
+    /// `f * step_norm` so a re-proposal is constrained inside the region
+    /// that was just rejected. `None` leaves the plain shrink.
+    pub rejection_step_cap_fraction: Option<f64>,
+}
+
+impl Default for TrustRegionPolicy {
+    fn default() -> Self {
+        Self::noise_aware(1.0e-12, 1.0e6, 1.0e-14)
+    }
+}
+
+impl TrustRegionPolicy {
+    /// A boundary-driven controller with **no** round-off noise floor.
+    /// Accepts iff `rho > 0.1`; shrinks by `0.25` when `rho < 0.25`;
+    /// expands by `2.0` when `rho > 0.75` and the step reached the
+    /// boundary. `min_radius` is `0` (the caller owns any convergence
+    /// floor) and there is no rejection step cap.
+    #[must_use]
+    pub fn classic(max_radius: f64) -> Self {
+        Self {
+            eta_accept: 0.1,
+            eta_shrink: 0.25,
+            eta_expand: 0.75,
+            shrink_factor: 0.25,
+            expand_factor: 2.0,
+            min_radius: 0.0,
+            max_radius,
+            noise_floor_rel: 0.0,
+            rejection_step_cap_fraction: None,
+        }
+    }
+
+    /// A round-off-aware controller. Accepts any real descent
+    /// (`eta_accept = 0`) above the relative noise floor, shrinks by
+    /// `0.25` (rejections additionally capped at `0.5 * step_norm`),
+    /// expands by `2.0` at the boundary, and clamps the radius to
+    /// `[min_radius, max_radius]`.
+    #[must_use]
+    pub fn noise_aware(min_radius: f64, max_radius: f64, noise_floor_rel: f64) -> Self {
+        Self {
+            eta_accept: 0.0,
+            eta_shrink: 0.25,
+            eta_expand: 0.75,
+            shrink_factor: 0.25,
+            expand_factor: 2.0,
+            min_radius,
+            max_radius,
+            noise_floor_rel,
+            rejection_step_cap_fraction: Some(0.5),
+        }
+    }
+
+    /// Override the acceptance threshold `eta_accept`.
+    #[must_use]
+    pub fn with_accept_threshold(mut self, eta_accept: f64) -> Self {
+        self.eta_accept = eta_accept;
+        self
+    }
+
+    /// Override the shrink / expand `rho` thresholds.
+    #[must_use]
+    pub fn with_rho_thresholds(mut self, eta_shrink: f64, eta_expand: f64) -> Self {
+        self.eta_shrink = eta_shrink;
+        self.eta_expand = eta_expand;
+        self
+    }
+
+    /// Override the shrink / expand multiplicative factors.
+    #[must_use]
+    pub fn with_factors(mut self, shrink_factor: f64, expand_factor: f64) -> Self {
+        self.shrink_factor = shrink_factor;
+        self.expand_factor = expand_factor;
+        self
+    }
+
+    /// Set (or clear with `None`) the rejection step-norm cap fraction.
+    #[must_use]
+    pub fn with_rejection_step_cap(mut self, fraction: Option<f64>) -> Self {
+        self.rejection_step_cap_fraction = fraction;
+        self
+    }
+
+    /// Decide acceptance and the next radius for a proposed step.
+    ///
+    /// - `radius`: the current trust-region radius.
+    /// - `step_norm`: the (metric) norm of the proposed step; only used
+    ///   for the rejection step cap. Pass any value when no cap is set.
+    /// - `hit_boundary`: whether the proposed step reached the region
+    ///   boundary (the caller's own predicate — e.g. a subproblem's
+    ///   boundary flag, or `step_norm >= 0.99 * radius`).
+    /// - `actual_reduction`: `f(x) - f(x_trial)` (positive is descent).
+    /// - `predicted_reduction`: the model's `m(0) - m(step)` (positive
+    ///   for a descent model).
+    /// - `objective_scale`: a magnitude used to size the round-off noise
+    ///   floor (e.g. `|f(x)|`).
+    #[must_use]
+    pub fn update(
+        &self,
+        radius: f64,
+        step_norm: f64,
+        hit_boundary: bool,
+        actual_reduction: f64,
+        predicted_reduction: f64,
+        objective_scale: f64,
+    ) -> TrustRegionStep {
+        let noise_floor = objective_scale.abs().max(1.0) * self.noise_floor_rel;
+        let predicted_finite_positive =
+            predicted_reduction.is_finite() && predicted_reduction > noise_floor;
+        let within_noise_floor = actual_reduction.abs() <= noise_floor;
+        let (rho, predicted_nonpositive) = if within_noise_floor {
+            // Realized change is at the round-off floor: the step neither
+            // helped nor hurt beyond noise, so treat it as a numerically
+            // neutral (converged) step with rho = 1 rather than dividing
+            // two round-off-level quantities.
+            (1.0, false)
+        } else if predicted_finite_positive {
+            (actual_reduction / predicted_reduction, false)
+        } else {
+            (f64::NEG_INFINITY, true)
+        };
+        let accepted =
+            rho.is_finite() && rho > self.eta_accept && actual_reduction >= -noise_floor;
+
+        let mut new_radius = radius;
+        let mut decision;
+        if !accepted {
+            new_radius *= self.shrink_factor;
+            if let Some(frac) = self.rejection_step_cap_fraction
+                && step_norm.is_finite()
+                && step_norm > 0.0
+            {
+                new_radius = new_radius.min(frac * step_norm);
+            }
+            decision = TrustRegionDecision::ShrinkOnRejection;
+        } else if rho < self.eta_shrink {
+            new_radius *= self.shrink_factor;
+            decision = TrustRegionDecision::ShrinkOnMarginalAccept;
+        } else if rho > self.eta_expand && hit_boundary {
+            new_radius *= self.expand_factor;
+            decision = TrustRegionDecision::GrowAtBoundary;
+        } else if rho > self.eta_expand {
+            decision = TrustRegionDecision::HoldInside;
+        } else {
+            decision = TrustRegionDecision::HoldModerate;
+        }
+
+        if !new_radius.is_finite() || new_radius <= 0.0 {
+            new_radius = self.min_radius;
+        }
+        let new_radius = new_radius.clamp(self.min_radius, self.max_radius);
+        if new_radius <= self.min_radius + f64::EPSILON
+            && matches!(
+                decision,
+                TrustRegionDecision::ShrinkOnRejection
+                    | TrustRegionDecision::ShrinkOnMarginalAccept
+            )
+        {
+            decision = TrustRegionDecision::RejectFloor;
+        }
+
+        TrustRegionStep {
+            rho,
+            new_radius,
+            accepted,
+            within_noise_floor,
+            predicted_nonpositive,
+            decision,
+        }
+    }
+}
+
+// =====================================================================
+// Levenberg–Marquardt damping-state driver
+// =====================================================================
+
+/// Configuration for the stateful [`lm_step`] Levenberg–Marquardt
+/// damping driver. The damping `lambda` is carried across outer
+/// iterations (unlike the fixed-schedule [`escalate_ridge`], which
+/// restarts from `initial` every call): a successful step shrinks
+/// `lambda` toward `min_lambda`, and every rejection or factorization
+/// failure grows it toward `max_lambda`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LmConfig {
+    /// Damping used on the very first step.
+    pub initial_lambda: f64,
+    /// Multiplier (`> 1`) applied to `lambda` on a rejection or a
+    /// factorization failure.
+    pub growth: f64,
+    /// Multiplier (`< 1`) applied to `lambda` on an accepted step.
+    pub shrink: f64,
+    /// Floor `lambda` never drops below on a shrink.
+    pub min_lambda: f64,
+    /// Cap `lambda` never rises above on a growth.
+    pub max_lambda: f64,
+    /// Maximum rejections tolerated within a single [`lm_step`] before it
+    /// reports [`LmOutcome::Exhausted`].
+    pub max_rejects: usize,
+}
+
+impl LmConfig {
+    /// A `×growth / ×shrink` schedule with an unbounded upper `lambda`.
+    #[must_use]
+    pub fn new(
+        initial_lambda: f64,
+        growth: f64,
+        shrink: f64,
+        min_lambda: f64,
+        max_rejects: usize,
+    ) -> Self {
+        Self {
+            initial_lambda,
+            growth,
+            shrink,
+            min_lambda,
+            max_lambda: f64::INFINITY,
+            max_rejects,
+        }
+    }
+
+    /// The `×4 / ×0.5` schedule (grow by four on rejection, halve on
+    /// acceptance) used by damped Gauss–Newton polish loops.
+    #[must_use]
+    pub fn quartic(initial_lambda: f64, min_lambda: f64, max_rejects: usize) -> Self {
+        Self::new(initial_lambda, 4.0, 0.5, min_lambda, max_rejects)
+    }
+
+    /// The `×10 / ÷10` decade schedule used by the isometry-defect
+    /// Gauss–Newton flows.
+    #[must_use]
+    pub fn decade(initial_lambda: f64, min_lambda: f64, max_rejects: usize) -> Self {
+        Self::new(initial_lambda, 10.0, 0.1, min_lambda, max_rejects)
+    }
+
+    /// Cap the upper `lambda` a growth may reach.
+    #[must_use]
+    pub fn with_max_lambda(mut self, max_lambda: f64) -> Self {
+        self.max_lambda = max_lambda;
+        self
+    }
+}
+
+/// Damping state carried across [`lm_step`] calls.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LmState {
+    /// The current Levenberg–Marquardt damping.
+    pub lambda: f64,
+    /// Rejections consumed by the most recent [`lm_step`].
+    pub rejects: usize,
+}
+
+impl LmState {
+    /// Seed the state from a configuration's `initial_lambda`.
+    #[must_use]
+    pub fn new(cfg: &LmConfig) -> Self {
+        Self {
+            lambda: cfg.initial_lambda,
+            rejects: 0,
+        }
+    }
+}
+
+/// The result of a single [`lm_step`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum LmOutcome<C> {
+    /// A candidate cleared both the factorization (`try_lambda` returned
+    /// `Ok(Some(_))`) and the caller's `accept` guard. `lambda` is the
+    /// shrunk damping stored for the next step.
+    Accepted {
+        /// The accepted candidate produced by `try_lambda`.
+        candidate: C,
+        /// The damping after the post-acceptance shrink.
+        lambda: f64,
+        /// Rejections consumed before this acceptance.
+        rejects: usize,
+    },
+    /// `max_rejects` was reached without an accepted candidate. The
+    /// damping in [`LmState`] has been grown across every rejection.
+    Exhausted {
+        /// Number of rejections consumed (equals `cfg.max_rejects`).
+        rejects: usize,
+    },
+}
+
+/// Drive one Levenberg–Marquardt step: escalate the damping until a
+/// factorable, accepted candidate is found or the rejection budget is
+/// exhausted.
+///
+/// - `try_lambda(lambda)` attempts to build a candidate at the given
+///   damping. `Ok(None)` signals a *recoverable* failure at this damping
+///   (e.g. the damped system was not factorable, or a hard feasibility
+///   guard such as a fold-free diffeomorphism check rejected the step) —
+///   the driver escalates. `Err(e)` aborts immediately.
+/// - `accept(&candidate)` is the caller's soft acceptance test (e.g.
+///   "the residual strictly decreased"). `false` also escalates.
+///
+/// On the first candidate that is both `Some(_)` and `accept`ed, the
+/// damping is shrunk toward `min_lambda` and stored in `state`, and
+/// [`LmOutcome::Accepted`] is returned. If the loop exhausts
+/// `cfg.max_rejects`, the grown damping is left in `state` and
+/// [`LmOutcome::Exhausted`] is returned — the caller typically treats an
+/// exhausted step as a numerical local optimum (no admissible step
+/// improved the objective).
+pub fn lm_step<C, E>(
+    state: &mut LmState,
+    cfg: &LmConfig,
+    mut try_lambda: impl FnMut(f64) -> Result<Option<C>, E>,
+    mut accept: impl FnMut(&C) -> bool,
+) -> Result<LmOutcome<C>, E> {
+    let mut rejects = 0usize;
+    while rejects < cfg.max_rejects {
+        match try_lambda(state.lambda)? {
+            Some(candidate) if accept(&candidate) => {
+                state.lambda = (state.lambda * cfg.shrink).max(cfg.min_lambda);
+                state.rejects = rejects;
+                return Ok(LmOutcome::Accepted {
+                    candidate,
+                    lambda: state.lambda,
+                    rejects,
+                });
+            }
+            _ => {
+                state.lambda = (state.lambda * cfg.growth).min(cfg.max_lambda);
+                rejects += 1;
+            }
+        }
+    }
+    state.rejects = rejects;
+    Ok(LmOutcome::Exhausted { rejects })
+}
+
+// =====================================================================
+// Safeguarded scalar root-finding for strictly monotone equations
+// =====================================================================
+
+/// One evaluation of the root oracle: the residual and its first two
+/// derivatives at a point. The second derivative feeds the optional
+/// Halley acceleration; pass `d2 = 0.0` (or any value) when it is not
+/// available and Halley will decline itself via the curvature floor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RootSample {
+    /// `F(a)`.
+    pub value: f64,
+    /// `F'(a)`.
+    pub d1: f64,
+    /// `F''(a)`.
+    pub d2: f64,
+}
+
+/// Which phase produced a [`RootSolution`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootMethod {
+    /// The seed already satisfied `|F| <= convergence_tol`.
+    ExactAtSeed,
+    /// A short warm-start Newton probe from the seed converged before any
+    /// global bracket was formed.
+    WarmStartNewton,
+    /// The globally convergent bracket-then-refine path produced the root.
+    Bracketed,
+}
+
+/// A converged root of a strictly monotone equation `F(a) = 0`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RootSolution {
+    /// The located root `a*`.
+    pub root: f64,
+    /// The residual `F(a*)` there (`|value| <= convergence_tol` on a
+    /// clean convergence, or the best residual seen otherwise).
+    pub value: f64,
+    /// `|F'(a*)|`, always finite and strictly positive on success — the
+    /// density-normalising calibration derivative many callers need.
+    pub abs_deriv: f64,
+    /// Refinement iterations consumed (bracket phase excluded).
+    pub iters: usize,
+    /// Which phase produced the solution.
+    pub method_used: RootMethod,
+}
+
+/// Configuration for [`find_root_monotone`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RootConfig {
+    /// Converge when `|F(a)| <= convergence_tol` (also the bracket-width
+    /// stopping scale in the refinement phase).
+    pub convergence_tol: f64,
+    /// Maximum geometric bracketing probes (phase 1).
+    pub max_bracket_iters: usize,
+    /// Maximum hybrid refinement iterations (phase 2).
+    pub max_refine_iters: usize,
+    /// Initial geometric bracketing step, as a fraction of the seed scale
+    /// `1 + |a_seed|` (floored at 1); doubles each probe.
+    pub initial_bracket_frac: f64,
+    /// Smallest `|F'|` (or Halley denominator) treated as usable before a
+    /// Newton / Halley step is abandoned for the guaranteed-progress
+    /// bisection fallback.
+    pub curvature_floor: f64,
+    /// Trust-region cap on the warm-start Newton probe, as a multiple of
+    /// the iterate scale `1 + |a|`. A correction larger than this abandons
+    /// the probe for the globally convergent bracketed solver.
+    pub warmstart_step_limit: f64,
+}
+
+impl RootConfig {
+    /// Sensible defaults keyed off a convergence tolerance:
+    /// `initial_bracket_frac = 0.25`, `curvature_floor = 1e-30`,
+    /// `warmstart_step_limit = 8.0`.
+    #[must_use]
+    pub fn new(convergence_tol: f64, max_bracket_iters: usize, max_refine_iters: usize) -> Self {
+        Self {
+            convergence_tol,
+            max_bracket_iters,
+            max_refine_iters,
+            initial_bracket_frac: 0.25,
+            curvature_floor: 1.0e-30,
+            warmstart_step_limit: 8.0,
+        }
+    }
+}
+
+/// Error returned by [`find_root_monotone`]. Generic over the oracle's
+/// own error type `E`, which is surfaced verbatim through
+/// [`RootError::Eval`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RootError<E> {
+    /// The oracle returned an error at the given point.
+    Eval(E),
+    /// `|F(seed)| <= tol` already, but `F'(seed)` is zero / non-finite,
+    /// so the derivative the caller needs is degenerate.
+    ExactRootDegenerate {
+        /// The seed point.
+        at: f64,
+    },
+    /// `F'(seed)` is zero / non-finite away from a root, so no monotone
+    /// direction can be inferred.
+    DegenerateDerivative {
+        /// The seed point.
+        at: f64,
+        /// The offending derivative value.
+        derivative: f64,
+    },
+    /// A supplied analytic bracket was invalid (non-finite or `lo == hi`).
+    BracketInvalid {
+        /// The bracket endpoints.
+        lo: f64,
+        /// The bracket endpoints.
+        hi: f64,
+    },
+    /// A supplied analytic bracket did not straddle zero.
+    BracketNoStraddle {
+        /// `F(lo)`.
+        f_lo: f64,
+        /// `F(hi)`.
+        f_hi: f64,
+    },
+    /// Geometric bracketing exhausted `max_bracket_iters` (or the step
+    /// cap) without straddling the root.
+    BracketingExhausted {
+        /// The search direction (`+1` or `-1`).
+        direction: f64,
+        /// The seed point.
+        seed: f64,
+    },
+    /// Refinement converged in `a` but `|F'|` at the best point is zero /
+    /// non-finite, so the reported derivative would be degenerate.
+    ConvergedRootDegenerate {
+        /// The converged point.
+        at: f64,
+    },
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for RootError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eval(e) => write!(f, "root oracle evaluation failed: {e}"),
+            Self::ExactRootDegenerate { at } => {
+                write!(f, "seed {at} is a root but its derivative is degenerate")
+            }
+            Self::DegenerateDerivative { at, derivative } => write!(
+                f,
+                "derivative at seed {at} is degenerate (F' = {derivative})"
+            ),
+            Self::BracketInvalid { lo, hi } => {
+                write!(f, "analytic bracket [{lo}, {hi}] is invalid")
+            }
+            Self::BracketNoStraddle { f_lo, f_hi } => write!(
+                f,
+                "analytic bracket does not straddle zero (F(lo) = {f_lo}, F(hi) = {f_hi})"
+            ),
+            Self::BracketingExhausted { direction, seed } => write!(
+                f,
+                "bracketing exhausted searching direction {direction} from seed {seed}"
+            ),
+            Self::ConvergedRootDegenerate { at } => write!(
+                f,
+                "refinement converged at {at} but its derivative is degenerate"
+            ),
+        }
+    }
+}
+
+impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for RootError<E> {}
+
+/// Safeguarded root-finder for a strictly monotone scalar equation
+/// `F(a) = 0`, with the monotone direction inferred from the sign of
+/// `F'` at the seed (so it handles both increasing and decreasing `F`).
+///
+/// The algorithm has two phases. **Bracketing** first tries up to two
+/// trust-region-capped warm-start Newton corrections from the seed (a
+/// good seed is often within one or two Newton steps), then, if the root
+/// is not yet found, either honors a supplied `analytic_bracket` or
+/// grows a geometric straddle outward from the seed. **Refinement** then
+/// runs a hybrid inside the bracket: a safeguarded Halley step when the
+/// second derivative is well-conditioned, falling back to a monotone
+/// Newton step, and to a guaranteed-progress bisection whenever the
+/// accelerated probe would leave the bracket or the curvature is below
+/// `curvature_floor`. The best (smallest-`|F|`) point seen is tracked and
+/// returned. Convergence is declared on `|F| <= convergence_tol` or a
+/// bracket width within the same tolerance scale.
+///
+/// This is a faithful generalization of the fixed-signature monotone root
+/// solver used by the calibration kernels: the guarantees (globally
+/// convergent bracketed fallback, Halley abandoned below the curvature
+/// floor, best-point tracking, positive returned derivative) are
+/// preserved exactly.
+pub fn find_root_monotone<E>(
+    mut oracle: impl FnMut(f64) -> Result<RootSample, E>,
+    seed: f64,
+    config: &RootConfig,
+    analytic_bracket: Option<(f64, f64)>,
+) -> Result<RootSolution, RootError<E>> {
+    let tol = config.convergence_tol;
+    let curv_floor = config.curvature_floor;
+
+    let seed_sample = oracle(seed).map_err(RootError::Eval)?;
+    let (f_init, f_deriv_init) = (seed_sample.value, seed_sample.d1);
+
+    // Exact root at the seed.
+    if f_init.abs() <= tol {
+        let abs_d = f_deriv_init.abs();
+        if !abs_d.is_finite() || abs_d == 0.0 {
+            return Err(RootError::ExactRootDegenerate { at: seed });
+        }
+        return Ok(RootSolution {
+            root: seed,
+            value: f_init,
+            abs_deriv: abs_d,
+            iters: 0,
+            method_used: RootMethod::ExactAtSeed,
+        });
+    }
+
+    if !f_deriv_init.is_finite() || f_deriv_init == 0.0 {
+        return Err(RootError::DegenerateDerivative {
+            at: seed,
+            derivative: f_deriv_init,
+        });
+    }
+
+    // Warm-start Newton probes before spending evaluations on a global
+    // bracket; fall through to the bracketed solver if not decisive.
+    let mut a = seed;
+    let mut f = f_init;
+    let mut fp = f_deriv_init;
+    for probe_iter in 0..2 {
+        if f.abs() <= tol {
+            let abs_d = fp.abs();
+            if !abs_d.is_finite() || abs_d == 0.0 {
+                break;
+            }
+            return Ok(RootSolution {
+                root: a,
+                value: f,
+                abs_deriv: abs_d,
+                iters: probe_iter,
+                method_used: RootMethod::WarmStartNewton,
+            });
+        }
+        if !fp.is_finite() || fp.abs() <= curv_floor {
+            break;
+        }
+        let step = -f / fp;
+        if !step.is_finite() || step.abs() > config.warmstart_step_limit * (1.0 + a.abs()) {
+            break;
+        }
+        let cand = a + step;
+        let sample = oracle(cand).map_err(RootError::Eval)?;
+        if sample.value.abs() <= tol {
+            let abs_d = sample.d1.abs();
+            if !abs_d.is_finite() || abs_d == 0.0 {
+                break;
+            }
+            return Ok(RootSolution {
+                root: cand,
+                value: sample.value,
+                abs_deriv: abs_d,
+                iters: probe_iter + 1,
+                method_used: RootMethod::WarmStartNewton,
+            });
+        }
+        a = cand;
+        f = sample.value;
+        fp = sample.d1;
+    }
+
+    // --- Phase 1: bracket the root. ---
+    let (mut neg_pt, mut pos_pt) = if let Some((lo, hi)) = analytic_bracket {
+        if !lo.is_finite() || !hi.is_finite() || lo == hi {
+            return Err(RootError::BracketInvalid { lo, hi });
+        }
+        let f_lo = oracle(lo).map_err(RootError::Eval)?.value;
+        let f_hi = oracle(hi).map_err(RootError::Eval)?.value;
+        if f_lo <= 0.0 && f_hi >= 0.0 {
+            (lo, hi)
+        } else if f_hi <= 0.0 && f_lo >= 0.0 {
+            (hi, lo)
+        } else {
+            return Err(RootError::BracketNoStraddle { f_lo, f_hi });
+        }
+    } else {
+        // Search direction: step_sign = -sign(f · F').
+        let step_sign: f64 = if f_init * f_deriv_init < 0.0 { 1.0 } else { -1.0 };
+        let f_init_negative = f_init < 0.0;
+        let mut same_side = seed;
+        let mut step_mag = (config.initial_bracket_frac * (1.0 + seed.abs())).max(1.0);
+        let step_cap = 1.0e6_f64.max(1024.0 * (1.0 + seed.abs()));
+        let mut found_other: Option<f64> = None;
+        for _ in 0..config.max_bracket_iters {
+            let probe = same_side + step_mag * step_sign;
+            let f_probe = oracle(probe).map_err(RootError::Eval)?.value;
+            let crossed = if f_init_negative {
+                f_probe >= 0.0
+            } else {
+                f_probe <= 0.0
+            };
+            if crossed {
+                found_other = Some(probe);
+                break;
+            }
+            same_side = probe;
+            step_mag *= 2.0;
+            if step_mag > step_cap {
+                break;
+            }
+        }
+        let Some(other) = found_other else {
+            return Err(RootError::BracketingExhausted {
+                direction: step_sign,
+                seed,
+            });
+        };
+        if f_init_negative {
+            (same_side, other)
+        } else {
+            (other, same_side)
+        }
+    };
+
+    // --- Phase 2: hybrid bisection / Newton / Halley refinement. ---
+    let mut best_a = seed;
+    let mut best_f = f_init;
+    let mut best_abs_deriv = f_deriv_init.abs();
+
+    let mut update_best = |a: f64, f: f64, f_d: f64| {
+        if f.abs() < best_f.abs() {
+            best_a = a;
+            best_f = f;
+            best_abs_deriv = f_d.abs();
+        }
+    };
+
+    let mut refine_iters = 0usize;
+    for _ in 0..config.max_refine_iters {
+        refine_iters += 1;
+        let (lo, hi) = if neg_pt <= pos_pt {
+            (neg_pt, pos_pt)
+        } else {
+            (pos_pt, neg_pt)
+        };
+        let mid = 0.5 * (lo + hi);
+        let mid_sample = oracle(mid).map_err(RootError::Eval)?;
+        let (f_mid, f_a_mid, f_aa_mid) = (mid_sample.value, mid_sample.d1, mid_sample.d2);
+        update_best(mid, f_mid, f_a_mid);
+
+        if f_mid.abs() <= tol {
+            break;
+        }
+
+        // Safeguarded Halley step when the curvature is well-conditioned.
+        let halley_probe = if f_a_mid.is_finite() && f_a_mid.abs() > curv_floor {
+            let halley_denom = 2.0 * f_a_mid * f_a_mid - f_mid * f_aa_mid;
+            if halley_denom.is_finite() && halley_denom.abs() > curv_floor {
+                let cand = mid - (2.0 * f_mid * f_a_mid) / halley_denom;
+                if cand > lo && cand < hi { Some(cand) } else { None }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Monotone Newton fallback, then bisection.
+        let probe = if let Some(cand) = halley_probe {
+            cand
+        } else if f_a_mid.is_finite() && f_a_mid.abs() > curv_floor {
+            let cand = mid - f_mid / f_a_mid;
+            if cand > lo && cand < hi { cand } else { mid }
+        } else {
+            mid
+        };
+
+        let (bracket_pt, f_bracket) = if (probe - mid).abs() > 0.0 {
+            let probe_sample = oracle(probe).map_err(RootError::Eval)?;
+            update_best(probe, probe_sample.value, probe_sample.d1);
+            (probe, probe_sample.value)
+        } else {
+            (mid, f_mid)
+        };
+
+        if f_bracket <= 0.0 {
+            neg_pt = bracket_pt;
+        } else {
+            pos_pt = bracket_pt;
+        }
+
+        let (next_lo, next_hi) = if neg_pt <= pos_pt {
+            (neg_pt, pos_pt)
+        } else {
+            (pos_pt, neg_pt)
+        };
+        if (next_hi - next_lo).abs() <= tol * (1.0 + next_hi.abs() + next_lo.abs()) {
+            break;
+        }
+    }
+
+    // Final validation: re-evaluate the derivative at the best point if
+    // it is suspect.
+    if !best_abs_deriv.is_finite() || best_abs_deriv == 0.0 {
+        let f_a_best = oracle(best_a).map_err(RootError::Eval)?.d1;
+        best_abs_deriv = f_a_best.abs();
+    }
+    if !best_abs_deriv.is_finite() || best_abs_deriv == 0.0 {
+        return Err(RootError::ConvergedRootDegenerate { at: best_a });
+    }
+
+    Ok(RootSolution {
+        root: best_a,
+        value: best_f,
+        abs_deriv: best_abs_deriv,
+        iters: refine_iters,
+        method_used: RootMethod::Bracketed,
+    })
+}
+
+// =====================================================================
+// Bidirectional (expand-then-backtrack) line search
+// =====================================================================
+
+/// Expansion half of [`bidirectional_line_search`]. The contraction half
+/// reuses [`BacktrackConfig`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpandConfig {
+    /// Multiplier (`> 1`) applied to the step while expansion keeps
+    /// improving.
+    pub expand_factor: f64,
+    /// Maximum expansion doublings attempted.
+    pub max_expansions: usize,
+    /// Largest step the expansion phase will reach; the phase stops once
+    /// the step meets or exceeds it.
+    pub max_step: f64,
+}
+
+impl Default for ExpandConfig {
+    fn default() -> Self {
+        Self {
+            expand_factor: 2.0,
+            max_expansions: 64,
+            max_step: 1.0e16,
+        }
+    }
+}
+
+/// Expand-then-backtrack line search: first *grow* the step while the
+/// `accept` predicate holds AND the objective keeps strictly improving,
+/// then, if no expansion improved on the incumbent, fall back to the
+/// geometric [`backtracking_line_search`] contraction from the initial
+/// step.
+///
+/// - `current_value`: the objective at the base point (the incumbent the
+///   expansion must strictly beat to keep growing).
+/// - `expand`: expansion factor / caps.
+/// - `backtrack`: the contraction schedule; its `initial_step` is also
+///   the first step the expansion phase tries.
+/// - `trial(step)`: evaluates a candidate, returning `Ok(None)` for a
+///   recoverably invalid point and `Ok(Some((value, payload)))`
+///   otherwise. `Err` aborts.
+/// - `accept(step, value)`: the sufficient-decrease predicate (e.g.
+///   Armijo).
+///
+/// Returns the best expanded step when expansion made progress, otherwise
+/// whatever the backtracking contraction accepts (or `None` if neither
+/// found an admissible step). The returned payload is never recomputed.
+pub fn bidirectional_line_search<P, E>(
+    current_value: f64,
+    expand: ExpandConfig,
+    backtrack: BacktrackConfig,
+    mut trial: impl FnMut(f64) -> Result<Option<(f64, P)>, E>,
+    accept: impl Fn(f64, f64) -> bool,
+) -> Result<Option<AcceptedStep<P>>, E> {
+    let mut step = backtrack.initial_step;
+    let mut best: Option<AcceptedStep<P>> = None;
+    let mut best_value = current_value;
+    for _ in 0..expand.max_expansions {
+        match trial(step)? {
+            Some((value, payload)) if accept(step, value) && value < best_value => {
+                best_value = value;
+                best = Some(AcceptedStep {
+                    step,
+                    value,
+                    payload,
+                });
+                if step >= expand.max_step {
+                    break;
+                }
+                step *= expand.expand_factor;
+            }
+            _ => break,
+        }
+    }
+    if best.is_some() {
+        return Ok(best);
+    }
+    // No expansion improved on the incumbent: contract from the initial
+    // step using the shared backtracking schedule.
+    backtracking_line_search(backtrack, trial, accept)
+}
+
 // Numerical helpers and small utilities
 const EPS: f64 = f64::EPSILON;
 #[inline]
@@ -1700,6 +2694,229 @@ pub struct FixedPointSample {
 pub enum StationarityKind {
     ProjectedGradient,
     StepNorm,
+    /// The run stopped because the objective flatlined over a window of
+    /// accepted steps rather than because the gradient reached tolerance
+    /// (see [`CostStallConfig`] and `Bfgs::with_cost_stall`). The
+    /// `final_gradient_norm` is still the bound-projected gradient norm at
+    /// the best iterate, but it is NOT guaranteed to be below the gradient
+    /// tolerance — the stop reason is cost-flatness. Callers read the
+    /// paired [`OptimizationStatus`] (`CostStallConverged` vs
+    /// `CostStallFloor`) to learn whether that residual was nonetheless
+    /// KKT-stationary (gam#1089/gam#1082).
+    CostStall,
+}
+
+/// Configuration for the gradient-independent cost-stall termination in
+/// [`Bfgs`] (enabled via `Bfgs::with_cost_stall`).
+///
+/// `Bfgs`'s primary exits all AND gradient-smallness with cost/step
+/// smallness (`stagnation_converged`, the `StallPolicy` block, and the
+/// small-step/flat-`f` test). On a flat, weakly-identified valley — the
+/// canonical case being a fully-penalized (double-penalty) REML surface
+/// with a shallow ridge — the objective flatlines while the projected
+/// gradient norm plateaus ABOVE tolerance, so none of those exits ever
+/// fires and BFGS grinds to `max_iterations` (gam#1089: a trivial
+/// n≈30..120 Gaussian fit emitting ~850k cost-only line-search probes
+/// until a wall-clock budget killed it).
+///
+/// This config adds the missing mgcv-style score-change stop, gated on
+/// the cost ALONE: watch the accepted-iterate objective and, once it
+/// stops improving by more than [`rel_tol`](Self::rel_tol) (relative to
+/// `1 + |best|`) over [`window`](Self::window) consecutive accepted
+/// steps, halt at the best-so-far iterate. Whether the halt is reported
+/// [`OptimizationStatus::CostStallConverged`] (success) or
+/// [`OptimizationStatus::CostStallFloor`] (non-stationary floor) is
+/// decided by the bound-PROJECTED gradient norm at the best iterate
+/// versus [`projected_grad_tol`](Self::projected_grad_tol): a stall whose
+/// projected gradient cleared that tolerance is a genuine KKT-stationary
+/// optimum on a flat surface, mirroring `opt`'s own
+/// `GradientTolerance { projected: true }` exit (gam#1082 — the
+/// projected norm is mandatory when bounds are active, since a bound-
+/// pinned near-separable optimum keeps a persistent out-of-bounds
+/// ∂V/∂ρ that inflates the raw norm forever).
+///
+/// The optional [`stuck_grad_ceiling`](Self::stuck_grad_ceiling) /
+/// [`max_stuck_escapes`](Self::max_stuck_escapes) knobs cover the
+/// gam#1426 "stuck stall" case: a cost stall whose best-iterate
+/// projected gradient is FAR above tolerance is not a flat valley but an
+/// inconsistent objective/gradient pair (e.g. an inner solve that hit
+/// its own iteration cap), and halting there would ship an under-solved
+/// point. When a ceiling is set, such a stall instead resets the
+/// no-improvement window and lets the optimizer keep descending, for a
+/// bounded number of escapes, before finally halting as a
+/// `CostStallFloor` so a genuinely pathological surface still terminates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CostStallConfig {
+    /// Relative improvement floor: an accepted step counts as "no
+    /// improvement" when `best - value <= rel_tol * (1 + |best|)`.
+    /// Derive this from the outer convergence tolerance so it tracks the
+    /// configured precision rather than a free-standing constant.
+    pub rel_tol: f64,
+    /// Number of consecutive accepted steps with negligible relative
+    /// improvement required before the stall is declared.
+    pub window: usize,
+    /// Projected outer gradient-norm threshold the best iterate must
+    /// clear for the stall to count as a genuine stationary optimum
+    /// ([`OptimizationStatus::CostStallConverged`]); a stall above it is
+    /// a [`OptimizationStatus::CostStallFloor`]. Use the SAME threshold
+    /// the caller's genuine gradient-convergence path uses.
+    pub projected_grad_tol: f64,
+    /// When `Some(ceiling)`, a filled-window stall whose best-iterate
+    /// projected gradient exceeds `ceiling` is treated as a NON-flat
+    /// "stuck" stall: instead of halting, the no-improvement window is
+    /// reset and the optimizer keeps descending (gam#1426). `None`
+    /// disables the escape — every filled window halts. A stall at or
+    /// below the ceiling always halts (as converged or floor per
+    /// `projected_grad_tol`).
+    pub stuck_grad_ceiling: Option<f64>,
+    /// Maximum number of consecutive stuck-stall escapes granted before
+    /// the guard halts anyway (as a `CostStallFloor`) so the loop still
+    /// terminates on a pathological surface. Ignored when
+    /// `stuck_grad_ceiling` is `None`.
+    pub max_stuck_escapes: usize,
+}
+
+impl CostStallConfig {
+    /// Build a config with the three core fields; escapes disabled
+    /// (`stuck_grad_ceiling = None`, `max_stuck_escapes = 0`). Use the
+    /// struct literal directly to opt into the stuck-stall escape.
+    pub fn new(rel_tol: f64, window: usize, projected_grad_tol: f64) -> Self {
+        Self {
+            rel_tol,
+            window,
+            projected_grad_tol,
+            stuck_grad_ceiling: None,
+            max_stuck_escapes: 0,
+        }
+    }
+}
+
+/// Running state for the [`CostStallConfig`] guard, folded once per
+/// accepted BFGS iterate. Tracks the monotone best-so-far objective (and
+/// the point/gradient/projected-norm at that best) plus the
+/// no-improvement streak; see `CostStallState::observe`.
+struct CostStallState {
+    config: CostStallConfig,
+    best_value: f64,
+    best_point: Option<Array1<f64>>,
+    /// Raw (un-projected) gradient at the best iterate, kept so the halt
+    /// can report `Solution::final_gradient` for that iterate.
+    best_grad: Option<Array1<f64>>,
+    /// Bound-PROJECTED gradient norm at the best iterate — the value the
+    /// stationarity classification and `Solution::final_gradient_norm`
+    /// use.
+    best_grad_norm: f64,
+    no_improve_streak: usize,
+    stuck_escapes: usize,
+}
+
+/// The best-so-far iterate a filled-window cost stall halts back to, plus
+/// the stationarity verdict. Returned by `CostStallState::observe` when
+/// the guard decides to stop.
+struct CostStallHalt {
+    /// `true` iff the best iterate's projected gradient cleared
+    /// `projected_grad_tol` — the `CostStallConverged` vs `CostStallFloor`
+    /// distinction.
+    converged: bool,
+    point: Array1<f64>,
+    value: f64,
+    grad: Array1<f64>,
+    grad_norm: f64,
+}
+
+impl CostStallState {
+    fn new(config: CostStallConfig) -> Self {
+        Self {
+            config,
+            best_value: f64::INFINITY,
+            best_point: None,
+            best_grad: None,
+            best_grad_norm: f64::INFINITY,
+            no_improve_streak: 0,
+            stuck_escapes: 0,
+        }
+    }
+
+    /// Fold one accepted iterate `(x, value, raw gradient, projected
+    /// gradient norm)` into the guard. Returns `Some(halt)` when the
+    /// objective has stalled over the configured window (and any
+    /// stuck-stall escape budget is exhausted), or `None` to keep
+    /// descending. Mirrors gam's `CostStallGuard::observe` (gam#1089/
+    /// gam#1082/gam#1426) restricted to the domain-agnostic core: it does
+    /// NOT know about inner-solver convergence flags, so callers that need
+    /// the gam#1426 "untrustworthy iterate" gate should set a
+    /// `stuck_grad_ceiling`, which captures the same "far-above-tolerance
+    /// stall is not a flat valley" signal from the projected gradient
+    /// alone.
+    fn observe(
+        &mut self,
+        x: &Array1<f64>,
+        value: f64,
+        grad: &Array1<f64>,
+        grad_proj_norm: f64,
+    ) -> Option<CostStallHalt> {
+        if !value.is_finite() {
+            // A non-finite accepted objective is the objective's problem,
+            // not a stall; reset so a later real descent is not falsely
+            // credited as a no-improvement step.
+            self.no_improve_streak = 0;
+            return None;
+        }
+        let improvement = self.best_value - value;
+        let floor = self.config.rel_tol * (1.0 + self.best_value.abs());
+        if value < self.best_value {
+            self.best_value = value;
+            self.best_point = Some(x.clone());
+            self.best_grad = Some(grad.clone());
+            self.best_grad_norm = grad_proj_norm;
+        }
+        // KKT-stationary-at-bound (gam#1082): once the projected gradient
+        // clears the outer tolerance there is no FEASIBLE descent left, so
+        // a still-decreasing raw cost is bound-pinned drift, not progress —
+        // treat the step as no-improvement so the window can fill.
+        let kkt_stationary =
+            grad_proj_norm.is_finite() && grad_proj_norm <= self.config.projected_grad_tol;
+        if improvement <= floor || kkt_stationary {
+            self.no_improve_streak = self.no_improve_streak.saturating_add(1);
+        } else {
+            self.no_improve_streak = 0;
+        }
+        if self.no_improve_streak < self.config.window {
+            return None;
+        }
+        let best_grad_norm = self.best_grad_norm;
+        let converged =
+            best_grad_norm.is_finite() && best_grad_norm <= self.config.projected_grad_tol;
+        // Stuck-stall escape (gam#1426): a filled window whose residual is
+        // far above tolerance is not a flat valley. Reset and keep going
+        // for a bounded number of escapes rather than halting on it.
+        if !converged {
+            if let Some(ceiling) = self.config.stuck_grad_ceiling {
+                if best_grad_norm.is_finite()
+                    && best_grad_norm > ceiling
+                    && self.stuck_escapes < self.config.max_stuck_escapes
+                {
+                    self.stuck_escapes = self.stuck_escapes.saturating_add(1);
+                    self.no_improve_streak = 0;
+                    return None;
+                }
+            }
+        }
+        let point = self.best_point.clone().unwrap_or_else(|| x.clone());
+        let grad = self.best_grad.clone().unwrap_or_else(|| grad.clone());
+        let value = if self.best_value.is_finite() {
+            self.best_value
+        } else {
+            value
+        };
+        Some(CostStallHalt {
+            converged,
+            point,
+            value,
+            grad,
+            grad_norm: best_grad_norm,
+        })
+    }
 }
 
 /// A summary of a successful solver run.
@@ -1853,17 +3070,48 @@ pub enum OptimizationStatus {
     /// non-SPD model Hessian, etc.). `last_solution` may still be
     /// populated.
     NumericalFailure,
+    /// Stopped because the objective stalled — it stopped improving by
+    /// more than the relative tolerance over a window of consecutive
+    /// accepted steps (see [`CostStallConfig`]) — AND the bound-projected
+    /// gradient norm at the best iterate cleared the configured outer
+    /// tolerance, so the stall is a genuine stationary optimum on a
+    /// (legitimately) flat objective valley. Treated as a success.
+    ///
+    /// This exists because `Bfgs`'s gradient/step exit ANDs
+    /// gradient-smallness with cost-smallness, so on a flat, weakly
+    /// identified valley (e.g. a fully-penalized REML double-penalty
+    /// surface) the cost flatlines while `‖g‖` plateaus above tolerance
+    /// and no gradient exit ever fires — BFGS burns its entire
+    /// `max_iterations` budget (gam#1089: a trivial fit emitting ~850k
+    /// cost-only evaluations). The cost-stall exit adds the missing
+    /// mgcv-style score-change stop; this status distinguishes
+    /// "gradient hit tol" (`Converged`) from "cost stalled at a
+    /// stationary floor" for callers that care.
+    CostStallConverged,
+    /// Stopped on a cost stall (as `CostStallConverged`) but the
+    /// bound-projected gradient norm at the best iterate remained ABOVE
+    /// the configured outer tolerance: a weakly-identified flat-valley
+    /// FLOOR with residual non-stationarity. Halting here is correct —
+    /// no further cost progress is available — but the best iterate is
+    /// NOT a stationary optimum, so this is NOT a success. The residual
+    /// gradient lies along weakly-identified directions that do not
+    /// reduce the objective (gam#1082: a bound-pinned near-separable
+    /// optimum whose raw gradient never vanishes).
+    CostStallFloor,
 }
 
 impl OptimizationStatus {
     /// `true` for terminal statuses that represent a successful stop at
     /// (or numerically indistinguishably close to) a stationary point.
-    /// `Converged` and `NumericallyConverged` are both successes; the
-    /// remaining variants are not.
+    /// `Converged`, `NumericallyConverged`, and `CostStallConverged` are
+    /// successes; the remaining variants (including `CostStallFloor`,
+    /// which halts at a non-stationary flat-valley floor) are not.
     pub fn is_success(self) -> bool {
         matches!(
             self,
-            OptimizationStatus::Converged | OptimizationStatus::NumericallyConverged
+            OptimizationStatus::Converged
+                | OptimizationStatus::NumericallyConverged
+                | OptimizationStatus::CostStallConverged
         )
     }
 }
@@ -2654,6 +3902,46 @@ where
 
 const CACHE_POINT_EPS: f64 = 1e-14;
 
+/// Default capacity of the opt-in line-search value-probe memo (see
+/// `Bfgs::with_value_probe_memo`). Matches the size gam used for the
+/// external `value_probe_cache` it maintained around this solver: large
+/// enough to hold every distinct trial an iterate's line search probes
+/// across Wolfe-strategy switches, small enough that the linear bitwise
+/// scan stays cheap relative to one full objective evaluation.
+const VALUE_PROBE_MEMO_DEFAULT_CAPACITY: usize = 256;
+
+/// One remembered line-search value probe: the exact point and the
+/// outcome `eval_cost` produced there. Errors are memoized too so a
+/// repeated infeasible probe is not re-run (its message is preserved).
+#[derive(Clone)]
+enum ProbeOutcome {
+    Cost(f64),
+    Recoverable(String),
+    Fatal(String),
+}
+
+impl ProbeOutcome {
+    fn from_result(result: &Result<f64, ObjectiveEvalError>) -> Self {
+        match result {
+            Ok(cost) => ProbeOutcome::Cost(*cost),
+            Err(ObjectiveEvalError::Recoverable { message }) => {
+                ProbeOutcome::Recoverable(message.clone())
+            }
+            Err(ObjectiveEvalError::Fatal { message }) => ProbeOutcome::Fatal(message.clone()),
+        }
+    }
+
+    fn to_result(&self) -> Result<f64, ObjectiveEvalError> {
+        match self {
+            ProbeOutcome::Cost(cost) => Ok(*cost),
+            ProbeOutcome::Recoverable(message) => {
+                Err(ObjectiveEvalError::recoverable(message.clone()))
+            }
+            ProbeOutcome::Fatal(message) => Err(ObjectiveEvalError::fatal(message.clone())),
+        }
+    }
+}
+
 #[inline]
 fn same_point_bits(lhs: &Array1<f64>, rhs: &Array1<f64>) -> bool {
     lhs.len() == rhs.len()
@@ -2757,6 +4045,11 @@ struct FirstOrderCache {
     last_cost: Option<f64>,
     last_grad: Array1<f64>,
     have_last_grad: bool,
+    /// Opt-in exact-point value-probe memo (see
+    /// `Bfgs::with_value_probe_memo`). `0` capacity ⇒ disabled and the
+    /// `Vec` stays empty so the fast path pays nothing.
+    probe_memo_capacity: usize,
+    probe_memo: Vec<(Array1<f64>, ProbeOutcome)>,
 }
 
 impl FirstOrderCache {
@@ -2766,7 +4059,43 @@ impl FirstOrderCache {
             last_cost: None,
             last_grad: Array1::zeros(n),
             have_last_grad: false,
+            probe_memo_capacity: 0,
+            probe_memo: Vec::new(),
         }
+    }
+
+    /// Turn on the exact-point value-probe memo with the given capacity.
+    /// A capacity of `0` leaves it disabled.
+    fn enable_probe_memo(&mut self, capacity: usize) {
+        self.probe_memo_capacity = capacity;
+    }
+
+    /// Drop all remembered probes. Called by BFGS on every accepted step:
+    /// the iterate moves, so previously-probed trial points cannot recur
+    /// and holding them only wastes memory and scan time.
+    fn clear_probe_memo(&mut self) {
+        self.probe_memo.clear();
+    }
+
+    /// Insert (or overwrite) a probe outcome, evicting oldest-first at
+    /// capacity. No-op when the memo is disabled.
+    fn remember_probe(&mut self, x: &Array1<f64>, result: &Result<f64, ObjectiveEvalError>) {
+        if self.probe_memo_capacity == 0 {
+            return;
+        }
+        let outcome = ProbeOutcome::from_result(result);
+        if let Some(entry) = self
+            .probe_memo
+            .iter_mut()
+            .find(|(px, _)| same_point_bits(px, x))
+        {
+            entry.1 = outcome;
+            return;
+        }
+        if self.probe_memo.len() >= self.probe_memo_capacity {
+            self.probe_memo.remove(0);
+        }
+        self.probe_memo.push((x.clone(), outcome));
     }
 
     fn eval_cost<ObjFn>(
@@ -2783,7 +4112,25 @@ impl FirstOrderCache {
         {
             return Ok(last_cost);
         }
-        let cost = recover_on_nonfinite_cost(obj_fn.eval_cost(x)?)?;
+        // Exact-point value-probe memo: BFGS re-queries identical rejected
+        // trial points across Wolfe-strategy switches, and each miss here
+        // is a full objective evaluation. Serving a bitwise-identical
+        // repeat from the memo preserves the objective the line search
+        // observes (deterministic objective, exact-bits key) while
+        // skipping the duplicate work. Disabled memo ⇒ empty vec ⇒ the
+        // scan is skipped entirely.
+        if self.probe_memo_capacity > 0 {
+            if let Some((_, outcome)) = self
+                .probe_memo
+                .iter()
+                .find(|(px, _)| same_point_bits(px, x))
+            {
+                return outcome.to_result();
+            }
+        }
+        let result = obj_fn.eval_cost(x).and_then(recover_on_nonfinite_cost);
+        self.remember_probe(x, &result);
+        let cost = result?;
         *func_evals += 1;
         self.last_x = Some(x.clone());
         self.last_cost = Some(cost);
@@ -4577,6 +5924,20 @@ struct BfgsCore {
     /// caller impose per-axis budgets that differ wildly across parameter
     /// blocks (e.g. log-λ wants `|d|≤5` but log-κ wants `|d|≤ln 2`).
     axis_step_caps: Option<Array1<f64>>,
+    /// Gradient-independent cost-stall termination (see
+    /// [`CostStallConfig`] and `Bfgs::with_cost_stall`). `None` (default)
+    /// preserves the historical behavior exactly: the guard is not
+    /// consulted and no extra bookkeeping runs. `Some(state)` folds each
+    /// accepted iterate into the guard and halts at the best-so-far
+    /// iterate when the objective flatlines over the configured window
+    /// (gam#1089/gam#1082).
+    cost_stall: Option<CostStallState>,
+    /// Exact-point line-search value-probe memo capacity (see
+    /// `Bfgs::with_value_probe_memo`). `None` (default) disables the memo
+    /// so cheap objectives pay no bookkeeping. `Some(cap)` gives the
+    /// solver's `FirstOrderCache` a bounded, bitwise-keyed cache of
+    /// `eval_cost` probe results, cleared on every accepted step.
+    value_probe_memo_capacity: Option<usize>,
 }
 
 /// A configurable BFGS solver.
@@ -4937,6 +6298,8 @@ impl BfgsCore {
             initial_metric: None,
             observer: None,
             axis_step_caps: None,
+            cost_stall: None,
+            value_probe_memo_capacity: None,
         }
     }
 
@@ -5255,6 +6618,9 @@ impl BfgsCore {
         }
         let mut x_k = self.project_point(&self.x0);
         let mut oracle = FirstOrderCache::new(x_k.len());
+        if let Some(capacity) = self.value_probe_memo_capacity {
+            oracle.enable_probe_memo(capacity);
+        }
         let mut func_evals = 0;
         let mut grad_evals = 0;
         let mut b_inv_backup = Array2::<f64>::zeros((n, n));
@@ -6089,6 +7455,55 @@ impl BfgsCore {
                 ));
             }
 
+            // Gradient-independent cost-stall exit (gam#1089/gam#1082).
+            // Fold this accepted iterate into the guard, using the
+            // bound-PROJECTED gradient norm (the KKT residual) so a
+            // bound-pinned near-separable optimum whose raw gradient never
+            // vanishes can still certify. When the guard reports a stall it
+            // returns the best-so-far iterate; the stationarity verdict
+            // decides `CostStallConverged` (success) vs `CostStallFloor`.
+            if self.cost_stall.is_some() {
+                let g_proj_norm = g_proj_next.dot(&g_proj_next).sqrt();
+                let halt = self
+                    .cost_stall
+                    .as_mut()
+                    .expect("cost_stall guard presence checked above")
+                    .observe(&x_next, f_next, &g_next, g_proj_norm);
+                if let Some(halt) = halt {
+                    let status = if halt.converged {
+                        OptimizationStatus::CostStallConverged
+                    } else {
+                        OptimizationStatus::CostStallFloor
+                    };
+                    let mut sol = Solution::gradient_based_with_status(
+                        halt.point,
+                        halt.value,
+                        halt.grad,
+                        halt.grad_norm,
+                        None,
+                        k + 1,
+                        func_evals,
+                        grad_evals,
+                        0,
+                        status,
+                    );
+                    sol.stationarity_kind = StationarityKind::CostStall;
+                    log::info!(
+                        "[BFGS] Cost-stall exit ({}): iters={}, f={:.6e}, ||g_proj||={:.3e}",
+                        if halt.converged {
+                            "converged at flat-valley floor"
+                        } else {
+                            "flat-valley floor, non-stationary"
+                        },
+                        sol.iterations,
+                        sol.final_value,
+                        sol.final_gradient_norm
+                            .expect("gradient-based solution must report gradient norm"),
+                    );
+                    return Ok(sol);
+                }
+            }
+
             // Update adaptive curvature slack scale and gradient drop factor based on flats
             let f_ok_flat = (f_next - f_k).abs() <= eps_f(f_k, self.tau_f)
                 || (f_next - f_k).abs() <= self.tol_f_rel * (1.0 + f_k.abs());
@@ -6322,7 +7737,13 @@ impl BfgsCore {
             // BFGS (no quadratic model in the same sense as TR), so
             // we report `f64::NAN`. `trust_radius` is `None` because
             // BFGS doesn't expose one to the public API.
-            let bfgs_step_norm = (&x_next - &x_k).dot(&(&x_next - &x_k)).sqrt();
+            //
+            // `step_len` (computed above from `s_k = &x_next - &x_k`,
+            // before the bound-active zeroing of `s_k`) is already the
+            // Euclidean norm of `x_next - x_k` — `x_k`/`x_next` are
+            // untouched since — so reuse it instead of re-subtracting into
+            // two fresh arrays every accepted iteration.
+            let bfgs_step_norm = step_len;
             if let Some(obs) = self.observer.as_mut() {
                 obs.on_step_accepted(&StepInfo {
                     iter: k,
@@ -6337,6 +7758,10 @@ impl BfgsCore {
             g_k = g_next;
             g_proj_k = g_proj_next;
             active_mask = active_after;
+            // The iterate has moved: line-search probes taken at the old
+            // iterate cannot recur, so drop the value-probe memo (no-op
+            // when the memo is disabled).
+            oracle.clear_probe_memo();
             // Update GLL window and global best
             self.gll.push(f_k);
             f_last_accepted = f_k;
@@ -6497,6 +7922,57 @@ where
     /// the line search honest (no sentinel costs poisoning Wolfe brackets).
     pub fn with_axis_step_caps(mut self, caps: Array1<f64>) -> Self {
         self.core.axis_step_caps = Some(caps);
+        self
+    }
+
+    /// Enable gradient-independent cost-stall termination.
+    ///
+    /// BFGS's built-in exits all AND gradient-smallness with cost/step
+    /// smallness, so on a flat, weakly-identified valley (the canonical
+    /// case being a fully-penalized REML double-penalty surface) the cost
+    /// flatlines while the projected gradient plateaus above tolerance and
+    /// BFGS grinds all the way to `max_iterations` (gam#1089: ~850k
+    /// cost-only probes on a trivial fit). With this enabled the solver
+    /// folds each accepted iterate into a [`CostStallConfig`] guard and,
+    /// once the objective stops improving by more than `rel_tol` over
+    /// `window` consecutive accepted steps, halts at the best-so-far
+    /// iterate. The returned [`Solution`] carries
+    /// [`StationarityKind::CostStall`] and a `status_hint` of
+    /// [`OptimizationStatus::CostStallConverged`] when the best iterate's
+    /// bound-projected gradient cleared `projected_grad_tol` (a genuine
+    /// stationary optimum on a flat surface) or
+    /// [`OptimizationStatus::CostStallFloor`] otherwise (a
+    /// weakly-identified floor with residual non-stationarity —
+    /// gam#1082). Both cases return `Ok(Solution)`; callers read the
+    /// `status_hint` to tell converged from floor.
+    ///
+    /// Calling this twice replaces the previous config. Not calling it
+    /// leaves BFGS's behavior exactly unchanged.
+    pub fn with_cost_stall(mut self, config: CostStallConfig) -> Self {
+        self.core.cost_stall = Some(CostStallState::new(config));
+        self
+    }
+
+    /// Enable an exact-point memo for line-search value probes.
+    ///
+    /// BFGS can re-query the identical rejected trial point when it
+    /// switches Wolfe strategies (StrongWolfe → backtracking → back), and
+    /// when each `eval_cost` is a full expensive solve that duplication is
+    /// pure waste. This installs a bounded (capacity 256), bitwise-keyed
+    /// cache of `eval_cost` results in the solver's `FirstOrderCache`:
+    /// an exact bit-for-bit repeat of a point already probed at the
+    /// current iterate is served from the memo instead of re-run. The
+    /// match is exact (`f64::to_bits`) because a merely-nearby point is a
+    /// different objective value and would invalidate Wolfe/Armijo
+    /// decisions; the objective is assumed deterministic. The memo is
+    /// cleared on every accepted step (the iterate moves, so old probes
+    /// cannot recur) and evicts oldest-first at capacity.
+    ///
+    /// Opt-in so cheap objectives pay no bookkeeping. This is the native
+    /// equivalent of the `value_probe_cache` gam maintained around this
+    /// solver.
+    pub fn with_value_probe_memo(mut self) -> Self {
+        self.core.value_probe_memo_capacity = Some(VALUE_PROBE_MEMO_DEFAULT_CAPACITY);
         self
     }
 
@@ -9255,16 +10731,17 @@ mod tests {
 
     use super::{
         AcceptedStep, ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, BacktrackConfig,
-        BatchZerothOrderObjective, Bfgs, BfgsError, Bounds, FallbackPolicy, FiniteDiffGradient,
-        FirstOrderObjective, FirstOrderObjectiveInto, FirstOrderSample, FirstOrderWorkspace,
-        FixedPoint, FixedPointObjective, FixedPointSample, FixedPointStatus, FusedObjective,
-        GradientTolerance, HessianFallbackPolicy, HessianMaterialization, HessianOperator,
-        HessianValue, InitialMetric, IterationInfo, LineSearchFailureReason, MatrixFreeTrustRegion,
-        MatrixFreeTrustRegionError, MaxIterations, NewtonTrustRegion, ObjectiveEvalError,
-        OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver, Problem, Profile,
-        RidgeSchedule, SecondOrderObjective, SecondOrderObjectiveInto, SecondOrderProblem,
-        SecondOrderSample, SecondOrderWorkspace, Solution, StepInfo, Tolerance,
-        ZerothOrderObjective, backtracking_line_search, escalate_ridge, optimize,
+        BatchZerothOrderObjective, Bfgs, BfgsError, Bounds, CostStallConfig, CostStallState,
+        FallbackPolicy, FiniteDiffGradient, FirstOrderCache, FirstOrderObjective,
+        FirstOrderObjectiveInto, FirstOrderSample, FirstOrderWorkspace, FixedPoint,
+        FixedPointObjective, FixedPointSample, FixedPointStatus, FusedObjective, GradientTolerance,
+        HessianFallbackPolicy, HessianMaterialization, HessianOperator, HessianValue, InitialMetric,
+        IterationInfo, LineSearchFailureReason, MatrixFreeTrustRegion, MatrixFreeTrustRegionError,
+        MaxIterations, NewtonTrustRegion, ObjectiveEvalError, OperatorObjective, OperatorSample,
+        OptimizationStatus, OptimizerObserver, Problem, Profile, RidgeSchedule, SecondOrderObjective,
+        SecondOrderObjectiveInto, SecondOrderProblem, SecondOrderSample, SecondOrderWorkspace,
+        Solution, StationarityKind, StepInfo, Tolerance, ZerothOrderObjective,
+        backtracking_line_search, escalate_ridge, optimize,
     };
     use ndarray::{Array1, Array2, array};
     use spectral::prelude::*;
@@ -13414,5 +14891,553 @@ mod tests {
             "expected MaxIterations or Converged, got {:?}",
             report.status
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Cost-stall termination (gam#1089/gam#1082) and value-probe memo.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cost_stall_state_certifies_converged_when_projected_grad_small() {
+        // A flat objective (no improvement) whose projected gradient is
+        // already below `projected_grad_tol`: after `window` folds the
+        // guard halts and certifies a genuine stationary optimum.
+        let config = CostStallConfig::new(1.0e-7, 3, 1.0e-3);
+        let mut state = CostStallState::new(config);
+        let x = array![0.5, -0.5];
+        let g = array![1.0e-6, -1.0e-6]; // ‖g‖ ≈ 1.4e-6 < 1e-3
+        // First fold moves best off +inf; folds 2..=window fill the streak.
+        let mut halt = None;
+        for _ in 0..3 {
+            halt = state.observe(&x, 1.0, &g, g.dot(&g).sqrt());
+        }
+        let halt = halt.expect("stall should fire once the window fills");
+        assert!(halt.converged, "small projected gradient ⇒ converged");
+        assert_eq!(halt.point, x);
+        assert!((halt.value - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn cost_stall_state_flags_floor_when_projected_grad_above_tol() {
+        // Identical flatness, but the projected gradient stays above the
+        // outer tolerance: the guard still halts (no further cost progress)
+        // but reports a non-stationary flat-valley floor.
+        let config = CostStallConfig::new(1.0e-7, 3, 1.0e-3);
+        let mut state = CostStallState::new(config);
+        let x = array![0.5, -0.5];
+        let g = array![0.4, -0.3]; // ‖g‖ = 0.5 ≫ 1e-3
+        let mut halt = None;
+        for _ in 0..3 {
+            halt = state.observe(&x, 1.0, &g, g.dot(&g).sqrt());
+        }
+        let halt = halt.expect("stall should fire once the window fills");
+        assert!(!halt.converged, "large projected gradient ⇒ floor, not converged");
+        assert!((halt.grad_norm - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cost_stall_state_keeps_descending_while_improving() {
+        // A strictly-improving sequence never trips the guard: each fold
+        // resets the no-improvement streak.
+        let config = CostStallConfig::new(1.0e-7, 3, 1.0e-3);
+        let mut state = CostStallState::new(config);
+        let x = array![0.0];
+        let g = array![0.5];
+        let mut value = 10.0;
+        for _ in 0..8 {
+            value -= 1.0; // improvement of 1.0 each step, far above the floor
+            let halt = state.observe(&x, value, &g, g.dot(&g).sqrt());
+            assert!(halt.is_none(), "an improving run must not halt");
+        }
+    }
+
+    #[test]
+    fn cost_stall_state_stuck_escape_defers_then_halts() {
+        // A far-above-tolerance stall with an escape budget: the guard
+        // resets the window instead of halting, up to `max_stuck_escapes`
+        // times, then finally halts as a floor.
+        let config = CostStallConfig {
+            rel_tol: 1.0e-7,
+            window: 2,
+            projected_grad_tol: 1.0e-3,
+            stuck_grad_ceiling: Some(5.0),
+            max_stuck_escapes: 1,
+        };
+        let mut state = CostStallState::new(config);
+        let x = array![0.0];
+        let g = array![11.0_f64]; // ‖g‖ = 11 > ceiling 5.0
+        let gn = g.dot(&g).sqrt();
+        // Fold 1 sets best; fold 2 fills the window → first (and only)
+        // escape ⇒ None, streak reset.
+        assert!(state.observe(&x, 1.0, &g, gn).is_none());
+        assert!(state.observe(&x, 1.0, &g, gn).is_none());
+        // Window refills; escape budget now exhausted ⇒ halt as floor.
+        assert!(state.observe(&x, 1.0, &g, gn).is_none());
+        let halt = state
+            .observe(&x, 1.0, &g, gn)
+            .expect("with the escape budget spent the stall must halt");
+        assert!(!halt.converged);
+    }
+
+    #[test]
+    fn bfgs_cost_stall_guard_does_not_disturb_normal_convergence() {
+        // Enabling the cost-stall guard must not perturb a run that
+        // converges the ordinary way: on a well-conditioned quadratic the
+        // gradient reaches tolerance long before any cost stall, so the
+        // guard never fires and the outcome is the usual gradient
+        // convergence (never a CostStall status). This pins the additive,
+        // opt-in contract: `with_cost_stall` only ADDS an exit on flat
+        // valleys, it does not change convergent runs.
+        let x0 = array![-1.2, 1.0];
+        let config = CostStallConfig::new(1.0e-7, 6, 1.0e-3);
+        let report = Bfgs::new(x0, bfgs_oracle(rosenbrock))
+            .with_max_iterations(MaxIterations::new(500).unwrap())
+            .with_cost_stall(config)
+            .run_report();
+        assert!(
+            report.status.is_success(),
+            "guarded run should still succeed, got {:?}",
+            report.status
+        );
+        assert_ne!(
+            report.solution.stationarity_kind,
+            StationarityKind::CostStall,
+            "a normally-convergent run must not report a cost-stall stop"
+        );
+        let opt = array![1.0, 1.0];
+        let diff = &report.solution.final_point - &opt;
+        assert!(
+            diff.dot(&diff).sqrt() < 1e-3,
+            "should reach the Rosenbrock optimum"
+        );
+    }
+
+    #[test]
+    fn probe_memo_serves_exact_repeat_without_re_eval() {
+        // Counts objective invocations; a bitwise-identical repeat probe is
+        // served from the memo, so the second `eval_cost` at the same point
+        // does not touch the objective and does not bump `func_evals`.
+        struct Counting {
+            calls: usize,
+        }
+        impl ZerothOrderObjective for Counting {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                self.calls += 1;
+                Ok(x.dot(x))
+            }
+        }
+        impl FirstOrderObjective for Counting {
+            fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                self.calls += 1;
+                Ok(FirstOrderSample {
+                    value: x.dot(x),
+                    gradient: 2.0 * x,
+                })
+            }
+        }
+        let mut cache = FirstOrderCache::new(2);
+        cache.enable_probe_memo(8);
+        let mut obj = Counting { calls: 0 };
+        let mut func_evals = 0usize;
+        let a = array![1.0, 2.0];
+        let b = array![3.0, 4.0]; // distinct point evicts nothing at cap 8
+        let c1 = cache.eval_cost(&mut obj, &a, &mut func_evals).unwrap();
+        let _ = cache.eval_cost(&mut obj, &b, &mut func_evals).unwrap();
+        let c2 = cache.eval_cost(&mut obj, &a, &mut func_evals).unwrap();
+        assert_eq!(c1, c2);
+        // Two distinct points evaluated once each; the repeat of `a` is a
+        // memo hit. (`b` displaced `a` from the single-slot `last_x` cache,
+        // so without the memo the repeat would re-run the objective.)
+        assert_eq!(obj.calls, 2, "repeat probe must be served from the memo");
+        assert_eq!(func_evals, 2, "memo hit must not bump func_evals");
+    }
+
+    #[test]
+    fn probe_memo_disabled_by_default_re_evaluates() {
+        struct Counting {
+            calls: usize,
+        }
+        impl ZerothOrderObjective for Counting {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                self.calls += 1;
+                Ok(x.dot(x))
+            }
+        }
+        impl FirstOrderObjective for Counting {
+            fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                self.calls += 1;
+                Ok(FirstOrderSample {
+                    value: x.dot(x),
+                    gradient: 2.0 * x,
+                })
+            }
+        }
+        let mut cache = FirstOrderCache::new(2);
+        let mut obj = Counting { calls: 0 };
+        let mut func_evals = 0usize;
+        let a = array![1.0, 2.0];
+        let b = array![3.0, 4.0];
+        let _ = cache.eval_cost(&mut obj, &a, &mut func_evals).unwrap();
+        let _ = cache.eval_cost(&mut obj, &b, &mut func_evals).unwrap();
+        let _ = cache.eval_cost(&mut obj, &a, &mut func_evals).unwrap();
+        // No memo: the repeat of `a` re-runs the objective.
+        assert_eq!(obj.calls, 3);
+        assert_eq!(func_evals, 3);
+    }
+
+    #[test]
+    fn probe_memo_cleared_forgets_prior_probes() {
+        struct Counting {
+            calls: usize,
+        }
+        impl ZerothOrderObjective for Counting {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                self.calls += 1;
+                Ok(x.dot(x))
+            }
+        }
+        impl FirstOrderObjective for Counting {
+            fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                self.calls += 1;
+                Ok(FirstOrderSample {
+                    value: x.dot(x),
+                    gradient: 2.0 * x,
+                })
+            }
+        }
+        let mut cache = FirstOrderCache::new(2);
+        cache.enable_probe_memo(8);
+        let mut obj = Counting { calls: 0 };
+        let mut func_evals = 0usize;
+        let a = array![1.0, 2.0];
+        let b = array![9.0, 9.0];
+        let _ = cache.eval_cost(&mut obj, &a, &mut func_evals).unwrap();
+        cache.clear_probe_memo();
+        // Displace the single-slot `last_x` cache so the repeat can only be
+        // served by the (now-cleared) memo.
+        let _ = cache.eval_cost(&mut obj, &b, &mut func_evals).unwrap();
+        let _ = cache.eval_cost(&mut obj, &a, &mut func_evals).unwrap();
+        assert_eq!(obj.calls, 3, "cleared memo must not serve the old probe");
+    }
+}
+
+#[cfg(test)]
+mod added_primitive_tests {
+    use super::*;
+
+    // --- TrustRegionPolicy ------------------------------------------------
+
+    #[test]
+    fn classic_policy_accepts_shrinks_and_expands() {
+        let p = TrustRegionPolicy::classic(10.0);
+        // rho ~ 0.05 (< eta_accept=0.1): rejected, shrink x0.25.
+        let s = p.update(1.0, 1.0, true, 0.05, 1.0, 1.0);
+        assert!(!s.accepted);
+        assert_eq!(s.decision, TrustRegionDecision::ShrinkOnRejection);
+        assert!((s.new_radius - 0.25).abs() < 1e-12);
+        // rho ~ 0.15 (accept, but < eta_shrink=0.25): accepted + shrink.
+        let s = p.update(1.0, 1.0, true, 0.15, 1.0, 1.0);
+        assert!(s.accepted);
+        assert_eq!(s.decision, TrustRegionDecision::ShrinkOnMarginalAccept);
+        assert!((s.new_radius - 0.25).abs() < 1e-12);
+        // rho ~ 0.5 (moderate): hold.
+        let s = p.update(2.0, 1.0, true, 0.5, 1.0, 1.0);
+        assert!(s.accepted);
+        assert_eq!(s.decision, TrustRegionDecision::HoldModerate);
+        assert!((s.new_radius - 2.0).abs() < 1e-12);
+        // rho ~ 0.9 at boundary: expand x2 capped at max.
+        let s = p.update(2.0, 1.0, true, 0.9, 1.0, 1.0);
+        assert_eq!(s.decision, TrustRegionDecision::GrowAtBoundary);
+        assert!((s.new_radius - 4.0).abs() < 1e-12);
+        // rho ~ 0.9 inside: hold.
+        let s = p.update(2.0, 1.0, false, 0.9, 1.0, 1.0);
+        assert_eq!(s.decision, TrustRegionDecision::HoldInside);
+        assert!((s.new_radius - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn classic_policy_expansion_respects_max_radius() {
+        let p = TrustRegionPolicy::classic(3.0);
+        let s = p.update(2.0, 1.0, true, 0.9, 1.0, 1.0);
+        assert_eq!(s.decision, TrustRegionDecision::GrowAtBoundary);
+        assert!((s.new_radius - 3.0).abs() < 1e-12, "capped at max_radius");
+    }
+
+    #[test]
+    fn classic_policy_nonpositive_prediction_rejects() {
+        let p = TrustRegionPolicy::classic(10.0);
+        let s = p.update(1.0, 1.0, true, 0.5, 0.0, 1.0);
+        assert!(!s.accepted);
+        assert!(s.predicted_nonpositive);
+        assert_eq!(s.rho, f64::NEG_INFINITY);
+        assert!((s.new_radius - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn noise_aware_neutral_step_is_accepted_with_unit_rho() {
+        // objective_scale=1e6 => noise_floor = 1e6 * 1e-14 = 1e-8.
+        let p = TrustRegionPolicy::noise_aware(1e-12, 1e6, 1e-14);
+        let s = p.update(1.0, 1.0, false, 1e-10, 1e-10, 1e6);
+        assert!(s.within_noise_floor);
+        assert_eq!(s.rho, 1.0);
+        assert!(s.accepted);
+    }
+
+    #[test]
+    fn noise_aware_rejection_caps_radius_to_half_step() {
+        let p = TrustRegionPolicy::noise_aware(1e-12, 1e6, 1e-14);
+        // Rejected (negative reduction well below the noise floor), step_norm=1.0.
+        // radius*0.25 = 0.25, but capped at 0.5*step_norm = 0.5 -> min = 0.25.
+        let s = p.update(1.0, 1.0, false, -0.5, 1.0, 1.0);
+        assert!(!s.accepted);
+        assert!((s.new_radius - 0.25).abs() < 1e-12);
+        // With a large radius, the 0.5*step cap binds instead of the x0.25 shrink.
+        let s = p.update(100.0, 1.0, false, -0.5, 1.0, 1.0);
+        assert!((s.new_radius - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn noise_aware_reject_floor_promotion() {
+        let p = TrustRegionPolicy::noise_aware(1e-12, 1e6, 1e-14);
+        // Start near the floor; a rejection shrink lands at min_radius -> RejectFloor.
+        let s = p.update(1e-12, 0.0, false, -1.0, 1.0, 1.0);
+        assert_eq!(s.decision, TrustRegionDecision::RejectFloor);
+        assert!((s.new_radius - 1e-12).abs() <= 1e-24);
+    }
+
+    // --- lm_step ----------------------------------------------------------
+
+    #[test]
+    fn lm_step_accepts_and_shrinks_lambda() {
+        let cfg = LmConfig::quartic(1.0, 1e-12, 24);
+        let mut st = LmState::new(&cfg);
+        let out: LmOutcome<i32> =
+            lm_step(&mut st, &cfg, |_lambda| Ok::<_, ()>(Some(7)), |_c| true).unwrap();
+        match out {
+            LmOutcome::Accepted { candidate, lambda, rejects } => {
+                assert_eq!(candidate, 7);
+                assert_eq!(rejects, 0);
+                assert!((lambda - 0.5).abs() < 1e-12);
+            }
+            _ => panic!("expected Accepted"),
+        }
+        assert!((st.lambda - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lm_step_escalates_on_rejection_then_accepts() {
+        let cfg = LmConfig::decade(1e-4, 1e-12, 10);
+        let mut st = LmState::new(&cfg);
+        // Accept only once lambda has grown past 1e-2 (i.e. after two x10 growths).
+        let out: LmOutcome<f64> = lm_step(
+            &mut st,
+            &cfg,
+            |lambda| Ok::<_, ()>(Some(lambda)),
+            |&c| c >= 1e-2,
+        )
+        .unwrap();
+        match out {
+            LmOutcome::Accepted { candidate, rejects, .. } => {
+                assert_eq!(rejects, 2);
+                assert!(candidate >= 1e-2);
+            }
+            _ => panic!("expected Accepted after escalation"),
+        }
+    }
+
+    #[test]
+    fn lm_step_none_candidate_escalates_and_exhausts() {
+        let cfg = LmConfig::decade(1e-4, 1e-12, 3);
+        let mut st = LmState::new(&cfg);
+        // try_lambda always reports a factorization failure (Ok(None)).
+        let out: LmOutcome<i32> =
+            lm_step(&mut st, &cfg, |_l| Ok::<_, ()>(None), |_c| true).unwrap();
+        match out {
+            LmOutcome::Exhausted { rejects } => assert_eq!(rejects, 3),
+            _ => panic!("expected Exhausted"),
+        }
+        // lambda grew x10 three times from 1e-4.
+        assert!((st.lambda - 1e-1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lm_step_propagates_error() {
+        let cfg = LmConfig::quartic(1.0, 1e-12, 5);
+        let mut st = LmState::new(&cfg);
+        let out: Result<LmOutcome<i32>, &str> =
+            lm_step(&mut st, &cfg, |_l| Err("boom"), |_c| true);
+        assert_eq!(out, Err("boom"));
+    }
+
+    // --- find_root_monotone ----------------------------------------------
+
+    fn cfg() -> RootConfig {
+        RootConfig::new(1e-12, 64, 64)
+    }
+
+    #[test]
+    fn root_increasing_exp() {
+        let sol = find_root_monotone(
+            |a| {
+                let ea = a.exp();
+                Ok::<_, ()>(RootSample { value: ea - 2.0, d1: ea, d2: ea })
+            },
+            0.0,
+            &cfg(),
+            None,
+        )
+        .unwrap();
+        assert!((sol.root - std::f64::consts::LN_2).abs() < 1e-9);
+        assert!((sol.abs_deriv - 2.0).abs() < 1e-9);
+        assert!(sol.value.abs() < 1e-12);
+    }
+
+    #[test]
+    fn root_decreasing_exp() {
+        let sol = find_root_monotone(
+            |a| {
+                let ea = (-a).exp();
+                Ok::<_, ()>(RootSample { value: ea - 0.5, d1: -ea, d2: ea })
+            },
+            0.0,
+            &cfg(),
+            None,
+        )
+        .unwrap();
+        assert!((sol.root - std::f64::consts::LN_2).abs() < 1e-9);
+        assert!((sol.abs_deriv - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn root_linear_exact() {
+        let sol = find_root_monotone(
+            |a| Ok::<_, ()>(RootSample { value: 2.0 * a - 7.0, d1: 2.0, d2: 0.0 }),
+            0.0,
+            &cfg(),
+            None,
+        )
+        .unwrap();
+        assert!((sol.root - 3.5).abs() < 1e-9);
+        assert!((sol.abs_deriv - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn root_exact_at_seed_reports_zero_iters() {
+        let sol = find_root_monotone(
+            |a| Ok::<_, ()>(RootSample { value: a, d1: 1.0, d2: 0.0 }),
+            0.0,
+            &cfg(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sol.iters, 0);
+        assert_eq!(sol.method_used, RootMethod::ExactAtSeed);
+    }
+
+    #[test]
+    fn root_analytic_bracket_is_honored() {
+        let sol = find_root_monotone(
+            |a| Ok::<_, ()>(RootSample { value: a - 3.0, d1: 1.0, d2: 0.0 }),
+            5.0,
+            &cfg(),
+            Some((0.0, 10.0)),
+        )
+        .unwrap();
+        assert!((sol.root - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn root_degenerate_derivative_errors() {
+        let err = find_root_monotone(
+            |a| Ok::<_, ()>(RootSample { value: a - 5.0, d1: 0.0, d2: 0.0 }),
+            0.0,
+            &cfg(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RootError::DegenerateDerivative { .. }));
+    }
+
+    #[test]
+    fn root_bracketing_exhausted_with_zero_iters() {
+        let err = find_root_monotone(
+            |a| Ok::<_, ()>(RootSample { value: a - 100.0, d1: 1.0, d2: 0.0 }),
+            0.0,
+            &RootConfig::new(1e-12, 0, 64),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RootError::BracketingExhausted { .. }));
+    }
+
+    #[test]
+    fn root_oracle_error_is_surfaced() {
+        let err = find_root_monotone(
+            |_a| Err::<RootSample, _>("oracle down"),
+            1.0,
+            &cfg(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, RootError::Eval("oracle down"));
+    }
+
+    // --- bidirectional_line_search ---------------------------------------
+
+    #[test]
+    fn bidirectional_expands_to_larger_step() {
+        // Objective decreasing in step over [0, 4], minimum near step=4.
+        // f(step) = (step - 4)^2; current_value at step 0 is 16.
+        let backtrack = BacktrackConfig { initial_step: 0.5, ..BacktrackConfig::default() };
+        let expand = ExpandConfig { expand_factor: 2.0, max_expansions: 8, max_step: 8.0 };
+        let accepted = bidirectional_line_search(
+            16.0,
+            expand,
+            backtrack,
+            |step| Ok::<_, ()>(Some(((step - 4.0).powi(2), step))),
+            |_step, value| value < 16.0,
+        )
+        .unwrap()
+        .expect("an accepted step");
+        // Expansion should have grown well beyond the initial 0.5 step.
+        assert!(accepted.step >= 2.0, "expanded step = {}", accepted.step);
+        assert!(accepted.value < 16.0);
+    }
+
+    #[test]
+    fn bidirectional_falls_back_to_contraction() {
+        // The initial step overshoots (worse than current); expansion cannot
+        // start, so it contracts until Armijo-style acceptance holds.
+        // f(step) = if step <= 0.3 { -step } else { 10.0 }.
+        let backtrack = BacktrackConfig { initial_step: 1.0, contraction: 0.5, max_steps: 20 };
+        let expand = ExpandConfig::default();
+        let accepted = bidirectional_line_search(
+            0.0,
+            expand,
+            backtrack,
+            |step| {
+                let v = if step <= 0.3 { -step } else { 10.0 };
+                Ok::<_, ()>(Some((v, step)))
+            },
+            |_step, value| value < 0.0,
+        )
+        .unwrap()
+        .expect("a contracted step");
+        assert!(accepted.step <= 0.3, "contracted step = {}", accepted.step);
+        assert!(accepted.value < 0.0);
+    }
+
+    #[test]
+    fn bidirectional_returns_none_when_nothing_admissible() {
+        let backtrack = BacktrackConfig { initial_step: 1.0, contraction: 0.5, max_steps: 5 };
+        let out = bidirectional_line_search(
+            0.0,
+            ExpandConfig::default(),
+            backtrack,
+            |step| Ok::<_, ()>(Some((10.0, step))),
+            |_s, value| value < 0.0,
+        )
+        .unwrap();
+        assert!(out.is_none());
     }
 }
