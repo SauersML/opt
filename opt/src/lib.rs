@@ -1720,7 +1720,7 @@ impl ReducedSymmetricSpectrum {
             .iter()
             .map(|value| value.abs())
             .fold(0.0_f64, f64::max);
-        let numerical_floor = (1.0 + scale) * (q as f64).sqrt() * f64::EPSILON;
+        let numerical_floor = scale * (q as f64).sqrt() * f64::EPSILON;
         Some(Self {
             free,
             eigenvalues,
@@ -5226,12 +5226,25 @@ impl ArcCore {
         }
     }
 
-    fn active_mask(&self, x: &Array1<f64>, g: &Array1<f64>) -> Vec<bool> {
-        if let Some(bounds) = &self.bounds {
-            bounds.active_mask(x, g)
-        } else {
-            vec![false; x.len()]
+    fn second_order_active_mask(&self, x: &Array1<f64>, g: &Array1<f64>) -> Vec<bool> {
+        let Some(bounds) = &self.bounds else {
+            return vec![false; x.len()];
+        };
+        let mut mask = vec![false; x.len()];
+        for index in 0..x.len() {
+            let at_lower = x[index] <= bounds.lower[index] + bounds.tol;
+            let at_upper = x[index] >= bounds.upper[index] - bounds.tol;
+            let fixed = bounds.lower[index] == bounds.upper[index];
+            // A strictly complementary bound removes its coordinate from the
+            // critical cone. With a zero multiplier, however, an inward
+            // direction remains feasible and its curvature must be certified;
+            // the projected-gradient mask's non-strict comparisons would hide
+            // exactly that bound saddle.
+            mask[index] = fixed
+                || (at_lower && g[index] > 0.0)
+                || (at_upper && g[index] < 0.0);
         }
+        mask
     }
 
     fn warm_inverse_from_history(
@@ -5409,9 +5422,10 @@ impl ArcCore {
         g: &Array1<f64>,
         sigma: f64,
         active: Option<&[bool]>,
+        x: &Array1<f64>,
     ) -> Option<Array1<f64>> {
         let g_norm = g.dot(g).sqrt();
-        if !g_norm.is_finite() {
+        if !g_norm.is_finite() || !sigma.is_finite() || sigma <= 0.0 || x.len() != g.len() {
             return None;
         }
         let n = g.len();
@@ -5440,7 +5454,7 @@ impl ArcCore {
             let minimum = spectrum.eigenvalues[0];
             let lambda_lower = -minimum;
             let target_norm = lambda_lower / sigma;
-            let gradient_floor = (1.0 + g_norm)
+            let gradient_floor = g_norm
                 * (spectrum.eigenvalues.len() as f64).sqrt()
                 * f64::EPSILON;
             let mut base = Array1::<f64>::zeros(spectral_gradient.len());
@@ -5459,10 +5473,29 @@ impl ArcCore {
             let spectral_step = if minimum_gradient <= gradient_floor
                 && base_norm <= target_norm * (1.0 + 32.0 * f64::EPSILON)
             {
-                let mut hard_case = base;
                 let missing_norm_sq = (target_norm * target_norm - base_norm * base_norm).max(0.0);
-                hard_case[minimum_index] += missing_norm_sq.sqrt();
-                hard_case
+                let missing_norm = missing_norm_sq.sqrt();
+                let mut plus = base.clone();
+                plus[minimum_index] += missing_norm;
+                let mut minus = base;
+                minus[minimum_index] -= missing_norm;
+                // The sign of a minimum eigenvector is arbitrary. At a weakly
+                // active bound one sign can point outside the box and project
+                // back to the saddle while the other is the feasible escape.
+                // Compare the actual feasible cubic models deterministically.
+                let feasible_model = |candidate: &Array1<f64>| {
+                    let full_step = spectrum.embed_step(candidate, n);
+                    let raw_trial = x + &full_step;
+                    let feasible_trial = self.project_point(&raw_trial);
+                    let feasible_step = &feasible_trial - x;
+                    self.arc_model_value(g, h, sigma, &feasible_step, active_opt)
+                        .0
+                };
+                if feasible_model(&minus) < feasible_model(&plus) {
+                    minus
+                } else {
+                    plus
+                }
             } else {
                 let secular_residual = |lambda: f64| -> Option<f64> {
                     let mut norm_sq = 0.0_f64;
@@ -5516,12 +5549,22 @@ impl ArcCore {
             let (model_delta, step_norm, model_gradient) =
                 self.arc_model_value(g, h, sigma, &step, active_opt);
             let model_gradient_norm = model_gradient.dot(&model_gradient).sqrt();
+            let h_scale = spectrum
+                .eigenvalues
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max);
+            let model_gradient_floor = 8.0
+                * (spectrum.eigenvalues.len() as f64).sqrt()
+                * f64::EPSILON
+                * (g_norm + h_scale * step_norm + sigma * step_norm * step_norm);
             if model_delta.is_finite()
                 && model_delta < 0.0
                 && step_norm.is_finite()
                 && step_norm > 0.0
                 && model_gradient_norm.is_finite()
-                && model_gradient_norm <= self.theta * step_norm * step_norm + 1e-12
+                && model_gradient_norm
+                    <= self.theta * step_norm * step_norm + model_gradient_floor
             {
                 return Some(step);
             }
@@ -5769,7 +5812,7 @@ impl ArcCore {
             }
             let g_proj_k = self.projected_gradient(&x_k, &g_k);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
-            let active = self.active_mask(&x_k, &g_k);
+            let active = self.second_order_active_mask(&x_k, &g_k);
             if g_norm.is_finite()
                 && g_norm <= effective_tol
                 && reduced_hessian_is_positive_semidefinite(&h_k, Some(&active))
@@ -5802,7 +5845,13 @@ impl ArcCore {
                     self.escalate_sigma_on_failure(&mut model_failure_streak);
                     continue;
                 }
-                match self.solve_arc_subproblem(h_model, &g_proj_k, self.sigma, Some(&active)) {
+                match self.solve_arc_subproblem(
+                    h_model,
+                    &g_proj_k,
+                    self.sigma,
+                    Some(&active),
+                    &x_k,
+                ) {
                     Some(s) => s,
                     None => {
                         // Failed subproblem solve: moderate growth first, stronger only
@@ -5812,7 +5861,7 @@ impl ArcCore {
                     }
                 }
             } else {
-                match self.solve_arc_subproblem(h_model, &g_proj_k, self.sigma, None) {
+                match self.solve_arc_subproblem(h_model, &g_proj_k, self.sigma, None, &x_k) {
                     Some(s) => s,
                     None => {
                         // Failed subproblem solve: moderate growth first, stronger only
@@ -5956,7 +6005,7 @@ impl ArcCore {
             // produced.
             let g_proj_trial = self.projected_gradient(&x_trial, &g_trial);
             let g_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
-            let trial_active = self.active_mask(&x_trial, &g_trial);
+            let trial_active = self.second_order_active_mask(&x_trial, &g_trial);
             if g_trial_norm.is_finite()
                 && g_trial_norm <= effective_tol
                 && reduced_hessian_is_positive_semidefinite(&h_trial, Some(&trial_active))
@@ -12186,7 +12235,7 @@ mod tests {
         let g = array![2.0, -3.0];
         let active = [true, false];
         let step = core
-            .solve_arc_subproblem(&h, &g, 1.0, Some(&active))
+            .solve_arc_subproblem(&h, &g, 1.0, Some(&active), &array![0.0, 0.0])
             .expect("masked direct ARC subproblem solve should succeed");
         assert!(
             step[0].abs() < 1e-12,
@@ -12205,7 +12254,7 @@ mod tests {
         let g = array![0.0, 0.0];
         let sigma = 4.0;
         let step = core
-            .solve_arc_subproblem(&h, &g, sigma, None)
+            .solve_arc_subproblem(&h, &g, sigma, None, &array![0.0, 0.0])
             .expect("strict saddle must produce a cubic hard-case step");
         assert!((step[0].abs() - 0.5).abs() < 1e-10);
         assert!(step[1].abs() < 1e-10);
@@ -12259,6 +12308,29 @@ mod tests {
             .expect("ARC must escape negative curvature in the free coordinate");
         assert!(solution.final_point[0].abs() < 1e-10);
         assert!((solution.final_point[1].abs() - 1.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn arc_escapes_zero_multiplier_lower_bound_saddle() {
+        let mut solver = super::Arc::new(
+            array![0.0],
+            SecondOrderFn::new(|x: &Array1<f64>| {
+                let square = x[0] * x[0];
+                (
+                    0.25 * (square - 1.0).powi(2),
+                    array![x[0] * (square - 1.0)],
+                    array![[3.0 * square - 1.0]],
+                )
+            }),
+        )
+        .with_profile(Profile::Deterministic)
+        .with_bounds(bounds(array![0.0], array![2.0], 1e-12))
+        .with_tolerance(tol(1e-10))
+        .with_max_iterations(iters(50));
+        let solution = solver
+            .run()
+            .expect("zero-multiplier bound saddle must expose its inward negative curvature");
+        assert!((solution.final_point[0] - 1.0).abs() < 1e-7);
     }
 
     #[test]
