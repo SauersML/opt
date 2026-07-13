@@ -12,4 +12,4 @@ keywords = ["optimization", "bfgs", "wolfe"]
 categories = ["science", "algorithms"]
 
 [dependencies]
-opt = { path = "../opt", version = "0.5.13" }
+opt = { path = "../opt", version = "0.5.14" }

@@ -97,6 +97,7 @@
 //! assert!((x_min[1] - 1.0).abs() < 1e-5);
 //! ```
 
+use faer::{Mat, Side};
 use ndarray::{Array1, Array2, ArrayView2};
 use std::collections::VecDeque;
 use std::sync::Arc as StdArc;
@@ -1667,6 +1668,95 @@ fn build_masked_subproblem_system(
         }
     }
     (effective_h, effective_rhs)
+}
+
+/// Exact spectrum of a symmetric Hessian restricted to coordinates that are
+/// free under the current box-constraint KKT active set.
+///
+/// ARC is a second-order method: a small projected gradient certifies a mode
+/// only when the Hessian is also positive semidefinite on this reduced space.
+/// Keeping the free-coordinate map with the eigensystem also lets the cubic
+/// hard-case step be assembled without turning active coordinates back on.
+struct ReducedSymmetricSpectrum {
+    free: Vec<usize>,
+    eigenvalues: Array1<f64>,
+    eigenvectors: Array2<f64>,
+    numerical_floor: f64,
+}
+
+impl ReducedSymmetricSpectrum {
+    fn decompose(h: &Array2<f64>, active: Option<&[bool]>) -> Option<Self> {
+        let n = h.nrows();
+        if h.ncols() != n || h.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let free: Vec<usize> = (0..n)
+            .filter(|&index| active.is_none_or(|mask| mask.is_empty() || !mask[index]))
+            .collect();
+        let q = free.len();
+        if q == 0 {
+            return Some(Self {
+                free,
+                eigenvalues: Array1::zeros(0),
+                eigenvectors: Array2::zeros((0, 0)),
+                numerical_floor: 0.0,
+            });
+        }
+        let reduced = Mat::<f64>::from_fn(q, q, |row, col| {
+            0.5 * (h[[free[row], free[col]]] + h[[free[col], free[row]]])
+        });
+        let eigen = reduced.self_adjoint_eigen(Side::Lower).ok()?;
+        let diagonal = eigen.S().column_vector().as_mat();
+        let vectors = eigen.U();
+        let eigenvalues = Array1::from_shape_fn(q, |index| diagonal[(index, 0)]);
+        let eigenvectors =
+            Array2::from_shape_fn((q, q), |(row, col)| vectors[(row, col)]);
+        if eigenvalues.iter().any(|value| !value.is_finite())
+            || eigenvectors.iter().any(|value| !value.is_finite())
+        {
+            return None;
+        }
+        let scale = eigenvalues
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let numerical_floor = (1.0 + scale) * (q as f64).sqrt() * f64::EPSILON;
+        Some(Self {
+            free,
+            eigenvalues,
+            eigenvectors,
+            numerical_floor,
+        })
+    }
+
+    fn has_resolvable_negative_curvature(&self) -> bool {
+        self.eigenvalues
+            .first()
+            .is_some_and(|minimum| *minimum < -self.numerical_floor)
+    }
+
+    fn gradient_coordinates(&self, gradient: &Array1<f64>) -> Array1<f64> {
+        let reduced_gradient =
+            Array1::from_iter(self.free.iter().map(|&index| gradient[index]));
+        self.eigenvectors.t().dot(&reduced_gradient)
+    }
+
+    fn embed_step(&self, spectral_step: &Array1<f64>, full_dim: usize) -> Array1<f64> {
+        let reduced_step = self.eigenvectors.dot(spectral_step);
+        let mut full_step = Array1::<f64>::zeros(full_dim);
+        for (reduced_index, &full_index) in self.free.iter().enumerate() {
+            full_step[full_index] = reduced_step[reduced_index];
+        }
+        full_step
+    }
+}
+
+fn reduced_hessian_is_positive_semidefinite(
+    h: &Array2<f64>,
+    active: Option<&[bool]>,
+) -> bool {
+    ReducedSymmetricSpectrum::decompose(h, active)
+        .is_some_and(|spectrum| !spectrum.has_resolvable_negative_curvature())
 }
 
 fn dense_trust_region_step(
@@ -5324,19 +5414,125 @@ impl ArcCore {
         if !g_norm.is_finite() {
             return None;
         }
-        if g_norm <= 1e-16 {
-            return Some(Array1::<f64>::zeros(g.len()));
-        }
-
-        let rhs = -g.clone();
         let n = g.len();
-        let cg_base_iter = (n / 2).clamp(25, 120);
         let active_opt = active;
         let active = active.unwrap_or(&[]);
         let use_mask = !active.is_empty();
         if use_mask && !any_free_variables(active) {
             return Some(Array1::<f64>::zeros(g.len()));
         }
+        let spectrum = ReducedSymmetricSpectrum::decompose(
+            h,
+            if use_mask { Some(active) } else { None },
+        )?;
+        if spectrum.has_resolvable_negative_curvature() {
+            // Global minimizer of
+            //   g's + 1/2 s'Hs + sigma/3 ||s||^3
+            // in the reduced eigenbasis. Its KKT multiplier satisfies
+            //   (H + lambda I)s = -g,
+            //   lambda = sigma ||s||,
+            //   H + lambda I >= 0.
+            // The last condition is the missing second-order contract in the
+            // old shifted-LU iteration. At an exact strict saddle `g=0`, the
+            // first two equations alone admit the spurious zero step; the hard
+            // case below adds the required minimum-eigenvector component.
+            let spectral_gradient = spectrum.gradient_coordinates(g);
+            let minimum = spectrum.eigenvalues[0];
+            let lambda_lower = -minimum;
+            let target_norm = lambda_lower / sigma;
+            let gradient_floor = (1.0 + g_norm)
+                * (spectrum.eigenvalues.len() as f64).sqrt()
+                * f64::EPSILON;
+            let mut base = Array1::<f64>::zeros(spectral_gradient.len());
+            let mut minimum_gradient = 0.0_f64;
+            let mut minimum_index = 0usize;
+            for index in 0..spectral_gradient.len() {
+                let denominator = spectrum.eigenvalues[index] + lambda_lower;
+                if denominator.abs() <= spectrum.numerical_floor {
+                    minimum_gradient = minimum_gradient.max(spectral_gradient[index].abs());
+                    minimum_index = index;
+                } else {
+                    base[index] = -spectral_gradient[index] / denominator;
+                }
+            }
+            let base_norm = base.dot(&base).sqrt();
+            let spectral_step = if minimum_gradient <= gradient_floor
+                && base_norm <= target_norm * (1.0 + 32.0 * f64::EPSILON)
+            {
+                let mut hard_case = base;
+                let missing_norm_sq = (target_norm * target_norm - base_norm * base_norm).max(0.0);
+                hard_case[minimum_index] += missing_norm_sq.sqrt();
+                hard_case
+            } else {
+                let secular_residual = |lambda: f64| -> Option<f64> {
+                    let mut norm_sq = 0.0_f64;
+                    for index in 0..spectral_gradient.len() {
+                        let denominator = spectrum.eigenvalues[index] + lambda;
+                        if !denominator.is_finite() || denominator <= 0.0 {
+                            return Some(f64::INFINITY);
+                        }
+                        let coordinate = spectral_gradient[index] / denominator;
+                        norm_sq += coordinate * coordinate;
+                    }
+                    Some(norm_sq.sqrt() - lambda / sigma)
+                };
+                let mut span = (sigma * g_norm).sqrt().max(
+                    8.0 * spectrum.numerical_floor.max(f64::EPSILON)
+                        * (1.0 + lambda_lower),
+                );
+                let mut lambda_high = lambda_lower + span;
+                let mut bracketed = false;
+                for _ in 0..128 {
+                    if secular_residual(lambda_high)? <= 0.0 {
+                        bracketed = true;
+                        break;
+                    }
+                    span *= 2.0;
+                    lambda_high = lambda_lower + span;
+                }
+                if !bracketed {
+                    return None;
+                }
+                let mut lambda_low = lambda_lower;
+                for _ in 0..self.subproblem_max_iterations.max(64) {
+                    let lambda_mid = 0.5 * (lambda_low + lambda_high);
+                    if secular_residual(lambda_mid)? > 0.0 {
+                        lambda_low = lambda_mid;
+                    } else {
+                        lambda_high = lambda_mid;
+                    }
+                    if lambda_high - lambda_low
+                        <= 8.0 * f64::EPSILON * (1.0 + lambda_high.abs())
+                    {
+                        break;
+                    }
+                }
+                Array1::from_shape_fn(spectral_gradient.len(), |index| {
+                    -spectral_gradient[index]
+                        / (spectrum.eigenvalues[index] + lambda_high)
+                })
+            };
+            let step = spectrum.embed_step(&spectral_step, n);
+            let (model_delta, step_norm, model_gradient) =
+                self.arc_model_value(g, h, sigma, &step, active_opt);
+            let model_gradient_norm = model_gradient.dot(&model_gradient).sqrt();
+            if model_delta.is_finite()
+                && model_delta < 0.0
+                && step_norm.is_finite()
+                && step_norm > 0.0
+                && model_gradient_norm.is_finite()
+                && model_gradient_norm <= self.theta * step_norm * step_norm + 1e-12
+            {
+                return Some(step);
+            }
+            return None;
+        }
+        if g_norm <= 1e-16 {
+            return Some(Array1::<f64>::zeros(g.len()));
+        }
+
+        let rhs = -g.clone();
+        let cg_base_iter = (n / 2).clamp(25, 120);
         let direct_small_dense = prefer_dense_direct(n);
         let (effective_h, effective_rhs) = if direct_small_dense {
             build_masked_subproblem_system(h, &rhs, if use_mask { Some(active) } else { None })
@@ -5573,7 +5769,11 @@ impl ArcCore {
             }
             let g_proj_k = self.projected_gradient(&x_k, &g_k);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
-            if g_norm.is_finite() && g_norm <= effective_tol {
+            let active = self.active_mask(&x_k, &g_k);
+            if g_norm.is_finite()
+                && g_norm <= effective_tol
+                && reduced_hessian_is_positive_semidefinite(&h_k, Some(&active))
+            {
                 return Ok(Solution::gradient_based(
                     x_k,
                     f_k,
@@ -5593,7 +5793,6 @@ impl ArcCore {
                 symmetrize_into(&mut h_model_workspace, &h_k);
                 &h_model_workspace
             };
-            let active = self.active_mask(&x_k, &g_k);
             let any_active = active.iter().copied().any(|v| v);
             // Solve the cubic model in the full space while masking bound-active
             // coordinates instead of materializing reduced subspaces.
@@ -5714,7 +5913,9 @@ impl ArcCore {
             // sigma oscillate. Declare numerical convergence instead.
             // See `ARC_NUMERICAL_CONV_FACTOR` for the full rationale.
             let f_scale = (1.0 + f_k.abs()) * f64::EPSILON;
-            if denom <= ARC_NUMERICAL_CONV_FACTOR * f_scale {
+            if denom <= ARC_NUMERICAL_CONV_FACTOR * f_scale
+                && reduced_hessian_is_positive_semidefinite(h_model, Some(&active))
+            {
                 return Ok(Solution::gradient_based_with_status(
                     x_k,
                     f_k,
@@ -5755,7 +5956,11 @@ impl ArcCore {
             // produced.
             let g_proj_trial = self.projected_gradient(&x_trial, &g_trial);
             let g_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
-            if g_trial_norm.is_finite() && g_trial_norm <= effective_tol {
+            let trial_active = self.active_mask(&x_trial, &g_trial);
+            if g_trial_norm.is_finite()
+                && g_trial_norm <= effective_tol
+                && reduced_hessian_is_positive_semidefinite(&h_trial, Some(&trial_active))
+            {
                 if h_trial.nrows() != n || h_trial.ncols() != n {
                     return Err(ArcError::HessianShapeMismatch {
                         expected: n,
@@ -11991,6 +12196,69 @@ mod tests {
         let (m_delta, _, grad_m) = core.arc_model_value(&g, &h, 1.0, &step, Some(&active));
         assert!(m_delta <= 1e-8, "ARC model should not increase materially");
         assert!(grad_m.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn arc_cubic_subproblem_takes_zero_gradient_hard_case() {
+        let core = super::ArcCore::new(array![0.0, 0.0]);
+        let h = array![[-2.0, 0.0], [0.0, 1.0]];
+        let g = array![0.0, 0.0];
+        let sigma = 4.0;
+        let step = core
+            .solve_arc_subproblem(&h, &g, sigma, None)
+            .expect("strict saddle must produce a cubic hard-case step");
+        assert!((step[0].abs() - 0.5).abs() < 1e-10);
+        assert!(step[1].abs() < 1e-10);
+        let (model_delta, step_norm, model_gradient) =
+            core.arc_model_value(&g, &h, sigma, &step, None);
+        assert!(model_delta < 0.0, "hard-case step must decrease the cubic model");
+        assert!((sigma * step_norm - 2.0).abs() < 1e-10);
+        assert!(model_gradient.dot(&model_gradient).sqrt() < 1e-10);
+    }
+
+    #[test]
+    fn arc_does_not_certify_an_interior_strict_saddle() {
+        let mut solver = super::Arc::new(
+            array![0.0, 0.0],
+            SecondOrderFn::new(|x: &Array1<f64>| {
+                let x0_sq = x[0] * x[0];
+                (
+                    0.25 * (x0_sq - 1.0).powi(2) + 0.5 * x[1] * x[1],
+                    array![x[0] * (x0_sq - 1.0), x[1]],
+                    array![[3.0 * x0_sq - 1.0, 0.0], [0.0, 1.0]],
+                )
+            }),
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1e-10))
+        .with_max_iterations(iters(50));
+        let solution = solver.run().expect("ARC must escape the stationary saddle");
+        assert!((solution.final_point[0].abs() - 1.0).abs() < 1e-7);
+        assert!(solution.final_point[1].abs() < 1e-9);
+    }
+
+    #[test]
+    fn arc_checks_curvature_only_on_bound_free_coordinates() {
+        let mut solver = super::Arc::new(
+            array![0.0, 0.0],
+            SecondOrderFn::new(|x: &Array1<f64>| {
+                let y_sq = x[1] * x[1];
+                (
+                    x[0] + 0.25 * (y_sq - 1.0).powi(2),
+                    array![1.0, x[1] * (y_sq - 1.0)],
+                    array![[0.0, 0.0], [0.0, 3.0 * y_sq - 1.0]],
+                )
+            }),
+        )
+        .with_profile(Profile::Deterministic)
+        .with_bounds(bounds(array![0.0, -2.0], array![2.0, 2.0], 1e-12))
+        .with_tolerance(tol(1e-10))
+        .with_max_iterations(iters(50));
+        let solution = solver
+            .run()
+            .expect("ARC must escape negative curvature in the free coordinate");
+        assert!(solution.final_point[0].abs() < 1e-10);
+        assert!((solution.final_point[1].abs() - 1.0).abs() < 1e-7);
     }
 
     #[test]
