@@ -1773,18 +1773,24 @@ fn reduced_negative_curvature_step(
     hessian: &HessianValue,
     active: &[bool],
     projected_gradient: &Array1<f64>,
+    point: &Array1<f64>,
+    bounds: Option<&BoxSpec>,
     trust_radius: f64,
 ) -> Result<Option<Array1<f64>>, ObjectiveEvalError> {
     let dense = hessian.materialize_dense()?.ok_or_else(|| {
         ObjectiveEvalError::fatal("second-order stationarity requires an analytic Hessian")
     })?;
-    if active.len() != dense.nrows() || projected_gradient.len() != dense.nrows() {
+    if active.len() != dense.nrows()
+        || projected_gradient.len() != dense.nrows()
+        || point.len() != dense.nrows()
+    {
         return Err(ObjectiveEvalError::fatal(format!(
-            "reduced curvature probe dimension mismatch: Hessian={}x{}, active={}, gradient={}",
+            "reduced curvature probe dimension mismatch: Hessian={}x{}, active={}, gradient={}, point={}",
             dense.nrows(),
             dense.ncols(),
             active.len(),
             projected_gradient.len(),
+            point.len(),
         )));
     }
     let spectrum = ReducedSymmetricSpectrum::decompose(&dense, Some(active))
@@ -1792,17 +1798,40 @@ fn reduced_negative_curvature_step(
     if !spectrum.has_resolvable_negative_curvature() {
         return Ok(None);
     }
-    let gradient_coordinates = spectrum.gradient_coordinates(projected_gradient);
     let mut spectral_step = Array1::<f64>::zeros(spectrum.free.len());
-    let sign = if gradient_coordinates[0] > 0.0 {
-        -1.0
-    } else {
-        1.0
+    spectral_step[0] = trust_radius;
+    let plus = spectrum.embed_step(&spectral_step, projected_gradient.len());
+    let minus = -&plus;
+
+    // A symmetric eigensolver owns no canonical eigenvector sign. At a weakly
+    // active box face, one orientation can point outside the box and project
+    // back to the saddle while its antipode is the genuine inward escape.
+    // Compare the exact quadratic model at the two *feasible* steps so
+    // convergence and escape are invariant to that arbitrary sign.
+    let feasible_candidate = |step: &Array1<f64>| {
+        let raw_trial = point + step;
+        let trial = bounds
+            .map(|box_bounds| box_bounds.project(&raw_trial))
+            .unwrap_or(raw_trial);
+        let feasible_step = trial - point;
+        let h_step = dense.dot(&feasible_step);
+        let predicted = -projected_gradient.dot(&feasible_step)
+            - 0.5 * feasible_step.dot(&h_step);
+        (feasible_step, predicted)
     };
-    spectral_step[0] = sign * trust_radius;
-    Ok(Some(
-        spectrum.embed_step(&spectral_step, projected_gradient.len()),
-    ))
+    let plus_candidate = feasible_candidate(&plus);
+    let minus_candidate = feasible_candidate(&minus);
+    let best = if plus_candidate.1 >= minus_candidate.1 {
+        plus_candidate
+    } else {
+        minus_candidate
+    };
+    if !best.1.is_finite() || best.1 <= 0.0 {
+        return Err(ObjectiveEvalError::fatal(
+            "resolvable reduced negative curvature has no feasible quadratic-model escape",
+        ));
+    }
+    Ok(Some(best.0))
 }
 
 fn dense_trust_region_step(
@@ -2008,6 +2037,21 @@ impl BoxSpec {
             let at_lower = x[i] <= lo + tol;
             let at_upper = x[i] >= hi - tol;
             mask[i] = (at_lower && g[i] >= 0.0) || (at_upper && g[i] <= 0.0);
+        }
+        mask
+    }
+
+    fn second_order_active_mask(&self, x: &Array1<f64>, g: &Array1<f64>) -> Vec<bool> {
+        let mut mask = vec![false; x.len()];
+        for i in 0..x.len() {
+            let at_lower = x[i] <= self.lower[i] + self.tol;
+            let at_upper = x[i] >= self.upper[i] - self.tol;
+            let fixed = self.lower[i] == self.upper[i];
+            // Strict complementarity removes a coordinate from the critical
+            // cone. A zero multiplier does not: an inward direction remains
+            // feasible, so its curvature must participate in a second-order
+            // stationarity decision.
+            mask[i] = fixed || (at_lower && g[i] > 0.0) || (at_upper && g[i] < 0.0);
         }
         mask
     }
@@ -5280,24 +5324,10 @@ impl ArcCore {
     }
 
     fn second_order_active_mask(&self, x: &Array1<f64>, g: &Array1<f64>) -> Vec<bool> {
-        let Some(bounds) = &self.bounds else {
-            return vec![false; x.len()];
-        };
-        let mut mask = vec![false; x.len()];
-        for index in 0..x.len() {
-            let at_lower = x[index] <= bounds.lower[index] + bounds.tol;
-            let at_upper = x[index] >= bounds.upper[index] - bounds.tol;
-            let fixed = bounds.lower[index] == bounds.upper[index];
-            // A strictly complementary bound removes its coordinate from the
-            // critical cone. With a zero multiplier, however, an inward
-            // direction remains feasible and its curvature must be certified;
-            // the projected-gradient mask's non-strict comparisons would hide
-            // exactly that bound saddle.
-            mask[index] = fixed
-                || (at_lower && g[index] > 0.0)
-                || (at_upper && g[index] < 0.0);
-        }
-        mask
+        self.bounds
+            .as_ref()
+            .map(|bounds| bounds.second_order_active_mask(x, g))
+            .unwrap_or_else(|| vec![false; x.len()])
     }
 
     fn warm_inverse_from_history(
@@ -8831,6 +8861,13 @@ impl MatrixFreeTrustRegionCore {
         }
     }
 
+    fn second_order_active_mask_vec(&self, x: &Array1<f64>, g: &Array1<f64>) -> Vec<bool> {
+        self.bounds
+            .as_ref()
+            .map(|bounds| bounds.second_order_active_mask(x, g))
+            .unwrap_or_else(|| vec![false; x.len()])
+    }
+
     fn run<ObjFn>(&mut self, obj_fn: &mut ObjFn) -> Result<Solution, MatrixFreeTrustRegionError>
     where
         ObjFn: OperatorObjective,
@@ -8921,10 +8958,14 @@ impl MatrixFreeTrustRegionCore {
             let active = self.active_mask_vec(&x_k, &sample.gradient);
             let mut negative_curvature_step = None;
             if g_proj_norm <= effective_tol {
+                let curvature_active =
+                    self.second_order_active_mask_vec(&x_k, &sample.gradient);
                 match reduced_negative_curvature_step(
                     &sample.hessian,
-                    &active,
+                    &curvature_active,
                     &g_proj,
+                    &x_k,
+                    self.bounds.as_ref(),
                     trust_radius,
                 ) {
                     Ok(Some(step)) => negative_curvature_step = Some(step),
@@ -9151,10 +9192,14 @@ impl MatrixFreeTrustRegionCore {
             // justification.
             let f_scale = (1.0 + sample.value.abs()) * f64::EPSILON;
             if predicted <= ARC_NUMERICAL_CONV_FACTOR * f_scale {
+                let curvature_active =
+                    self.second_order_active_mask_vec(&x_k, &sample.gradient);
                 match reduced_negative_curvature_step(
                     &sample.hessian,
-                    &active,
+                    &curvature_active,
                     &g_proj,
+                    &x_k,
+                    self.bounds.as_ref(),
                     trust_radius,
                 ) {
                     Ok(None) => {
@@ -9342,11 +9387,14 @@ impl MatrixFreeTrustRegionCore {
             let g_proj_trial = self.projected_gradient(&x_trial, &trial.gradient);
             let g_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
             if g_trial_norm.is_finite() && g_trial_norm <= effective_tol {
-                let trial_active = self.active_mask_vec(&x_trial, &trial.gradient);
+                let trial_active =
+                    self.second_order_active_mask_vec(&x_trial, &trial.gradient);
                 match reduced_negative_curvature_step(
                     &trial.hessian,
                     &trial_active,
                     &g_proj_trial,
+                    &x_trial,
+                    self.bounds.as_ref(),
                     trust_radius,
                 ) {
                     Ok(None) => {
@@ -14632,6 +14680,106 @@ mod tests {
             .expect("operator trust region must escape a zero-gradient strict saddle");
         assert!((solution.final_point[0].abs() - 1.0).abs() < 1e-7);
         assert!(solution.final_point[1].abs() < 1e-9);
+    }
+
+    #[test]
+    fn matrix_free_trust_region_escapes_zero_multiplier_lower_bound_saddle() {
+        struct WeakBoundSaddle;
+
+        impl ZerothOrderObjective for WeakBoundSaddle {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                let square = x[0] * x[0];
+                Ok(0.25 * (square - 1.0).powi(2))
+            }
+        }
+
+        impl FirstOrderObjective for WeakBoundSaddle {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                let square = x[0] * x[0];
+                Ok(FirstOrderSample {
+                    value: 0.25 * (square - 1.0).powi(2),
+                    gradient: array![x[0] * (square - 1.0)],
+                })
+            }
+        }
+
+        impl OperatorObjective for WeakBoundSaddle {
+            fn eval_value_grad_op(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<OperatorSample, ObjectiveEvalError> {
+                let first = FirstOrderObjective::eval_grad(self, x)?;
+                let square = x[0] * x[0];
+                Ok(OperatorSample {
+                    value: first.value,
+                    gradient: first.gradient,
+                    hessian: HessianValue::Operator(super::StdArc::new(ExactDenseOperator {
+                        hessian: array![[3.0 * square - 1.0]],
+                    })),
+                })
+            }
+        }
+
+        let bounds = Bounds::new(array![0.0], array![2.0], 1e-12).unwrap();
+        let mut solver = MatrixFreeTrustRegion::new(array![0.0], WeakBoundSaddle)
+            .with_bounds(bounds)
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_tolerance(Tolerance::new(1e-10).unwrap())
+            .with_initial_trust_radius(0.5);
+        let solution = solver
+            .run()
+            .expect("a zero-multiplier bound must retain its inward curvature direction");
+        assert!((solution.final_point[0] - 1.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn matrix_free_trust_region_respects_strictly_complementary_bound() {
+        struct StrictBoundMinimum;
+
+        impl ZerothOrderObjective for StrictBoundMinimum {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                Ok(x[0] - x[0] * x[0])
+            }
+        }
+
+        impl FirstOrderObjective for StrictBoundMinimum {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                Ok(FirstOrderSample {
+                    value: x[0] - x[0] * x[0],
+                    gradient: array![1.0 - 2.0 * x[0]],
+                })
+            }
+        }
+
+        impl OperatorObjective for StrictBoundMinimum {
+            fn eval_value_grad_op(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<OperatorSample, ObjectiveEvalError> {
+                Ok(OperatorSample {
+                    value: x[0] - x[0] * x[0],
+                    gradient: array![1.0 - 2.0 * x[0]],
+                    hessian: HessianValue::Dense(array![[-2.0]]),
+                })
+            }
+        }
+
+        let bounds = Bounds::new(array![0.0], array![0.25], 1e-12).unwrap();
+        let mut solver = MatrixFreeTrustRegion::new(array![0.0], StrictBoundMinimum)
+            .with_bounds(bounds)
+            .with_max_iterations(MaxIterations::new(10).unwrap())
+            .with_tolerance(Tolerance::new(1e-10).unwrap());
+        let solution = solver
+            .run()
+            .expect("strict complementarity removes the outward curvature direction");
+        assert_eq!(solution.final_point, array![0.0]);
+        assert_eq!(solution.iterations, 0);
     }
 
     /// `MatrixFreeTrustRegion` accepts `HessianValue::Dense(_)` via the
