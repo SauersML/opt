@@ -52,7 +52,11 @@ jobs:
             exit 1
           fi
 
+          # crates.io rejects anonymous API probes without an identifying
+          # User-Agent. Treating that 403 as "version absent" made an already
+          # published companion crate enter the retry loop for ten minutes.
           if curl --silent --show-error --fail \
+            --user-agent 'SauersML-opt-publish/1.0 (https://github.com/SauersML/opt)' \
             "https://crates.io/api/v1/crates/$package_name/$version" >/dev/null; then
             echo "$package_name $version already exists on crates.io; skipping publish"
             exit 0
