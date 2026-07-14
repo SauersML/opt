@@ -4646,6 +4646,13 @@ struct ArcCore {
     observer: Option<Box<dyn OptimizerObserver>>,
 }
 
+struct ArcTrialCandidate {
+    point: Array1<f64>,
+    step: Array1<f64>,
+    step_norm: f64,
+    predicted_decrease: f64,
+}
+
 /// A configurable Adaptive Regularization with Cubics (ARC) solver.
 pub struct Arc<ObjFn> {
     core: ArcCore,
@@ -5400,6 +5407,130 @@ impl ArcCore {
         (model_delta, s_norm, grad_m)
     }
 
+    /// Project one cubic-model step into the feasible box and certify the
+    /// model decrease at the step that will actually be evaluated.
+    fn prepare_arc_trial(
+        &self,
+        x: &Array1<f64>,
+        proposed_step: &Array1<f64>,
+        gradient: &Array1<f64>,
+        hessian: &Array2<f64>,
+        active: &[bool],
+    ) -> Option<ArcTrialCandidate> {
+        let raw_point = x + proposed_step;
+        let point = self.project_point(&raw_point);
+        let step = &point - x;
+        let step_norm = step.dot(&step).sqrt();
+        if !step_norm.is_finite() || step_norm <= 1e-16 {
+            return None;
+        }
+        let distortion = (&step - proposed_step)
+            .dot(&(&step - proposed_step))
+            .sqrt();
+        let proposed_norm = proposed_step.dot(proposed_step).sqrt();
+        let projection_changed = distortion > 1e-8 * (1.0 + proposed_norm);
+        let (model_delta, _, model_gradient) =
+            self.arc_model_value(gradient, hessian, self.sigma, &step, Some(active));
+        let model_gradient_norm = model_gradient.dot(&model_gradient).sqrt();
+        let model_gradient_target = self.theta * step_norm * step_norm;
+        if !model_delta.is_finite()
+            || !model_gradient_norm.is_finite()
+            || model_delta > 0.0
+            || (!projection_changed
+                && model_gradient_norm > model_gradient_target.max(1e-14))
+        {
+            return None;
+        }
+        let predicted_decrease = -model_delta;
+        if !predicted_decrease.is_finite() || predicted_decrease <= 0.0 {
+            return None;
+        }
+        Some(ArcTrialCandidate {
+            point,
+            step,
+            step_norm,
+            predicted_decrease,
+        })
+    }
+
+    /// Return both global cubic-model minimizers in the exact hard case.
+    ///
+    /// When the gradient has no numerically resolvable component in the
+    /// minimum-eigenvalue eigenspace, the shifted system fixes every other
+    /// spectral coordinate but leaves two equal-norm choices along one
+    /// minimum eigenvector.  Both are part of the subproblem solution; an
+    /// eigensolver's arbitrary eigenvector sign must not make one inaccessible.
+    fn arc_hard_case_steps(
+        &self,
+        spectrum: &ReducedSymmetricSpectrum,
+        gradient: &Array1<f64>,
+        sigma: f64,
+        full_dim: usize,
+    ) -> Option<(Array1<f64>, Array1<f64>)> {
+        if !spectrum.has_resolvable_negative_curvature() {
+            return None;
+        }
+        let spectral_gradient = spectrum.gradient_coordinates(gradient);
+        let lambda_lower = -spectrum.eigenvalues[0];
+        let target_norm = lambda_lower / sigma;
+        let gradient_norm = gradient.dot(gradient).sqrt();
+        let gradient_floor = gradient_norm
+            * (spectrum.eigenvalues.len() as f64).sqrt()
+            * f64::EPSILON;
+        let mut base = Array1::<f64>::zeros(spectral_gradient.len());
+        let mut minimum_gradient = 0.0_f64;
+        let mut minimum_index = 0usize;
+        for index in 0..spectral_gradient.len() {
+            let denominator = spectrum.eigenvalues[index] + lambda_lower;
+            if denominator.abs() <= spectrum.numerical_floor {
+                minimum_gradient = minimum_gradient.max(spectral_gradient[index].abs());
+                minimum_index = index;
+            } else {
+                base[index] = -spectral_gradient[index] / denominator;
+            }
+        }
+        let base_norm = base.dot(&base).sqrt();
+        if minimum_gradient > gradient_floor
+            || base_norm > target_norm * (1.0 + 32.0 * f64::EPSILON)
+        {
+            return None;
+        }
+        let missing_norm =
+            (target_norm * target_norm - base_norm * base_norm).max(0.0).sqrt();
+        if !missing_norm.is_finite() || missing_norm <= 0.0 {
+            return None;
+        }
+        let mut plus = base.clone();
+        plus[minimum_index] += missing_norm;
+        let mut minus = base;
+        minus[minimum_index] -= missing_norm;
+        Some((
+            spectrum.embed_step(&plus, full_dim),
+            spectrum.embed_step(&minus, full_dim),
+        ))
+    }
+
+    /// Recover the other exact hard-case minimizer corresponding to `primary`.
+    fn opposing_arc_hard_case_step(
+        &self,
+        hessian: &Array2<f64>,
+        gradient: &Array1<f64>,
+        sigma: f64,
+        active: &[bool],
+        primary: &Array1<f64>,
+    ) -> Option<Array1<f64>> {
+        let spectrum = ReducedSymmetricSpectrum::decompose(hessian, Some(active))?;
+        let (plus, minus) =
+            self.arc_hard_case_steps(&spectrum, gradient, sigma, gradient.len())?;
+        let plus_distance = (&plus - primary).dot(&(&plus - primary));
+        let minus_distance = (&minus - primary).dot(&(&minus - primary));
+        if plus_distance > minus_distance {
+            Some(plus)
+        } else {
+            Some(minus)
+        }
+    }
+
     fn cauchy_arc_step(
         &self,
         g: &Array1<f64>,
@@ -5499,39 +5630,15 @@ impl ArcCore {
             let spectral_gradient = spectrum.gradient_coordinates(g);
             let minimum = spectrum.eigenvalues[0];
             let lambda_lower = -minimum;
-            let target_norm = lambda_lower / sigma;
-            let gradient_floor = g_norm
-                * (spectrum.eigenvalues.len() as f64).sqrt()
-                * f64::EPSILON;
-            let mut base = Array1::<f64>::zeros(spectral_gradient.len());
-            let mut minimum_gradient = 0.0_f64;
-            let mut minimum_index = 0usize;
-            for index in 0..spectral_gradient.len() {
-                let denominator = spectrum.eigenvalues[index] + lambda_lower;
-                if denominator.abs() <= spectrum.numerical_floor {
-                    minimum_gradient = minimum_gradient.max(spectral_gradient[index].abs());
-                    minimum_index = index;
-                } else {
-                    base[index] = -spectral_gradient[index] / denominator;
-                }
-            }
-            let base_norm = base.dot(&base).sqrt();
-            let spectral_step = if minimum_gradient <= gradient_floor
-                && base_norm <= target_norm * (1.0 + 32.0 * f64::EPSILON)
+            let step = if let Some((plus, minus)) =
+                self.arc_hard_case_steps(&spectrum, g, sigma, n)
             {
-                let missing_norm_sq = (target_norm * target_norm - base_norm * base_norm).max(0.0);
-                let missing_norm = missing_norm_sq.sqrt();
-                let mut plus = base.clone();
-                plus[minimum_index] += missing_norm;
-                let mut minus = base;
-                minus[minimum_index] -= missing_norm;
                 // The sign of a minimum eigenvector is arbitrary. At a weakly
                 // active bound one sign can point outside the box and project
                 // back to the saddle while the other is the feasible escape.
                 // Compare the actual feasible cubic models deterministically.
                 let feasible_model = |candidate: &Array1<f64>| {
-                    let full_step = spectrum.embed_step(candidate, n);
-                    let raw_trial = x + &full_step;
+                    let raw_trial = x + candidate;
                     let feasible_trial = self.project_point(&raw_trial);
                     let feasible_step = &feasible_trial - x;
                     self.arc_model_value(g, h, sigma, &feasible_step, active_opt)
@@ -5586,12 +5693,12 @@ impl ArcCore {
                         break;
                     }
                 }
-                Array1::from_shape_fn(spectral_gradient.len(), |index| {
+                let spectral_step = Array1::from_shape_fn(spectral_gradient.len(), |index| {
                     -spectral_gradient[index]
                         / (spectrum.eigenvalues[index] + lambda_high)
-                })
+                });
+                spectrum.embed_step(&spectral_step, n)
             };
-            let step = spectrum.embed_step(&spectral_step, n);
             let (model_delta, step_norm, model_gradient) =
                 self.arc_model_value(g, h, sigma, &step, active_opt);
             let model_gradient_norm = model_gradient.dot(&model_gradient).sqrt();
@@ -5918,88 +6025,16 @@ impl ArcCore {
                 }
             };
 
-            let x_trial_raw = &x_k + &step;
-            let x_trial = self.project_point(&x_trial_raw);
-            let s_trial = &x_trial - &x_k;
-            let s_norm = s_trial.dot(&s_trial).sqrt();
-            if !s_norm.is_finite() || s_norm <= 1e-16 {
+            let Some(mut candidate) = self.prepare_arc_trial(
+                &x_k,
+                &step,
+                &g_proj_k,
+                h_model,
+                &active,
+            ) else {
                 self.escalate_sigma_on_failure(&mut model_failure_streak);
                 continue;
-            }
-            let step_distortion = (&s_trial - &step).dot(&(&s_trial - &step)).sqrt();
-            let step_norm_ref = step.dot(&step).sqrt();
-            let proj_changed = step_distortion > 1e-8 * (1.0 + step_norm_ref);
-
-            // Recompute the cubic-model decrease at the actually-feasible step
-            // `s_trial` (which may have been projected onto the box). The
-            // unconstrained subproblem solved for `step`, so when projection
-            // shrank or rotated it the previously-computed model decrease no
-            // longer applies — the ρ-ratio test must use `m(s_trial)`.
-            //
-            // The standard ARC subproblem-progress condition
-            // `‖∇m(s)‖ ≤ θ‖s‖²` certifies that `s` is near the cubic model's
-            // minimizer. After box projection that certificate does not hold
-            // by construction (clipping shoves us off the minimum), so we
-            // enforce it only when no projection occurred. The ρ-ratio
-            // acceptance below still gates whether the clipped step is taken.
-            //
-            // Earlier code (fb876b7f) instead diverted clipped steps into a
-            // special branch that accepted only when BOTH f_trial <= f_k AND
-            // |g_proj_trial| <= |g_proj_k|. The gradient half of that
-            // conjunction is wrong: at a near-stationary plateau with a
-            // near-singular Hessian direction (typical of LAML smoothing-
-            // parameter optimization at the saturation regime), a clipped
-            // step lands at a point with strictly lower cost but strictly
-            // larger gradient — moving off the plateau onto a steeper region
-            // of the surface is real descent. The conjunction rejected these
-            // legitimate steps and forced σ to grow doubling-by-doubling
-            // until the unconstrained step happened to fit inside the box.
-            // See `arc_clipped_step_accepts_when_cost_decreases_even_if_gradient_grows`.
-            // Recompute the cubic-model decrease at the actually-feasible step
-            // `s_trial` (which may have been projected onto the box). The
-            // unconstrained subproblem solved for `step`, so when projection
-            // shrank or rotated it the previously-computed model decrease no
-            // longer applies — the ρ-ratio test must use `m(s_trial)`.
-            //
-            // The standard ARC subproblem-progress condition
-            // `‖∇m(s)‖ ≤ θ‖s‖²` certifies that `s` is near the cubic model's
-            // minimizer. After box projection that certificate does not hold
-            // by construction (clipping shoves us off the minimum), so we
-            // enforce it only when no projection occurred. The ρ-ratio
-            // acceptance below still gates whether the clipped step is taken.
-            //
-            // Earlier code (fb876b7f) instead diverted clipped steps into a
-            // special branch that accepted only when BOTH f_trial <= f_k AND
-            // |g_proj_trial| <= |g_proj_k|. The gradient half of that
-            // conjunction is wrong: at a near-stationary plateau with a
-            // near-singular Hessian direction (typical of LAML smoothing-
-            // parameter optimization at the saturation regime), a clipped
-            // step can land at a point with strictly lower cost but strictly
-            // larger projected gradient — moving off the plateau onto a
-            // steeper region of the surface is real descent. The conjunction
-            // rejected these legitimate steps and forced σ to grow
-            // doubling-by-doubling until the unconstrained step happened to
-            // fit inside the box, burning ~10-15 iterations with no progress.
-            let (m_delta_trial, _, grad_m_trial) =
-                self.arc_model_value(&g_proj_k, h_model, self.sigma, &s_trial, Some(&active));
-            let grad_m_norm = grad_m_trial.dot(&grad_m_trial).sqrt();
-            let target_m = self.theta * s_norm * s_norm;
-            if !m_delta_trial.is_finite()
-                || !grad_m_norm.is_finite()
-                || m_delta_trial > 0.0
-                || (!proj_changed && grad_m_norm > target_m.max(1e-14))
-            {
-                self.escalate_sigma_on_failure(&mut model_failure_streak);
-                continue;
-            }
-
-            // Standard ARC predicted reduction is m(0) - m(s) = -m(s),
-            // where `m_delta_trial` already includes the cubic term.
-            let denom = -m_delta_trial;
-            if !denom.is_finite() || denom <= 0.0 {
-                self.escalate_sigma_on_failure(&mut model_failure_streak);
-                continue;
-            }
+            };
 
             // Numerical-convergence guard: when the predicted reduction
             // is below the ULP scale of the objective value, the rho
@@ -6008,7 +6043,7 @@ impl ArcCore {
             // sigma oscillate. Declare numerical convergence instead.
             // See `ARC_NUMERICAL_CONV_FACTOR` for the full rationale.
             let f_scale = (1.0 + f_k.abs()) * f64::EPSILON;
-            if denom <= ARC_NUMERICAL_CONV_FACTOR * f_scale
+            if candidate.predicted_decrease <= ARC_NUMERICAL_CONV_FACTOR * f_scale
                 && reduced_hessian_is_positive_semidefinite(h_model, Some(&active))
             {
                 return Ok(Solution::gradient_based_with_status(
@@ -6025,23 +6060,77 @@ impl ArcCore {
                 ));
             }
 
-            let (f_trial, g_trial, h_trial) = match oracle.eval_cost_grad_hessian(
+            let primary_sample = oracle.eval_cost_grad_hessian(
                 obj_fn,
-                &x_trial,
+                &candidate.point,
                 self.bounds.as_ref(),
                 &mut func_evals,
                 &mut grad_evals,
                 &mut hess_evals,
-            ) {
+            );
+            let (f_trial, g_trial, h_trial) = match primary_sample {
                 Ok(sample) => sample,
                 Err(ObjectiveEvalError::Recoverable { .. }) => {
-                    self.escalate_sigma_on_failure(&mut model_failure_streak);
-                    continue;
+                    // At negative curvature the cubic model has two opposing
+                    // escape orientations.  Eigenvector sign is arbitrary, and
+                    // one orientation can enter an objective-domain wall (for
+                    // example a non-convergent profiled inner solve) while the
+                    // antipode is the feasible descent route.  Increasing sigma
+                    // and replaying the same sign cannot resolve that topology.
+                    // Try the antipode exactly once, but only when the reduced
+                    // Hessian genuinely has negative curvature and the projected
+                    // antipode independently satisfies the cubic-model decrease
+                    // contract.  This is the other mathematical hard-case
+                    // solution, not a first-order or approximate fallback.
+                    let Some(opposing_step) = self.opposing_arc_hard_case_step(
+                        h_model,
+                        &g_proj_k,
+                        self.sigma,
+                        &active,
+                        &step,
+                    ) else {
+                        self.escalate_sigma_on_failure(&mut model_failure_streak);
+                        continue;
+                    };
+                    let Some(antipodal_candidate) = self.prepare_arc_trial(
+                        &x_k,
+                        &opposing_step,
+                        &g_proj_k,
+                        h_model,
+                        &active,
+                    )
+                    else {
+                        self.escalate_sigma_on_failure(&mut model_failure_streak);
+                        continue;
+                    };
+                    let antipodal_sample = oracle.eval_cost_grad_hessian(
+                        obj_fn,
+                        &antipodal_candidate.point,
+                        self.bounds.as_ref(),
+                        &mut func_evals,
+                        &mut grad_evals,
+                        &mut hess_evals,
+                    );
+                    candidate = antipodal_candidate;
+                    match antipodal_sample {
+                        Ok(sample) => sample,
+                        Err(ObjectiveEvalError::Recoverable { .. }) => {
+                            self.escalate_sigma_on_failure(&mut model_failure_streak);
+                            continue;
+                        }
+                        Err(ObjectiveEvalError::Fatal { message }) => {
+                            return Err(ArcError::ObjectiveFailed { message });
+                        }
+                    }
                 }
                 Err(ObjectiveEvalError::Fatal { message }) => {
                     return Err(ArcError::ObjectiveFailed { message });
                 }
             };
+            let x_trial = candidate.point;
+            let s_trial = candidate.step;
+            let s_norm = candidate.step_norm;
+            let denom = candidate.predicted_decrease;
             // Trial-point gradient short-circuit. If the projected
             // gradient at the trial is already within tolerance, we are
             // at a stationary point — accept regardless of the noisy
@@ -12435,6 +12524,99 @@ mod tests {
         let solution = solver.run().expect("ARC must escape the stationary saddle");
         assert!((solution.final_point[0].abs() - 1.0).abs() < 1e-7);
         assert!(solution.final_point[1].abs() < 1e-9);
+    }
+
+    #[test]
+    fn arc_tries_both_exact_hard_case_orientations_after_recoverable_domain_error() {
+        #[derive(Default)]
+        struct HardCaseState {
+            rejected_trial: Option<Array1<f64>>,
+            saw_opposing_trial: bool,
+        }
+
+        struct OneSidedHardCaseObjective {
+            state: Arc<Mutex<HardCaseState>>,
+        }
+
+        impl OneSidedHardCaseObjective {
+            fn sample(x: &Array1<f64>) -> SecondOrderSample {
+                const LINEAR_Y: f64 = 0.2;
+                let x_sq = x[0] * x[0];
+                SecondOrderSample {
+                    value: 0.25 * (x_sq - 1.0).powi(2)
+                        + 0.5 * x[1] * x[1]
+                        + LINEAR_Y * x[1],
+                    gradient: array![x[0] * (x_sq - 1.0), x[1] + LINEAR_Y],
+                    hessian: Some(array![[3.0 * x_sq - 1.0, 0.0], [0.0, 1.0]]),
+                }
+            }
+        }
+
+        impl ZerothOrderObjective for OneSidedHardCaseObjective {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                Ok(Self::sample(x).value)
+            }
+        }
+
+        impl FirstOrderObjective for OneSidedHardCaseObjective {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                let sample = Self::sample(x);
+                Ok(FirstOrderSample {
+                    value: sample.value,
+                    gradient: sample.gradient,
+                })
+            }
+        }
+
+        impl SecondOrderObjective for OneSidedHardCaseObjective {
+            fn eval_hessian(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<SecondOrderSample, ObjectiveEvalError> {
+                let mut state = self.state.lock().expect("hard-case test state poisoned");
+                if x[0].abs() > 0.5 && state.rejected_trial.is_none() {
+                    state.rejected_trial = Some(x.clone());
+                    return Err(ObjectiveEvalError::recoverable(
+                        "one exact hard-case orientation leaves the objective domain",
+                    ));
+                }
+                if let Some(rejected) = state.rejected_trial.as_ref()
+                    && !state.saw_opposing_trial
+                {
+                    assert!(
+                        (x[0] + rejected[0]).abs() < 1e-10,
+                        "the opposing hard-case trial must reflect only the negative-curvature coordinate"
+                    );
+                    assert!(
+                        (x[1] - rejected[1]).abs() < 1e-10,
+                        "the regular spectral coordinate must be preserved"
+                    );
+                    state.saw_opposing_trial = true;
+                }
+                drop(state);
+                Ok(Self::sample(x))
+            }
+        }
+
+        let state = Arc::new(Mutex::new(HardCaseState::default()));
+        let objective = OneSidedHardCaseObjective {
+            state: Arc::clone(&state),
+        };
+        let mut solver = super::Arc::new(array![0.0, 0.0], objective)
+            .with_profile(Profile::Deterministic)
+            .with_tolerance(tol(1e-10))
+            .with_max_iterations(iters(100));
+        let solution = solver
+            .run()
+            .expect("ARC must use the other exact hard-case orientation");
+        assert!((solution.final_point[0].abs() - 1.0).abs() < 1e-7);
+        assert!((solution.final_point[1] + 0.2).abs() < 1e-7);
+        let state = state.lock().expect("hard-case test state poisoned");
+        assert!(state.rejected_trial.is_some());
+        assert!(state.saw_opposing_trial);
     }
 
     #[test]
