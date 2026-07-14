@@ -1759,6 +1759,52 @@ fn reduced_hessian_is_positive_semidefinite(
         .is_some_and(|spectrum| !spectrum.has_resolvable_negative_curvature())
 }
 
+/// Materialize an exact Hessian operator only at a prospective stationary
+/// exit, then either certify its reduced Hessian or return the trust-region
+/// boundary step along its most-negative free-coordinate eigendirection.
+///
+/// Operator trust-region iterations normally stay matrix-free. A second-order
+/// method cannot, however, turn a small projected gradient into convergence
+/// without checking curvature: a strict saddle has exactly zero gradient. The
+/// terminal certificate would have to materialize the same operator anyway, so
+/// this one bounded probe is the authoritative convergence geometry rather
+/// than a fallback approximation.
+fn reduced_negative_curvature_step(
+    hessian: &HessianValue,
+    active: &[bool],
+    projected_gradient: &Array1<f64>,
+    trust_radius: f64,
+) -> Result<Option<Array1<f64>>, ObjectiveEvalError> {
+    let dense = hessian.materialize_dense()?.ok_or_else(|| {
+        ObjectiveEvalError::fatal("second-order stationarity requires an analytic Hessian")
+    })?;
+    if active.len() != dense.nrows() || projected_gradient.len() != dense.nrows() {
+        return Err(ObjectiveEvalError::fatal(format!(
+            "reduced curvature probe dimension mismatch: Hessian={}x{}, active={}, gradient={}",
+            dense.nrows(),
+            dense.ncols(),
+            active.len(),
+            projected_gradient.len(),
+        )));
+    }
+    let spectrum = ReducedSymmetricSpectrum::decompose(&dense, Some(active))
+        .ok_or_else(|| ObjectiveEvalError::fatal("reduced curvature eigendecomposition failed"))?;
+    if !spectrum.has_resolvable_negative_curvature() {
+        return Ok(None);
+    }
+    let gradient_coordinates = spectrum.gradient_coordinates(projected_gradient);
+    let mut spectral_step = Array1::<f64>::zeros(spectrum.free.len());
+    let sign = if gradient_coordinates[0] > 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    spectral_step[0] = sign * trust_radius;
+    Ok(Some(
+        spectrum.embed_step(&spectral_step, projected_gradient.len()),
+    ))
+}
+
 fn dense_trust_region_step(
     h: &Array2<f64>,
     g: &Array1<f64>,
@@ -8783,19 +8829,54 @@ impl MatrixFreeTrustRegionCore {
             }
             let g_proj = self.projected_gradient(&x_k, &sample.gradient);
             let g_proj_norm = g_proj.dot(&g_proj).sqrt();
+            let active = self.active_mask_vec(&x_k, &sample.gradient);
+            let mut negative_curvature_step = None;
             if g_proj_norm <= effective_tol {
-                let sol = Solution::gradient_based(
-                    x_k.clone(),
-                    sample.value,
-                    sample.gradient.clone(),
-                    g_proj_norm,
-                    None,
-                    k,
-                    func_evals,
-                    grad_evals,
-                    hvp_evals, // we account for HVPs in the hess_evals slot for now
-                );
-                return Ok(sol);
+                match reduced_negative_curvature_step(
+                    &sample.hessian,
+                    &active,
+                    &g_proj,
+                    trust_radius,
+                ) {
+                    Ok(Some(step)) => negative_curvature_step = Some(step),
+                    Ok(None) => {
+                        let sol = Solution::gradient_based(
+                            x_k.clone(),
+                            sample.value,
+                            sample.gradient.clone(),
+                            g_proj_norm,
+                            None,
+                            k,
+                            func_evals,
+                            grad_evals,
+                            hvp_evals,
+                        );
+                        return Ok(sol);
+                    }
+                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                        trust_radius *= 0.25;
+                        if trust_radius < self.trust_radius_min {
+                            let last = Box::new(Solution::gradient_based(
+                                x_k.clone(),
+                                sample.value,
+                                sample.gradient.clone(),
+                                g_proj_norm,
+                                None,
+                                k,
+                                func_evals,
+                                grad_evals,
+                                hvp_evals,
+                            ));
+                            return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
+                                last_solution: last,
+                            });
+                        }
+                        continue;
+                    }
+                    Err(ObjectiveEvalError::Fatal { message }) => {
+                        return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
+                    }
+                }
             }
 
             // Materialize a Hessian operator handle for the CG step.
@@ -8877,24 +8958,36 @@ impl MatrixFreeTrustRegionCore {
             };
 
             // Compute a step via Steihaug-Toint truncated CG.
-            let active = self.active_mask_vec(&x_k, &sample.gradient);
             let cg_max_iter = ((n as f64) * self.cg_max_iter_factor).ceil() as usize;
             let cg_max_iter = cg_max_iter.max(2 * n).max(8);
-            let step_result = operator_steihaug_toint_step(
-                &op_handle,
-                &g_proj,
-                trust_radius,
-                if self.bounds.is_some() {
-                    Some(&active)
-                } else {
-                    None
-                },
-                self.cg_tol,
-                cg_max_iter,
-                &mut hvp_evals,
-                &mut cg_scratch,
-            );
-            let predicted = match step_result {
+            let step_result = if let Some(step) = negative_curvature_step {
+                cg_scratch.p.assign(&step);
+                match op_handle.apply_into(&cg_scratch.p, &mut cg_scratch.hp) {
+                    Ok(()) => {
+                        hvp_evals += 1;
+                        let predicted =
+                            -g_proj.dot(&cg_scratch.p) - 0.5 * cg_scratch.p.dot(&cg_scratch.hp);
+                        Ok(Some(predicted))
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                operator_steihaug_toint_step(
+                    &op_handle,
+                    &g_proj,
+                    trust_radius,
+                    if self.bounds.is_some() {
+                        Some(&active)
+                    } else {
+                        None
+                    },
+                    self.cg_tol,
+                    cg_max_iter,
+                    &mut hvp_evals,
+                    &mut cg_scratch,
+                )
+            };
+            let mut predicted = match step_result {
                 Ok(Some(p)) => p,
                 Ok(None) => {
                     // Gradient was already at convergence (caught by the
@@ -8969,19 +9062,59 @@ impl MatrixFreeTrustRegionCore {
             // justification.
             let f_scale = (1.0 + sample.value.abs()) * f64::EPSILON;
             if predicted <= ARC_NUMERICAL_CONV_FACTOR * f_scale {
-                let sol = Solution::gradient_based_with_status(
-                    x_k.clone(),
-                    sample.value,
-                    sample.gradient.clone(),
-                    g_proj_norm,
-                    None,
-                    k,
-                    func_evals,
-                    grad_evals,
-                    hvp_evals,
-                    OptimizationStatus::NumericallyConverged,
-                );
-                return Ok(sol);
+                match reduced_negative_curvature_step(
+                    &sample.hessian,
+                    &active,
+                    &g_proj,
+                    trust_radius,
+                ) {
+                    Ok(None) => {
+                        let sol = Solution::gradient_based_with_status(
+                            x_k.clone(),
+                            sample.value,
+                            sample.gradient.clone(),
+                            g_proj_norm,
+                            None,
+                            k,
+                            func_evals,
+                            grad_evals,
+                            hvp_evals,
+                            OptimizationStatus::NumericallyConverged,
+                        );
+                        return Ok(sol);
+                    }
+                    Ok(Some(step)) => {
+                        cg_scratch.p.assign(&step);
+                        match op_handle.apply_into(&cg_scratch.p, &mut cg_scratch.hp) {
+                            Ok(()) => {
+                                hvp_evals += 1;
+                                predicted = -g_proj.dot(&cg_scratch.p)
+                                    - 0.5 * cg_scratch.p.dot(&cg_scratch.hp);
+                                if predicted <= 0.0 || !predicted.is_finite() {
+                                    return Err(MatrixFreeTrustRegionError::ObjectiveFailed {
+                                        message: "resolvable negative-curvature step did not decrease the exact quadratic model".to_string(),
+                                    });
+                                }
+                            }
+                            Err(ObjectiveEvalError::Recoverable { .. }) => {
+                                trust_radius *= 0.25;
+                                continue;
+                            }
+                            Err(ObjectiveEvalError::Fatal { message }) => {
+                                return Err(MatrixFreeTrustRegionError::ObjectiveFailed {
+                                    message,
+                                });
+                            }
+                        }
+                    }
+                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                        trust_radius *= 0.25;
+                        continue;
+                    }
+                    Err(ObjectiveEvalError::Fatal { message }) => {
+                        return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
+                    }
+                }
             }
 
             // Step lives in `cg_scratch.p`. Form the trial point in
@@ -9120,18 +9253,36 @@ impl MatrixFreeTrustRegionCore {
             let g_proj_trial = self.projected_gradient(&x_trial, &trial.gradient);
             let g_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
             if g_trial_norm.is_finite() && g_trial_norm <= effective_tol {
-                let sol = Solution::gradient_based(
-                    x_trial,
-                    trial.value,
-                    trial.gradient,
-                    g_trial_norm,
-                    None,
-                    k + 1,
-                    func_evals,
-                    grad_evals,
-                    hvp_evals,
-                );
-                return Ok(sol);
+                let trial_active = self.active_mask_vec(&x_trial, &trial.gradient);
+                match reduced_negative_curvature_step(
+                    &trial.hessian,
+                    &trial_active,
+                    &g_proj_trial,
+                    trust_radius,
+                ) {
+                    Ok(None) => {
+                        let sol = Solution::gradient_based(
+                            x_trial,
+                            trial.value,
+                            trial.gradient,
+                            g_trial_norm,
+                            None,
+                            k + 1,
+                            func_evals,
+                            grad_evals,
+                            hvp_evals,
+                        );
+                        return Ok(sol);
+                    }
+                    Ok(Some(_)) => {}
+                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                        trust_radius *= 0.5;
+                        continue;
+                    }
+                    Err(ObjectiveEvalError::Fatal { message }) => {
+                        return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
+                    }
+                }
             }
 
             let actual = sample.value - trial.value;
@@ -14154,6 +14305,33 @@ mod tests {
         }
     }
 
+    struct ExactDenseOperator {
+        hessian: Array2<f64>,
+    }
+
+    impl HessianOperator for ExactDenseOperator {
+        fn dim(&self) -> usize {
+            self.hessian.nrows()
+        }
+
+        fn apply_into(
+            &self,
+            v: &Array1<f64>,
+            out: &mut Array1<f64>,
+        ) -> Result<(), ObjectiveEvalError> {
+            ndarray::linalg::general_mat_vec_mul(1.0, &self.hessian, v, 0.0, out);
+            Ok(())
+        }
+
+        fn materialization(&self) -> HessianMaterialization {
+            HessianMaterialization::Explicit
+        }
+
+        fn materialize_dense(&self) -> Result<Array2<f64>, ObjectiveEvalError> {
+            Ok(self.hessian.clone())
+        }
+    }
+
     /// `f(x) = 0.5 * (x - 1)^T (x - 1)`, with the Hessian exposed as
     /// the identity operator instead of a dense matrix.
     struct OperatorQuadratic {
@@ -14220,6 +14398,58 @@ mod tests {
         // Solution; we just assert it was non-zero (a real algorithm
         // ran).
         assert!(solution.hess_evals > 0);
+    }
+
+    #[test]
+    fn matrix_free_trust_region_escapes_stationary_operator_saddle() {
+        struct OperatorSaddle;
+
+        impl ZerothOrderObjective for OperatorSaddle {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                let square = x[0] * x[0];
+                Ok(0.25 * (square - 1.0).powi(2) + 0.5 * x[1] * x[1])
+            }
+        }
+
+        impl FirstOrderObjective for OperatorSaddle {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                let square = x[0] * x[0];
+                Ok(FirstOrderSample {
+                    value: 0.25 * (square - 1.0).powi(2) + 0.5 * x[1] * x[1],
+                    gradient: array![x[0] * (square - 1.0), x[1]],
+                })
+            }
+        }
+
+        impl OperatorObjective for OperatorSaddle {
+            fn eval_value_grad_op(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<OperatorSample, ObjectiveEvalError> {
+                let first = FirstOrderObjective::eval_grad(self, x)?;
+                let square = x[0] * x[0];
+                Ok(OperatorSample {
+                    value: first.value,
+                    gradient: first.gradient,
+                    hessian: HessianValue::Operator(super::StdArc::new(ExactDenseOperator {
+                        hessian: array![[3.0 * square - 1.0, 0.0], [0.0, 1.0]],
+                    })),
+                })
+            }
+        }
+
+        let mut solver = MatrixFreeTrustRegion::new(array![0.0, 0.0], OperatorSaddle)
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_tolerance(Tolerance::new(1e-10).unwrap())
+            .with_initial_trust_radius(0.5);
+        let solution = solver
+            .run()
+            .expect("operator trust region must escape a zero-gradient strict saddle");
+        assert!((solution.final_point[0].abs() - 1.0).abs() < 1e-7);
+        assert!(solution.final_point[1].abs() < 1e-9);
     }
 
     /// `MatrixFreeTrustRegion` accepts `HessianValue::Dense(_)` via the
