@@ -7,6 +7,8 @@
 //! - `Bfgs`: dense quasi-Newton optimization with robust hybrid line search.
 //! - `NewtonTrustRegion`: Hessian-based trust-region optimization.
 //! - `Arc`: Adaptive Regularization with Cubics (ARC).
+//! - `find_root_bracketed`: derivative-free scalar root refinement from an
+//!   analytic sign bracket.
 //!
 //! All solvers support optional simple box constraints and are built around practical
 //! robustness for noisy/non-ideal objectives.
@@ -1154,6 +1156,293 @@ pub fn find_root_monotone<E>(
         abs_deriv: best_abs_deriv,
         iters: refine_iters,
         method_used: RootMethod::Bracketed,
+    })
+}
+
+// =====================================================================
+// Safeguarded scalar root-finding from an analytic sign bracket
+// =====================================================================
+
+/// Configuration for [`find_root_bracketed`].
+///
+/// `position_tolerance` is relative to the scale of the current bracket:
+/// refinement stops when its width is no larger than
+/// `position_tolerance * (1 + |lower| + |upper|)`. `residual_tolerance`
+/// independently permits an earlier exit when the oracle value is already
+/// small enough.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BracketedRootConfig {
+    /// Relative tolerance for the final bracket width.
+    pub position_tolerance: f64,
+    /// Absolute tolerance for the root residual.
+    pub residual_tolerance: f64,
+    /// Maximum safeguarded Illinois iterations.
+    pub max_iterations: usize,
+}
+
+impl BracketedRootConfig {
+    /// Construct a bracketed-root configuration.
+    #[must_use]
+    pub fn new(position_tolerance: f64, residual_tolerance: f64, max_iterations: usize) -> Self {
+        Self {
+            position_tolerance,
+            residual_tolerance,
+            max_iterations,
+        }
+    }
+}
+
+/// The convergence certificate returned by [`find_root_bracketed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BracketedRootMethod {
+    /// The lower endpoint satisfied the residual tolerance.
+    LowerEndpoint,
+    /// The upper endpoint satisfied the residual tolerance.
+    UpperEndpoint,
+    /// An interior oracle evaluation satisfied the residual tolerance.
+    Residual,
+    /// The surviving sign bracket satisfied the position tolerance.
+    BracketWidth,
+}
+
+/// A root certified by an analytic sign-changing bracket.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BracketedRootSolution {
+    /// Best-residual point evaluated inside the final bracket.
+    pub root: f64,
+    /// Oracle value at `root`.
+    pub value: f64,
+    /// Final ordered bracket known to contain a root by continuity.
+    pub bracket: (f64, f64),
+    /// Refinement iterations consumed; endpoint convergence uses zero.
+    pub iterations: usize,
+    /// Total oracle evaluations, including the two endpoints.
+    pub func_evals: usize,
+    /// The certificate that terminated refinement.
+    pub method_used: BracketedRootMethod,
+}
+
+/// Error returned by [`find_root_bracketed`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BracketedRootError<E> {
+    /// The oracle returned an error at `at`.
+    Eval {
+        /// Evaluation point.
+        at: f64,
+        /// Oracle error.
+        source: E,
+    },
+    /// A tolerance or iteration limit was invalid.
+    InvalidConfig,
+    /// The endpoints did not form a finite, ordered interval.
+    InvalidBracket {
+        /// Supplied lower endpoint.
+        lower: f64,
+        /// Supplied upper endpoint.
+        upper: f64,
+    },
+    /// The oracle returned a non-finite residual.
+    NonFiniteValue {
+        /// Evaluation point.
+        at: f64,
+        /// Non-finite value.
+        value: f64,
+    },
+    /// Neither endpoint was a root and their residuals had the same sign.
+    NoSignChange {
+        /// Residual at the lower endpoint.
+        lower_value: f64,
+        /// Residual at the upper endpoint.
+        upper_value: f64,
+    },
+    /// The iteration budget expired with a valid but insufficiently narrow
+    /// sign bracket.
+    MaxIterations {
+        /// Final lower endpoint.
+        lower: f64,
+        /// Final upper endpoint.
+        upper: f64,
+        /// Residual at the final lower endpoint.
+        lower_value: f64,
+        /// Residual at the final upper endpoint.
+        upper_value: f64,
+    },
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for BracketedRootError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eval { at, source } => {
+                write!(f, "root oracle evaluation failed at {at}: {source}")
+            }
+            Self::InvalidConfig => write!(f, "bracketed-root configuration is invalid"),
+            Self::InvalidBracket { lower, upper } => {
+                write!(f, "root bracket [{lower}, {upper}] is invalid")
+            }
+            Self::NonFiniteValue { at, value } => {
+                write!(f, "root oracle returned non-finite value {value} at {at}")
+            }
+            Self::NoSignChange {
+                lower_value,
+                upper_value,
+            } => write!(
+                f,
+                "root bracket does not change sign (F(lower) = {lower_value}, F(upper) = {upper_value})"
+            ),
+            Self::MaxIterations {
+                lower,
+                upper,
+                lower_value,
+                upper_value,
+            } => write!(
+                f,
+                "bracketed-root refinement exhausted on [{lower}, {upper}] with residuals [{lower_value}, {upper_value}]"
+            ),
+        }
+    }
+}
+
+impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for BracketedRootError<E> {}
+
+/// Find a zero of a continuous scalar function inside a supplied sign-changing
+/// bracket without requiring derivatives of that function.
+///
+/// Refinement uses the Illinois variant of regula falsi: secant interpolation
+/// gives fast progress on smooth profiles, while halving the retained
+/// endpoint's interpolation weight prevents the classical false-position
+/// stall. Every accepted point lies strictly inside the current interval and
+/// preserves the sign bracket. If floating-point interpolation cannot produce
+/// an interior point, the method bisects instead. Consequently a successful
+/// [`BracketedRootMethod::BracketWidth`] result is a location certificate from
+/// the bracket itself and does not pretend that a steep residual must be small.
+///
+/// The oracle must be continuous on `[lower, upper]`. Unlike
+/// [`find_root_monotone`], it need not be monotone and no first or second
+/// derivative is required. With a negative residual at the lower endpoint and
+/// a positive residual at the upper endpoint, the surviving bracket also
+/// preserves the first-order sign orientation of a scalar local minimum when
+/// the oracle is an objective derivative.
+pub fn find_root_bracketed<E>(
+    mut oracle: impl FnMut(f64) -> Result<f64, E>,
+    lower: f64,
+    upper: f64,
+    config: &BracketedRootConfig,
+) -> Result<BracketedRootSolution, BracketedRootError<E>> {
+    if !(config.position_tolerance.is_finite()
+        && config.position_tolerance > 0.0
+        && config.residual_tolerance.is_finite()
+        && config.residual_tolerance >= 0.0
+        && config.max_iterations > 0)
+    {
+        return Err(BracketedRootError::InvalidConfig);
+    }
+    if !(lower.is_finite() && upper.is_finite() && lower < upper) {
+        return Err(BracketedRootError::InvalidBracket { lower, upper });
+    }
+
+    let evaluate = |oracle: &mut dyn FnMut(f64) -> Result<f64, E>,
+                    at: f64|
+     -> Result<f64, BracketedRootError<E>> {
+        let value = oracle(at).map_err(|source| BracketedRootError::Eval { at, source })?;
+        if !value.is_finite() {
+            return Err(BracketedRootError::NonFiniteValue { at, value });
+        }
+        Ok(value)
+    };
+
+    let mut lower = lower;
+    let mut upper = upper;
+    let mut lower_value = evaluate(&mut oracle, lower)?;
+    if lower_value.abs() <= config.residual_tolerance {
+        return Ok(BracketedRootSolution {
+            root: lower,
+            value: lower_value,
+            bracket: (lower, upper),
+            iterations: 0,
+            func_evals: 1,
+            method_used: BracketedRootMethod::LowerEndpoint,
+        });
+    }
+    let mut upper_value = evaluate(&mut oracle, upper)?;
+    if upper_value.abs() <= config.residual_tolerance {
+        return Ok(BracketedRootSolution {
+            root: upper,
+            value: upper_value,
+            bracket: (lower, upper),
+            iterations: 0,
+            func_evals: 2,
+            method_used: BracketedRootMethod::UpperEndpoint,
+        });
+    }
+    if lower_value.is_sign_positive() == upper_value.is_sign_positive() {
+        return Err(BracketedRootError::NoSignChange {
+            lower_value,
+            upper_value,
+        });
+    }
+
+    // Illinois interpolation uses adjusted endpoint weights only to choose the
+    // next point. The real residuals above remain the sign certificate.
+    let mut lower_weight = lower_value;
+    let mut upper_weight = upper_value;
+    let mut func_evals = 2usize;
+    for iterations in 1..=config.max_iterations {
+        let denominator = upper_weight - lower_weight;
+        let interpolated = (lower * upper_weight - upper * lower_weight) / denominator;
+        let midpoint = lower + (upper - lower) * 0.5;
+        let at = if interpolated.is_finite() && interpolated > lower && interpolated < upper {
+            interpolated
+        } else {
+            midpoint
+        };
+        let value = evaluate(&mut oracle, at)?;
+        func_evals += 1;
+        if value.abs() <= config.residual_tolerance {
+            return Ok(BracketedRootSolution {
+                root: at,
+                value,
+                bracket: (lower, upper),
+                iterations,
+                func_evals,
+                method_used: BracketedRootMethod::Residual,
+            });
+        }
+
+        if value.is_sign_positive() == lower_value.is_sign_positive() {
+            lower = at;
+            lower_value = value;
+            lower_weight = lower_value;
+            upper_weight *= 0.5;
+        } else {
+            upper = at;
+            upper_value = value;
+            upper_weight = upper_value;
+            lower_weight *= 0.5;
+        }
+
+        let width_tolerance = config.position_tolerance * (1.0 + lower.abs() + upper.abs());
+        if upper - lower <= width_tolerance {
+            let (root, value) = if lower_value.abs() <= upper_value.abs() {
+                (lower, lower_value)
+            } else {
+                (upper, upper_value)
+            };
+            return Ok(BracketedRootSolution {
+                root,
+                value,
+                bracket: (lower, upper),
+                iterations,
+                func_evals,
+                method_used: BracketedRootMethod::BracketWidth,
+            });
+        }
+    }
+
+    Err(BracketedRootError::MaxIterations {
+        lower,
+        upper,
+        lower_value,
+        upper_value,
     })
 }
 
@@ -16280,6 +16569,115 @@ mod added_primitive_tests {
         )
         .unwrap_err();
         assert_eq!(err, RootError::Eval("oracle down"));
+    }
+
+    // --- find_root_bracketed --------------------------------------------
+
+    fn bracketed_cfg() -> BracketedRootConfig {
+        BracketedRootConfig::new(1e-12, 1e-12, 64)
+    }
+
+    #[test]
+    fn bracketed_root_converges_without_derivative_or_monotonicity_contract() {
+        let root = 0.25;
+        let sol = find_root_bracketed(
+            |x| Ok::<_, ()>((x - root) * (1.0 + (x - 0.8).powi(2))),
+            -2.0,
+            3.0,
+            &bracketed_cfg(),
+        )
+        .unwrap();
+        assert!((sol.root - root).abs() < 1e-9, "solution = {sol:?}");
+        assert!(sol.func_evals >= 3);
+        assert!(sol.bracket.0 <= root && root <= sol.bracket.1);
+    }
+
+    #[test]
+    fn bracketed_root_illinois_avoids_false_position_endpoint_stall() {
+        // Ordinary regula falsi barely moves the positive endpoint for this
+        // badly unbalanced bracket. Illinois must still converge promptly.
+        let sol = find_root_bracketed(
+            |x| Ok::<_, ()>(x.powi(10) - 1.0),
+            0.0,
+            2.0,
+            &BracketedRootConfig::new(1e-12, 1e-12, 64),
+        )
+        .unwrap();
+        assert!((sol.root - 1.0).abs() < 1e-9, "solution = {sol:?}");
+        assert!(sol.iterations < 64);
+    }
+
+    #[test]
+    fn bracketed_root_width_is_a_certificate_for_steep_residuals() {
+        let root = std::f64::consts::FRAC_1_PI;
+        let sol = find_root_bracketed(
+            |x| Ok::<_, ()>(f64::MAX.sqrt() * (x - root)),
+            0.0,
+            1.0,
+            &BracketedRootConfig::new(1e-12, 0.0, 64),
+        )
+        .unwrap();
+        assert!((sol.root - root).abs() < 1e-11, "solution = {sol:?}");
+        assert!(matches!(
+            sol.method_used,
+            BracketedRootMethod::BracketWidth | BracketedRootMethod::Residual
+        ));
+    }
+
+    #[test]
+    fn bracketed_root_reports_endpoint_certificate_without_extra_evaluation() {
+        let sol = find_root_bracketed(
+            |x| Ok::<_, ()>(x),
+            0.0,
+            4.0,
+            &bracketed_cfg(),
+        )
+        .unwrap();
+        assert_eq!(sol.root, 0.0);
+        assert_eq!(sol.func_evals, 1);
+        assert_eq!(sol.method_used, BracketedRootMethod::LowerEndpoint);
+    }
+
+    #[test]
+    fn bracketed_root_rejects_same_sign_and_non_finite_oracles() {
+        let same_sign = find_root_bracketed(
+            |x| Ok::<_, ()>(x * x + 1.0),
+            -1.0,
+            1.0,
+            &bracketed_cfg(),
+        )
+        .unwrap_err();
+        assert!(matches!(same_sign, BracketedRootError::NoSignChange { .. }));
+
+        let non_finite = find_root_bracketed(
+            |_x| Ok::<_, ()>(f64::NAN),
+            -1.0,
+            1.0,
+            &bracketed_cfg(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            non_finite,
+            BracketedRootError::NonFiniteValue { .. }
+        ));
+    }
+
+    #[test]
+    fn bracketed_root_surfaces_oracle_errors_with_the_evaluation_point() {
+        let err = find_root_bracketed(
+            |_x| Err::<f64, _>("oracle down"),
+            -1.0,
+            1.0,
+            &bracketed_cfg(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            BracketedRootError::Eval {
+                at: -1.0,
+                source: "oracle down"
+            }
+        );
     }
 
     // --- bidirectional_line_search ---------------------------------------
