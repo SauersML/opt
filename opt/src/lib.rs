@@ -538,7 +538,15 @@ impl TrustRegionPolicy {
         let noise_floor = objective_scale.abs().max(1.0) * self.noise_floor_rel;
         let predicted_finite_positive =
             predicted_reduction.is_finite() && predicted_reduction > noise_floor;
-        let within_noise_floor = actual_reduction.abs() <= noise_floor;
+        // `noise_floor_rel = 0.0` is documented to disable this guard
+        // entirely, but `|actual| <= 0.0` is TRUE at exactly zero, so a
+        // step that changed the objective by precisely nothing was being
+        // promoted to a numerically-neutral ACCEPT with `rho = 1.0`. That
+        // is the opposite of what a zero floor is asked for, and it is
+        // reachable: a plateau, a saturated barrier, or any objective that
+        // returns a constant over a region all produce an exactly-zero
+        // reduction. Require a positive floor before the guard can fire.
+        let within_noise_floor = noise_floor > 0.0 && actual_reduction.abs() <= noise_floor;
         let (rho, predicted_nonpositive) = if within_noise_floor {
             // Realized change is at the round-off floor: the step neither
             // helped nor hurt beyond noise, so treat it as a numerically
@@ -6146,14 +6154,46 @@ impl NewtonTrustRegionCore {
                 }
             };
             let act_dec = f_k - f_trial;
-            let rho = act_dec / pred_dec;
-            if rho > 0.75 && s_norm > 0.99 * trust_radius {
-                trust_radius = (trust_radius * 2.0).min(self.trust_radius_max.max(1.0));
-            } else if rho < 0.25 {
-                trust_radius = (trust_radius * 0.5).max(degenerate_trust_radius(&x_k));
-            }
-
-            let accepted = rho > self.eta_accept;
+            // Radius control goes through `TrustRegionPolicy` rather than
+            // being re-derived here. This crate ships that policy as a
+            // documented, separately tested primitive, and the loop used to
+            // hand-roll it inline with five bare literals (0.75 / 0.25 /
+            // 2.0 / 0.5 / 0.99) that no test could reach independently and
+            // that had drifted out of agreement with the matrix-free
+            // solver's copy. One implementation, one place to change it,
+            // and the `RejectFloor` decision arrives for free instead of
+            // being detected separately.
+            //
+            // The constants are this loop's own, stated explicitly rather
+            // than inherited from `classic`/`noise_aware`: routing the
+            // MECHANISM through the shared policy must not silently change
+            // the POLICY. `noise_aware` would additionally enable a
+            // round-off neutral-step guard and a rejection step cap that
+            // this solver has never had; both look like improvements and
+            // neither is landing without a measured A/B.
+            let policy = TrustRegionPolicy {
+                eta_accept: self.eta_accept,
+                eta_shrink: 0.25,
+                eta_expand: 0.75,
+                shrink_factor: 0.5,
+                expand_factor: 2.0,
+                min_radius: degenerate_trust_radius(&x_k),
+                max_radius: self.trust_radius_max.max(1.0),
+                noise_floor_rel: 0.0,
+                rejection_step_cap_fraction: None,
+            };
+            let hit_boundary = s_norm > 0.99 * trust_radius;
+            let step = policy.update(
+                trust_radius,
+                s_norm,
+                hit_boundary,
+                act_dec,
+                pred_dec,
+                f_k,
+            );
+            trust_radius = step.new_radius;
+            let rho = step.rho;
+            let accepted = step.accepted;
             if let Some(obs) = self.observer.as_mut() {
                 let info = StepInfo {
                     iter: k,
@@ -18169,5 +18209,46 @@ mod termination_provenance_tests {
         );
         // The gradient is still readable — it just carries no verdict.
         assert!(report.solution.termination.grad_norm().is_some());
+    }
+}
+
+#[cfg(test)]
+mod trust_region_policy_noise_floor_tests {
+    use super::*;
+
+    /// `noise_floor_rel = 0.0` is documented to disable the neutral-step
+    /// guard entirely. It has to hold at EXACTLY zero reduction, which is
+    /// the only place a zero floor and a positive one can disagree — and
+    /// exactly-zero is reachable, not exotic: a plateau, a saturated
+    /// barrier, or any objective constant over a region produces it.
+    ///
+    /// Before this was pinned, a step that changed the objective by
+    /// precisely nothing was promoted to `rho = 1.0` and ACCEPTED, so a
+    /// trust region on a flat patch walked instead of shrinking.
+    #[test]
+    fn a_zero_noise_floor_does_not_accept_an_exactly_neutral_step() {
+        let policy = TrustRegionPolicy::classic(10.0);
+        assert_eq!(policy.noise_floor_rel, 0.0);
+        let step = policy.update(1.0, 1.0, false, 0.0, 1.0, 1.0);
+        assert!(
+            !step.within_noise_floor,
+            "a zero floor must disable the guard, not fire at exactly zero"
+        );
+        assert_eq!(step.rho, 0.0, "rho is the honest 0/1, not a neutral 1.0");
+        assert!(!step.accepted, "no reduction is not an acceptable step");
+        assert!(step.new_radius < 1.0, "and the region must shrink");
+    }
+
+    /// The guard still does its job when a floor is actually configured:
+    /// a reduction below the floor is round-off, not information, and
+    /// dividing two round-off-scale quantities to form `rho` is what the
+    /// guard exists to avoid.
+    #[test]
+    fn a_positive_noise_floor_still_neutralizes_a_round_off_step() {
+        let policy = TrustRegionPolicy::noise_aware(1.0e-12, 10.0, 1.0e-14);
+        let step = policy.update(1.0, 1.0, false, 1.0e-16, 1.0e-15, 1.0);
+        assert!(step.within_noise_floor);
+        assert_eq!(step.rho, 1.0);
+        assert!(step.accepted);
     }
 }
