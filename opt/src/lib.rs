@@ -125,6 +125,28 @@ pub fn armijo_roundoff_cushion(current_value: f64) -> f64 {
     constants::ARMIJO_ROUNDOFF_EPS_MULTIPLE * f64::EPSILON * (1.0 + current_value.abs())
 }
 
+/// The trust radius below which a trust region contains no point
+/// distinguishable from its centre.
+///
+/// `‖s‖ ≤ ε·(1 + ‖x‖∞)` implies every component of `x + s` rounds back
+/// to `x` in `f64`, so a region this small can only ever propose the
+/// current iterate. Shrinking past it cannot change the trial, and
+/// every further iteration re-evaluates the objective for a step that
+/// provably cannot move — which is how a rejecting trust-region loop
+/// used to burn its whole iteration budget.
+///
+/// This is a *derived* floor, not a tuned constant: it is the exact
+/// representability limit at the current iterate, so it adapts to the
+/// scale of `x` instead of being wrong in both directions the way a
+/// fixed `1e-12` is (far too coarse near the origin, far too fine at
+/// `‖x‖ ~ 1e6`).
+#[inline]
+#[must_use]
+pub fn degenerate_trust_radius(x: &Array1<f64>) -> f64 {
+    let x_inf = x.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    f64::EPSILON * (1.0 + x_inf)
+}
+
 /// A trial accepted by [`backtracking_line_search`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AcceptedStep<P> {
@@ -3459,6 +3481,431 @@ impl CostStallState {
     }
 }
 
+// =====================================================================
+// Termination provenance
+// =====================================================================
+
+/// Which vector norm a stationarity test measured in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StationarityNorm {
+    /// Euclidean norm of the (bound-projected) gradient.
+    L2,
+    /// Maximum-absolute-component norm of the (bound-projected) gradient.
+    LInf,
+}
+
+/// Whether a stationarity threshold was absolute or rescaled by the iterate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StationarityScaling {
+    /// The threshold is the resolved tolerance as-is.
+    Absolute,
+    /// The threshold was multiplied by `1 + ‖x‖∞`, so it grows with the
+    /// iterate and is **weaker than the absolute test** wherever the
+    /// iterate is large.
+    RelativeToIterate,
+}
+
+/// The quantity a stationarity claim was decided against, carried
+/// alongside the claim.
+///
+/// A verdict emitted without the quantity it was decided against is
+/// unfalsifiable from the run record: two solvers can both report
+/// "converged" while having applied thresholds orders of magnitude
+/// apart, and nothing downstream can tell them apart. Every
+/// [`TerminationReason`] that asserts first-order stationarity carries
+/// this so a consumer can reproduce the comparison exactly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StationarityEvidence {
+    /// The gradient norm the solver measured at the returned point.
+    pub measured: f64,
+    /// The threshold it was compared against.
+    pub threshold: f64,
+    /// Which norm `measured` and `threshold` are expressed in.
+    pub norm: StationarityNorm,
+    /// Whether `threshold` was rescaled by the iterate.
+    pub scaling: StationarityScaling,
+}
+
+impl StationarityEvidence {
+    /// `measured / threshold`. Values above `1` mean the test was
+    /// satisfied only because the threshold was loosened (relative
+    /// scaling), or that the stop was not a stationarity stop at all.
+    #[must_use]
+    pub fn ratio(&self) -> f64 {
+        self.measured / self.threshold
+    }
+}
+
+/// Why a solver stopped, and the quantities that decided it.
+///
+/// Every `opt` solver reaches its return through exactly one of these
+/// tests. Before this type existed the choice was discarded at the
+/// return statement: forty-two distinct stop decisions across the five
+/// solvers collapsed into three observable outcomes (`Ok`,
+/// `MaxIterationsReached`, `LineSearchFailed`), and every consumer
+/// re-derived the reason from the error variant, from the rendered
+/// message text, or from whichever solver branch it happened to call.
+/// Those re-derivations disagreed with each other and with the solver.
+///
+/// The reason is therefore a **required** field of [`Solution`], not an
+/// `Option` on a side channel: an absent reason and a reason that
+/// happens to be uninteresting must not render identically, and a stop
+/// site that forgets to name its test must not compile.
+///
+/// # Not every "converged" is the same claim
+///
+/// [`GradientTolerance`](Self::GradientTolerance) and
+/// [`RelativeStationarityWindow`](Self::RelativeStationarityWindow) both
+/// return successfully, but the second applies a threshold scaled by
+/// `1 + ‖x‖∞` and measured in `L∞` — at a large iterate it can be
+/// orders of magnitude weaker. Consumers that certify optimality must
+/// read [`stationarity_evidence`](Self::stationarity_evidence) rather
+/// than treating every success alike.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum TerminationReason {
+    /// The bound-projected gradient norm fell below the resolved
+    /// gradient tolerance. The strongest claim any solver here makes.
+    GradientTolerance { grad_norm: f64, threshold: f64 },
+    /// The step became negligible, the objective flat across it, and
+    /// the projected gradient below tolerance — all three together.
+    SmallStepFlatObjective {
+        step_norm: f64,
+        objective_change: f64,
+        grad_norm: f64,
+        threshold: f64,
+    },
+    /// An `L∞` stationarity test, with the threshold rescaled by
+    /// `1 + ‖x‖∞`, held for `window` consecutive iterations. **Weaker
+    /// than [`GradientTolerance`](Self::GradientTolerance)** by the
+    /// scaling factor and by the norm change; see
+    /// [`StationarityScaling::RelativeToIterate`].
+    RelativeStationarityWindow {
+        grad_inf: f64,
+        threshold: f64,
+        window: usize,
+    },
+    /// The objective flatlined over the cost-stall window and the
+    /// projected gradient at the best iterate cleared its tolerance:
+    /// a genuine stationary optimum on a flat valley.
+    CostStallStationary {
+        grad_norm: f64,
+        threshold: f64,
+        window: usize,
+    },
+    /// The objective flatlined over the cost-stall window but the
+    /// projected gradient did **not** clear tolerance. Halting is
+    /// correct — no further cost progress is available — but the point
+    /// is not stationary. Not a success.
+    CostStallFloor {
+        grad_norm: f64,
+        threshold: f64,
+        window: usize,
+    },
+    /// The model's predicted decrease fell below the objective's
+    /// round-off noise floor, so the acceptance ratio carries no
+    /// curvature information. Stationary in the finite-precision sense.
+    ModelNoiseFloor {
+        predicted_decrease: f64,
+        noise_floor: f64,
+        grad_norm: f64,
+    },
+    /// The trust radius (or cubic regularization) reached its floor
+    /// with `consecutive_rejections` steps rejected in a row: the
+    /// region cannot shrink further and no step is acceptable. Further
+    /// iterations would re-evaluate the objective without any prospect
+    /// of progress, so the loop stops here rather than grinding out its
+    /// iteration budget.
+    TrustRegionRejectFloor {
+        radius: f64,
+        floor: f64,
+        consecutive_rejections: usize,
+        grad_norm: f64,
+    },
+    /// A fixed-point iteration's accepted step norm fell below
+    /// tolerance.
+    StepNormTolerance { step_norm: f64, threshold: f64 },
+    /// A fixed-point objective returned [`FixedPointStatus::Stop`].
+    /// The objective, not the solver, decided to stop; the solver makes
+    /// no stationarity claim of its own.
+    FixedPointRequestedStop { step_norm: f64 },
+    /// The iteration budget was exhausted with no test satisfied. The
+    /// returned point is the best seen.
+    IterationBudget {
+        iterations: usize,
+        grad_norm: f64,
+        threshold: f64,
+    },
+    /// The line search could not produce an acceptable point.
+    LineSearchFailed { grad_norm: f64 },
+    /// The objective returned a fatal evaluation error.
+    ObjectiveFailed,
+    /// Numerical instability: non-finite gradient or objective, a model
+    /// Hessian that could not be made positive definite, a subproblem
+    /// solver that produced no usable step.
+    NumericalFailure,
+}
+
+impl TerminationReason {
+    /// The quantity this stop was decided against, when it asserts
+    /// first-order stationarity at all.
+    ///
+    /// `None` for stops that make no stationarity claim
+    /// ([`IterationBudget`](Self::IterationBudget),
+    /// [`ObjectiveFailed`](Self::ObjectiveFailed), …). For those the
+    /// gradient norm, where known, is still readable via
+    /// [`grad_norm`](Self::grad_norm) — but it was not compared against
+    /// anything, and reporting it as though it had been is the defect
+    /// this distinction exists to prevent.
+    #[must_use]
+    pub fn stationarity_evidence(&self) -> Option<StationarityEvidence> {
+        let ev = |measured: f64, threshold: f64, norm, scaling| {
+            Some(StationarityEvidence {
+                measured,
+                threshold,
+                norm,
+                scaling,
+            })
+        };
+        match *self {
+            Self::GradientTolerance {
+                grad_norm,
+                threshold,
+            } => ev(
+                grad_norm,
+                threshold,
+                StationarityNorm::L2,
+                StationarityScaling::Absolute,
+            ),
+            Self::SmallStepFlatObjective {
+                grad_norm,
+                threshold,
+                ..
+            } => ev(
+                grad_norm,
+                threshold,
+                StationarityNorm::L2,
+                StationarityScaling::Absolute,
+            ),
+            Self::RelativeStationarityWindow {
+                grad_inf,
+                threshold,
+                ..
+            } => ev(
+                grad_inf,
+                threshold,
+                StationarityNorm::LInf,
+                StationarityScaling::RelativeToIterate,
+            ),
+            Self::CostStallStationary {
+                grad_norm,
+                threshold,
+                ..
+            }
+            | Self::CostStallFloor {
+                grad_norm,
+                threshold,
+                ..
+            } => ev(
+                grad_norm,
+                threshold,
+                StationarityNorm::L2,
+                StationarityScaling::Absolute,
+            ),
+            Self::StepNormTolerance {
+                step_norm,
+                threshold,
+            } => ev(
+                step_norm,
+                threshold,
+                StationarityNorm::L2,
+                StationarityScaling::Absolute,
+            ),
+            // A noise-floor stop is a statement about the MODEL's
+            // resolution, not about the gradient: the gradient was never
+            // compared to a threshold, so there is no evidence to report.
+            Self::ModelNoiseFloor { .. }
+            | Self::TrustRegionRejectFloor { .. }
+            | Self::FixedPointRequestedStop { .. }
+            | Self::IterationBudget { .. }
+            | Self::LineSearchFailed { .. }
+            | Self::ObjectiveFailed
+            | Self::NumericalFailure => None,
+        }
+    }
+
+    /// The gradient norm at the returned point, where the stop site knew
+    /// one. Unlike [`stationarity_evidence`](Self::stationarity_evidence)
+    /// this makes no claim that the value was compared against anything.
+    #[must_use]
+    pub fn grad_norm(&self) -> Option<f64> {
+        match *self {
+            Self::GradientTolerance { grad_norm, .. }
+            | Self::SmallStepFlatObjective { grad_norm, .. }
+            | Self::CostStallStationary { grad_norm, .. }
+            | Self::CostStallFloor { grad_norm, .. }
+            | Self::ModelNoiseFloor { grad_norm, .. }
+            | Self::TrustRegionRejectFloor { grad_norm, .. }
+            | Self::IterationBudget { grad_norm, .. }
+            | Self::LineSearchFailed { grad_norm } => Some(grad_norm),
+            Self::RelativeStationarityWindow { grad_inf, .. } => Some(grad_inf),
+            Self::StepNormTolerance { .. }
+            | Self::FixedPointRequestedStop { .. }
+            | Self::ObjectiveFailed
+            | Self::NumericalFailure => None,
+        }
+    }
+
+    /// `true` when the solver asserts the returned point is stationary.
+    ///
+    /// Note this is a claim about the *test that fired*, not about its
+    /// strength: [`RelativeStationarityWindow`](Self::RelativeStationarityWindow)
+    /// answers `true` while applying a threshold that can be orders of
+    /// magnitude looser than the absolute one. Read
+    /// [`stationarity_evidence`](Self::stationarity_evidence) to judge
+    /// the strength.
+    #[must_use]
+    pub fn is_stationary_claim(&self) -> bool {
+        matches!(
+            self,
+            Self::GradientTolerance { .. }
+                | Self::SmallStepFlatObjective { .. }
+                | Self::RelativeStationarityWindow { .. }
+                | Self::CostStallStationary { .. }
+                | Self::ModelNoiseFloor { .. }
+                | Self::StepNormTolerance { .. }
+        )
+    }
+
+    /// The [`OptimizationStatus`] this reason maps to.
+    ///
+    /// `OptimizationStatus` is derived from the reason rather than being
+    /// set independently, so the coarse classification can never
+    /// disagree with the test that actually fired.
+    #[must_use]
+    pub fn status(&self) -> OptimizationStatus {
+        match self {
+            Self::GradientTolerance { .. }
+            | Self::SmallStepFlatObjective { .. }
+            | Self::RelativeStationarityWindow { .. }
+            | Self::StepNormTolerance { .. }
+            | Self::FixedPointRequestedStop { .. } => OptimizationStatus::Converged,
+            Self::ModelNoiseFloor { .. } => OptimizationStatus::NumericallyConverged,
+            Self::CostStallStationary { .. } => OptimizationStatus::CostStallConverged,
+            Self::CostStallFloor { .. } => OptimizationStatus::CostStallFloor,
+            Self::TrustRegionRejectFloor { .. } => OptimizationStatus::TrustRegionRejectFloor,
+            Self::IterationBudget { .. } => OptimizationStatus::MaxIterations,
+            Self::LineSearchFailed { .. } => OptimizationStatus::LineSearchFailed,
+            Self::ObjectiveFailed => OptimizationStatus::ObjectiveFailed,
+            Self::NumericalFailure => OptimizationStatus::NumericalFailure,
+        }
+    }
+
+    /// `true` when the run terminated at a point the solver is willing
+    /// to certify. Equivalent to `self.status().is_success()`.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.status().is_success()
+    }
+
+    /// A short stable identifier, suitable for logs and structured
+    /// records.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::GradientTolerance { .. } => "gradient_tolerance",
+            Self::SmallStepFlatObjective { .. } => "small_step_flat_objective",
+            Self::RelativeStationarityWindow { .. } => "relative_stationarity_window",
+            Self::CostStallStationary { .. } => "cost_stall_stationary",
+            Self::CostStallFloor { .. } => "cost_stall_floor",
+            Self::ModelNoiseFloor { .. } => "model_noise_floor",
+            Self::TrustRegionRejectFloor { .. } => "trust_region_reject_floor",
+            Self::StepNormTolerance { .. } => "step_norm_tolerance",
+            Self::FixedPointRequestedStop { .. } => "fixed_point_requested_stop",
+            Self::IterationBudget { .. } => "iteration_budget",
+            Self::LineSearchFailed { .. } => "line_search_failed",
+            Self::ObjectiveFailed => "objective_failed",
+            Self::NumericalFailure => "numerical_failure",
+        }
+    }
+}
+
+impl std::fmt::Display for TerminationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label())?;
+        match *self {
+            Self::RelativeStationarityWindow {
+                grad_inf,
+                threshold,
+                window,
+            } => write!(
+                f,
+                "(|g|inf={grad_inf:.6e} <= {threshold:.6e} [relative to iterate] for {window} iters)"
+            ),
+            Self::CostStallStationary {
+                grad_norm,
+                threshold,
+                window,
+            }
+            | Self::CostStallFloor {
+                grad_norm,
+                threshold,
+                window,
+            } => write!(
+                f,
+                "(|g|={grad_norm:.6e} vs {threshold:.6e} over window {window})"
+            ),
+            Self::SmallStepFlatObjective {
+                step_norm,
+                objective_change,
+                grad_norm,
+                threshold,
+            } => write!(
+                f,
+                "(|s|={step_norm:.6e}, df={objective_change:.6e}, |g|={grad_norm:.6e} < {threshold:.6e})"
+            ),
+            Self::ModelNoiseFloor {
+                predicted_decrease,
+                noise_floor,
+                ..
+            } => write!(
+                f,
+                "(pred={predicted_decrease:.6e} <= noise floor {noise_floor:.6e})"
+            ),
+            Self::TrustRegionRejectFloor {
+                radius,
+                floor,
+                consecutive_rejections,
+                ..
+            } => write!(
+                f,
+                "(radius={radius:.6e} at floor {floor:.6e} after {consecutive_rejections} consecutive rejections)"
+            ),
+            Self::IterationBudget {
+                iterations,
+                grad_norm,
+                threshold,
+            } => write!(
+                f,
+                "({iterations} iterations; |g|={grad_norm:.6e} never reached {threshold:.6e})"
+            ),
+            Self::StepNormTolerance {
+                step_norm,
+                threshold,
+            } => write!(f, "(|step|={step_norm:.6e} <= {threshold:.6e})"),
+            Self::FixedPointRequestedStop { step_norm } => {
+                write!(f, "(objective requested stop at |step|={step_norm:.6e})")
+            }
+            Self::LineSearchFailed { grad_norm } => write!(f, "(|g|={grad_norm:.6e})"),
+            Self::GradientTolerance {
+                grad_norm,
+                threshold,
+            } => write!(f, "(|g|={grad_norm:.6e} < {threshold:.6e})"),
+            Self::ObjectiveFailed | Self::NumericalFailure => Ok(()),
+        }
+    }
+}
+
 /// A summary of a successful solver run.
 ///
 /// Note that for non-convex functions, convergence to a local minimum is not guaranteed.
@@ -3486,13 +3933,16 @@ pub struct Solution {
     pub grad_evals: usize,
     /// The total number of times a Hessian was supplied directly by the objective.
     pub hess_evals: usize,
-    /// Optional status hint set by solvers that have a finer-grained
-    /// success classification than the default `Result<Solution, _>`
-    /// distinction. Currently used by `Arc` and `MatrixFreeTrustRegion`
-    /// to flag `OptimizationStatus::NumericallyConverged` (the cost-ratio
-    /// test fell below the cost's ULP noise floor). `None` means
-    /// "use the default mapping from the outcome variant".
-    pub status_hint: Option<OptimizationStatus>,
+    /// Which test stopped the solver, and the quantities that decided
+    /// it.
+    ///
+    /// Required, not optional: an absent reason and an uninteresting
+    /// reason must not render identically, and a stop site that forgets
+    /// to name its test must fail to compile. The coarse
+    /// [`OptimizationStatus`] is derived from this via
+    /// [`TerminationReason::status`] rather than tracked separately, so
+    /// the two can never disagree.
+    pub termination: TerminationReason,
 }
 
 impl Solution {
@@ -3506,6 +3956,7 @@ impl Solution {
         func_evals: usize,
         grad_evals: usize,
         hess_evals: usize,
+        termination: TerminationReason,
     ) -> Self {
         Self {
             final_point,
@@ -3514,40 +3965,17 @@ impl Solution {
             final_hessian,
             final_gradient_norm: Some(final_gradient_norm),
             final_step_norm: None,
-            stationarity_kind: StationarityKind::ProjectedGradient,
+            stationarity_kind: match termination {
+                TerminationReason::CostStallStationary { .. }
+                | TerminationReason::CostStallFloor { .. } => StationarityKind::CostStall,
+                _ => StationarityKind::ProjectedGradient,
+            },
             iterations,
             func_evals,
             grad_evals,
             hess_evals,
-            status_hint: None,
+            termination,
         }
-    }
-
-    fn gradient_based_with_status(
-        final_point: Array1<f64>,
-        final_value: f64,
-        final_gradient: Array1<f64>,
-        final_gradient_norm: f64,
-        final_hessian: Option<Array2<f64>>,
-        iterations: usize,
-        func_evals: usize,
-        grad_evals: usize,
-        hess_evals: usize,
-        status: OptimizationStatus,
-    ) -> Self {
-        let mut s = Self::gradient_based(
-            final_point,
-            final_value,
-            final_gradient,
-            final_gradient_norm,
-            final_hessian,
-            iterations,
-            func_evals,
-            grad_evals,
-            hess_evals,
-        );
-        s.status_hint = Some(status);
-        s
     }
 
     fn fixed_point(
@@ -3556,6 +3984,7 @@ impl Solution {
         final_step_norm: f64,
         iterations: usize,
         func_evals: usize,
+        termination: TerminationReason,
     ) -> Self {
         Self {
             final_point,
@@ -3569,8 +3998,15 @@ impl Solution {
             func_evals,
             grad_evals: 0,
             hess_evals: 0,
-            status_hint: None,
+            termination,
         }
+    }
+
+    /// The coarse outcome category, derived from
+    /// [`termination`](Self::termination).
+    #[must_use]
+    pub fn status(&self) -> OptimizationStatus {
+        self.termination.status()
     }
 }
 
@@ -3699,7 +4135,7 @@ pub struct OptimizationReport {
 /// where the solver gave up before producing a real best-seen point.
 /// All counters are zero; `final_point` is the seed `x0` so callers
 /// have something usable to retry from.
-fn placeholder_solution(x0: &Array1<f64>) -> Solution {
+fn placeholder_solution(x0: &Array1<f64>, termination: TerminationReason) -> Solution {
     Solution {
         final_point: x0.clone(),
         final_value: f64::NAN,
@@ -3708,11 +4144,11 @@ fn placeholder_solution(x0: &Array1<f64>) -> Solution {
         final_gradient_norm: None,
         final_step_norm: None,
         stationarity_kind: StationarityKind::ProjectedGradient,
+        termination,
         iterations: 0,
         func_evals: 0,
         grad_evals: 0,
         hess_evals: 0,
-        status_hint: None,
     }
 }
 
@@ -3725,151 +4161,282 @@ fn diagnostics_from_solution(sol: &Solution) -> OptimizationDiagnostics {
     }
 }
 
-fn bfgs_outcome_into_report(
-    x0: &Array1<f64>,
-    outcome: Result<Solution, BfgsError>,
-) -> OptimizationReport {
-    match outcome {
-        Ok(solution) => {
-            let diagnostics = diagnostics_from_solution(&solution);
-            let status = solution
-                .status_hint
-                .unwrap_or(OptimizationStatus::Converged);
-            OptimizationReport {
-                solution,
-                status,
-                diagnostics,
-            }
-        }
-        Err(BfgsError::MaxIterationsReached { last_solution }) => {
-            let solution = *last_solution;
-            let diagnostics = diagnostics_from_solution(&solution);
-            OptimizationReport {
-                solution,
-                status: OptimizationStatus::MaxIterations,
-                diagnostics,
-            }
-        }
-        Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
-            let solution = *last_solution;
-            let diagnostics = diagnostics_from_solution(&solution);
-            OptimizationReport {
-                solution,
-                status: OptimizationStatus::LineSearchFailed,
-                diagnostics,
-            }
-        }
-        Err(BfgsError::ObjectiveFailed { .. }) => OptimizationReport {
-            solution: placeholder_solution(x0),
-            status: OptimizationStatus::ObjectiveFailed,
-            diagnostics: OptimizationDiagnostics::default(),
-        },
-        Err(_) => OptimizationReport {
-            solution: placeholder_solution(x0),
-            status: OptimizationStatus::NumericalFailure,
-            diagnostics: OptimizationDiagnostics::default(),
-        },
+/// Wrap a terminal `Solution` in a report.
+///
+/// The status is **read from the solution's own
+/// [`TerminationReason`]**, never re-derived from the error variant the
+/// solver happened to return. The solver already decided why it
+/// stopped; a second classification at this boundary could only agree
+/// by luck, and historically did not — the same stop reached through
+/// `Ok(_)` and through an `Err(_)` carrying a best-seen point used to
+/// be labelled differently.
+fn report_from_solution(solution: Solution) -> OptimizationReport {
+    let diagnostics = diagnostics_from_solution(&solution);
+    let status = solution.termination.status();
+    OptimizationReport {
+        solution,
+        status,
+        diagnostics,
     }
 }
 
-fn newton_outcome_into_report(
+/// A solver error that can surrender the best point it saw.
+///
+/// Every solver's error enum carries either a `last_solution` (whose
+/// `termination` the solver already set) or nothing at all, in which
+/// case the reason is recoverable from the variant itself. Centralizing
+/// the mapping keeps `run_report` identical across solvers.
+trait TerminalOutcome: Sized {
+    fn into_terminal_solution(self, x0: &Array1<f64>) -> Solution;
+}
+
+fn outcome_into_report<E: TerminalOutcome>(
     x0: &Array1<f64>,
-    outcome: Result<Solution, NewtonTrustRegionError>,
+    outcome: Result<Solution, E>,
 ) -> OptimizationReport {
-    match outcome {
-        Ok(solution) => {
-            let diagnostics = diagnostics_from_solution(&solution);
-            let status = solution
-                .status_hint
-                .unwrap_or(OptimizationStatus::Converged);
-            OptimizationReport {
-                solution,
-                status,
-                diagnostics,
+    report_from_solution(match outcome {
+        Ok(solution) => solution,
+        Err(err) => err.into_terminal_solution(x0),
+    })
+}
+
+impl TerminalOutcome for BfgsError {
+    fn into_terminal_solution(self, x0: &Array1<f64>) -> Solution {
+        match self {
+            BfgsError::MaxIterationsReached { last_solution }
+            | BfgsError::LineSearchFailed { last_solution, .. } => *last_solution,
+            BfgsError::ObjectiveFailed { .. } => {
+                placeholder_solution(x0, TerminationReason::ObjectiveFailed)
             }
+            _ => placeholder_solution(x0, TerminationReason::NumericalFailure),
         }
-        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
-            let solution = *last_solution;
-            let diagnostics = diagnostics_from_solution(&solution);
-            OptimizationReport {
-                solution,
-                status: OptimizationStatus::MaxIterations,
-                diagnostics,
-            }
-        }
-        Err(NewtonTrustRegionError::ObjectiveFailed { .. }) => OptimizationReport {
-            solution: placeholder_solution(x0),
-            status: OptimizationStatus::ObjectiveFailed,
-            diagnostics: OptimizationDiagnostics::default(),
-        },
-        Err(_) => OptimizationReport {
-            solution: placeholder_solution(x0),
-            status: OptimizationStatus::NumericalFailure,
-            diagnostics: OptimizationDiagnostics::default(),
-        },
     }
 }
 
-fn arc_outcome_into_report(
-    x0: &Array1<f64>,
-    outcome: Result<Solution, ArcError>,
-) -> OptimizationReport {
-    match outcome {
-        Ok(solution) => {
-            let diagnostics = diagnostics_from_solution(&solution);
-            // Honor any solver-set status hint (e.g.
-            // `NumericallyConverged` from the rho-noise-floor guard);
-            // otherwise the `Ok(_)` outcome maps to `Converged`.
-            let status = solution
-                .status_hint
-                .unwrap_or(OptimizationStatus::Converged);
-            OptimizationReport {
-                solution,
-                status,
-                diagnostics,
+impl TerminalOutcome for NewtonTrustRegionError {
+    fn into_terminal_solution(self, x0: &Array1<f64>) -> Solution {
+        match self {
+            NewtonTrustRegionError::MaxIterationsReached { last_solution }
+            | NewtonTrustRegionError::TrustRegionRejectFloor { last_solution } => *last_solution,
+            NewtonTrustRegionError::ObjectiveFailed { .. } => {
+                placeholder_solution(x0, TerminationReason::ObjectiveFailed)
             }
+            _ => placeholder_solution(x0, TerminationReason::NumericalFailure),
         }
-        Err(ArcError::MaxIterationsReached { last_solution }) => {
-            let solution = *last_solution;
-            let diagnostics = diagnostics_from_solution(&solution);
-            OptimizationReport {
-                solution,
-                status: OptimizationStatus::MaxIterations,
-                diagnostics,
-            }
-        }
-        Err(ArcError::ObjectiveFailed { .. }) => OptimizationReport {
-            solution: placeholder_solution(x0),
-            status: OptimizationStatus::ObjectiveFailed,
-            diagnostics: OptimizationDiagnostics::default(),
-        },
-        Err(_) => OptimizationReport {
-            solution: placeholder_solution(x0),
-            status: OptimizationStatus::NumericalFailure,
-            diagnostics: OptimizationDiagnostics::default(),
-        },
     }
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum ObjectiveEvalError {
-    #[error("recoverable objective evaluation failure: {message}")]
-    Recoverable { message: String },
-    #[error("fatal objective evaluation failure: {message}")]
-    Fatal { message: String },
+impl TerminalOutcome for ArcError {
+    fn into_terminal_solution(self, x0: &Array1<f64>) -> Solution {
+        match self {
+            ArcError::MaxIterationsReached { last_solution }
+            | ArcError::TrustRegionRejectFloor { last_solution } => *last_solution,
+            ArcError::ObjectiveFailed { .. } => {
+                placeholder_solution(x0, TerminationReason::ObjectiveFailed)
+            }
+            _ => placeholder_solution(x0, TerminationReason::NumericalFailure),
+        }
+    }
+}
+
+impl TerminalOutcome for MatrixFreeTrustRegionError {
+    fn into_terminal_solution(self, x0: &Array1<f64>) -> Solution {
+        match self {
+            MatrixFreeTrustRegionError::MaxIterationsReached { last_solution }
+            | MatrixFreeTrustRegionError::TrustRegionRejectFloor { last_solution } => {
+                *last_solution
+            }
+            MatrixFreeTrustRegionError::ObjectiveFailed { .. } => {
+                placeholder_solution(x0, TerminationReason::ObjectiveFailed)
+            }
+            _ => placeholder_solution(x0, TerminationReason::NumericalFailure),
+        }
+    }
+}
+
+impl TerminalOutcome for FixedPointError {
+    fn into_terminal_solution(self, x0: &Array1<f64>) -> Solution {
+        match self {
+            FixedPointError::MaxIterationsReached { last_solution } => *last_solution,
+            FixedPointError::ObjectiveFailed { .. } => {
+                placeholder_solution(x0, TerminationReason::ObjectiveFailed)
+            }
+            _ => placeholder_solution(x0, TerminationReason::NumericalFailure),
+        }
+    }
+}
+
+/// Whether a failed objective evaluation invalidates the whole run or
+/// only the point it was evaluated at.
+///
+/// This is a property of the *failure*, decided by the producer that
+/// knows what went wrong. It is not recoverable from the rendered
+/// message, and a consumer that tries to guess it from text is
+/// guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectiveEvalKind {
+    /// This point is unusable; the solver should treat the trial as
+    /// infeasible, back off, and continue.
+    Recoverable,
+    /// The run cannot continue.
+    Fatal,
+}
+
+/// A failed objective evaluation, classified by the producer.
+///
+/// # Why this carries a typed source
+///
+/// The classification must be made once, by the code that knows what
+/// failed, and then travel unchanged. Before this type carried a
+/// source, the boundary was lossy: a caller with a rich typed error in
+/// hand had to render it to a `String` to cross into `opt`, and any
+/// layer that later needed to re-classify the same failure had nothing
+/// left to consult but the prose. In gam that produced a real defect —
+/// one error variant was classified recoverable at the site that could
+/// still see its type and fatal at the site that could only see its
+/// text, so a trial the optimizer was equipped to survive aborted the
+/// entire fit (gam#2553). The verdict was carried in prose, and prose
+/// is one `format!` away from silently changing meaning.
+///
+/// [`recoverable_from`](Self::recoverable_from) and
+/// [`fatal_from`](Self::fatal_from) attach the originating error so
+/// downstream code can [`downcast_ref`](Self::downcast_ref) back to it
+/// instead of re-deriving a classification that was already made.
+#[derive(Debug, Clone)]
+pub struct ObjectiveEvalError {
+    kind: ObjectiveEvalKind,
+    message: String,
+    source: Option<StdArc<dyn std::error::Error + Send + Sync + 'static>>,
+}
+
+impl std::fmt::Display for ObjectiveEvalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self.kind {
+            ObjectiveEvalKind::Recoverable => "recoverable",
+            ObjectiveEvalKind::Fatal => "fatal",
+        };
+        write!(f, "{label} objective evaluation failure: {}", self.message)
+    }
+}
+
+impl std::error::Error for ObjectiveEvalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|e| e.as_ref() as &(dyn std::error::Error + 'static))
+    }
 }
 
 impl ObjectiveEvalError {
+    /// A recoverable failure described only by a message.
     pub fn recoverable(message: impl Into<String>) -> Self {
-        Self::Recoverable {
+        Self {
+            kind: ObjectiveEvalKind::Recoverable,
             message: message.into(),
+            source: None,
         }
     }
 
+    /// A fatal failure described only by a message.
     pub fn fatal(message: impl Into<String>) -> Self {
-        Self::Fatal {
+        Self {
+            kind: ObjectiveEvalKind::Fatal,
             message: message.into(),
+            source: None,
         }
+    }
+
+    /// A failure of the given kind carrying the originating typed error.
+    ///
+    /// The message is the source's `Display`; the source itself stays
+    /// reachable via [`source_ref`](Self::source_ref) /
+    /// [`downcast_ref`](Self::downcast_ref) so no later layer has to
+    /// reconstruct the classification from text.
+    pub fn from_source<E>(kind: ObjectiveEvalKind, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self {
+            kind,
+            message: source.to_string(),
+            source: Some(StdArc::new(source)),
+        }
+    }
+
+    /// [`from_source`](Self::from_source) with [`ObjectiveEvalKind::Recoverable`].
+    pub fn recoverable_from<E>(source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::from_source(ObjectiveEvalKind::Recoverable, source)
+    }
+
+    /// [`from_source`](Self::from_source) with [`ObjectiveEvalKind::Fatal`].
+    pub fn fatal_from<E>(source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::from_source(ObjectiveEvalKind::Fatal, source)
+    }
+
+    /// Prefix the message, preserving the kind and the typed source.
+    ///
+    /// Use this instead of `format!`-ing the rendered error into a new
+    /// `ObjectiveEvalError`: re-wrapping through a string is exactly
+    /// what loses the classification.
+    #[must_use]
+    pub fn with_context(mut self, context: impl std::fmt::Display) -> Self {
+        self.message = format!("{context}: {}", self.message);
+        self
+    }
+
+    /// The producer's classification.
+    #[must_use]
+    pub fn kind(&self) -> ObjectiveEvalKind {
+        self.kind
+    }
+
+    /// `true` when the solver may back off and continue.
+    #[must_use]
+    pub fn is_recoverable(&self) -> bool {
+        matches!(self.kind, ObjectiveEvalKind::Recoverable)
+    }
+
+    /// `true` when the run cannot continue.
+    #[must_use]
+    pub fn is_fatal(&self) -> bool {
+        matches!(self.kind, ObjectiveEvalKind::Fatal)
+    }
+
+    /// The message, without the kind prefix `Display` adds.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Consume the error and take its message.
+    #[must_use]
+    pub fn into_message(self) -> String {
+        self.message
+    }
+
+    /// The originating error, when one was attached.
+    #[must_use]
+    pub fn source_ref(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+        self.source.as_deref()
+    }
+
+    /// Recover the producer's own error type.
+    ///
+    /// This is the mechanism that lets a classification be *carried*
+    /// rather than re-derived: a layer that needs to know what failed
+    /// asks for the type back instead of pattern-matching the prose.
+    #[must_use]
+    pub fn downcast_ref<E>(&self) -> Option<&E>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.source.as_deref().and_then(|e| e.downcast_ref::<E>())
     }
 }
 
@@ -4464,10 +5031,10 @@ impl ProbeOutcome {
     fn from_result(result: &Result<f64, ObjectiveEvalError>) -> Self {
         match result {
             Ok(cost) => ProbeOutcome::Cost(*cost),
-            Err(ObjectiveEvalError::Recoverable { message }) => {
-                ProbeOutcome::Recoverable(message.clone())
+            Err(err) if err.is_recoverable() => {
+                ProbeOutcome::Recoverable(err.message().to_string())
             }
-            Err(ObjectiveEvalError::Fatal { message }) => ProbeOutcome::Fatal(message.clone()),
+            Err(err) => ProbeOutcome::Fatal(err.message().to_string()),
         }
     }
 
@@ -4972,6 +5539,11 @@ pub enum NewtonTrustRegionError {
     #[error("Failed to form a positive-definite trust-region model Hessian.")]
     ModelHessianNotSpd,
     #[error(
+        "Trust radius shrank to its floor without producing an accepted step. \
+         The objective may have severe noise or the model may be poorly scaled."
+    )]
+    TrustRegionRejectFloor { last_solution: Box<Solution> },
+    #[error(
         "Maximum number of iterations reached without converging. The best solution found is returned."
     )]
     MaxIterationsReached { last_solution: Box<Solution> },
@@ -5020,6 +5592,11 @@ pub enum ArcError {
     ObjectiveFailed { message: String },
     #[error("ARC subproblem solver failed to produce a usable step.")]
     SubproblemFailed,
+    #[error(
+        "Cubic regularization saturated at its ceiling without producing an accepted step. \
+         The objective may have severe noise or the model may be poorly scaled."
+    )]
+    TrustRegionRejectFloor { last_solution: Box<Solution> },
     #[error(
         "Maximum number of iterations reached without converging. The best solution found is returned."
     )]
@@ -5382,10 +5959,7 @@ impl NewtonTrustRegionCore {
             if approx_point(seed_x, &x_k) {
                 if let Err(err) = oracle.seed_from_sample(seed_x, seed_sample) {
                     return Err(NewtonTrustRegionError::ObjectiveFailed {
-                        message: match err {
-                            ObjectiveEvalError::Recoverable { message }
-                            | ObjectiveEvalError::Fatal { message } => message,
-                        },
+                        message: err.into_message(),
                     });
                 }
             }
@@ -5402,7 +5976,7 @@ impl NewtonTrustRegionCore {
             VecDeque::with_capacity(self.history_cap.max(2));
         let (mut f_k, mut g_k, mut h_k) = match initial {
             Ok(sample) => sample,
-            Err(ObjectiveEvalError::Recoverable { .. }) => {
+            Err(err) if err.is_recoverable() => {
                 if matches!(self.fallback_policy, FallbackPolicy::AutoBfgs) {
                     return self.run_bfgs_fallback(
                         obj_fn,
@@ -5415,7 +5989,8 @@ impl NewtonTrustRegionCore {
                 }
                 return Err(NewtonTrustRegionError::NonFiniteObjective);
             }
-            Err(ObjectiveEvalError::Fatal { message }) => {
+            Err(err) => {
+                        let message = err.into_message();
                 return Err(NewtonTrustRegionError::ObjectiveFailed { message });
             }
         };
@@ -5449,6 +6024,45 @@ impl NewtonTrustRegionCore {
             });
         }
 
+        // Consecutive iterations that produced no accepted step. Reset
+        // on every acceptance. A trust-region loop that cannot accept is
+        // only making progress through the radius, so once the radius
+        // reaches the representability floor there is nothing left to
+        // try and the loop must say so rather than spend the rest of its
+        // budget re-evaluating an unmovable point.
+        let mut consecutive_rejections = 0usize;
+        macro_rules! shrink_or_report_floor {
+            ($iter:expr) => {{
+                consecutive_rejections += 1;
+                let radius_floor = degenerate_trust_radius(&x_k);
+                if trust_radius <= radius_floor {
+                    let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
+                    self.last_trust_radius = Some(trust_radius);
+                    return Err(NewtonTrustRegionError::TrustRegionRejectFloor {
+                        last_solution: Box::new(Solution::gradient_based(
+                            x_k.clone(),
+                            f_k,
+                            g_k.clone(),
+                            g_norm,
+                            Some(h_k.clone()),
+                            $iter,
+                            func_evals,
+                            grad_evals,
+                            hess_evals,
+                            TerminationReason::TrustRegionRejectFloor {
+                                radius: trust_radius,
+                                floor: radius_floor,
+                                consecutive_rejections,
+                                grad_norm: g_norm,
+                            },
+                        )),
+                    });
+                }
+                trust_radius = (trust_radius * 0.5).max(radius_floor);
+                continue;
+            }};
+        }
+
         for k in 0..self.max_iterations {
             self.last_trust_radius = Some(trust_radius);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
@@ -5463,6 +6077,10 @@ impl NewtonTrustRegionCore {
                     func_evals,
                     grad_evals,
                     hess_evals,
+                    TerminationReason::GradientTolerance {
+                        grad_norm: g_norm,
+                        threshold: effective_tol,
+                    },
                 ));
             }
 
@@ -5476,23 +6094,16 @@ impl NewtonTrustRegionCore {
             let any_active = active.iter().copied().any(|v| v);
             let (trial_step, pred_dec_free) = if any_active {
                 if !any_free_variables(&active) {
-                    trust_radius = (trust_radius * 0.5).max(1e-12);
-                    continue;
+                    shrink_or_report_floor!(k);
                 }
                 match self.steihaug_toint_step(h_model, &g_proj_k, trust_radius, Some(&active)) {
                     Some(v) => v,
-                    None => {
-                        trust_radius = (trust_radius * 0.5).max(1e-12);
-                        continue;
-                    }
+                    None => shrink_or_report_floor!(k),
                 }
             } else {
                 match self.steihaug_toint_step(h_model, &g_proj_k, trust_radius, None) {
                     Some(v) => v,
-                    None => {
-                        trust_radius = (trust_radius * 0.5).max(1e-12);
-                        continue;
-                    }
+                    None => shrink_or_report_floor!(k),
                 }
             };
 
@@ -5501,8 +6112,7 @@ impl NewtonTrustRegionCore {
             let s_trial = &x_trial - &x_k;
             let s_norm = s_trial.dot(&s_trial).sqrt();
             if !s_norm.is_finite() || s_norm <= 1e-16 {
-                trust_radius = (trust_radius * 0.5).max(1e-12);
-                continue;
+                shrink_or_report_floor!(k);
             }
             let pred_dec = if (&s_trial - &trial_step)
                 .dot(&(&s_trial - &trial_step))
@@ -5514,8 +6124,7 @@ impl NewtonTrustRegionCore {
                 pred_dec_free
             };
             if !pred_dec.is_finite() || pred_dec <= 0.0 {
-                trust_radius = (trust_radius * 0.5).max(1e-12);
-                continue;
+                shrink_or_report_floor!(k);
             }
 
             let (f_trial, g_trial, h_trial) = match oracle.eval_cost_grad_hessian(
@@ -5527,12 +6136,13 @@ impl NewtonTrustRegionCore {
                 &mut hess_evals,
             ) {
                 Ok(sample) => sample,
-                Err(ObjectiveEvalError::Recoverable { .. }) => {
-                    trust_radius = (trust_radius * 0.2).max(1e-12);
-                    continue;
+                Err(err) if err.is_recoverable() => {
+                    shrink_or_report_floor!(k);
                 }
-                Err(ObjectiveEvalError::Fatal { message }) => {
-                    return Err(NewtonTrustRegionError::ObjectiveFailed { message });
+                Err(err) => {
+                    return Err(NewtonTrustRegionError::ObjectiveFailed {
+                        message: err.into_message(),
+                    });
                 }
             };
             let act_dec = f_k - f_trial;
@@ -5540,7 +6150,7 @@ impl NewtonTrustRegionCore {
             if rho > 0.75 && s_norm > 0.99 * trust_radius {
                 trust_radius = (trust_radius * 2.0).min(self.trust_radius_max.max(1.0));
             } else if rho < 0.25 {
-                trust_radius = (trust_radius * 0.5).max(1e-12);
+                trust_radius = (trust_radius * 0.5).max(degenerate_trust_radius(&x_k));
             }
 
             let accepted = rho > self.eta_accept;
@@ -5578,6 +6188,15 @@ impl NewtonTrustRegionCore {
                 g_k = g_trial;
                 h_k = h_trial;
                 g_proj_k = self.projected_gradient(&x_k, &g_k);
+                consecutive_rejections = 0;
+            } else {
+                // A rejected trial is progress only through the radius.
+                // Once the radius can no longer shrink to anything
+                // distinguishable from the current point, further
+                // iterations are guaranteed to re-propose the same
+                // unmovable step, so report the floor instead of
+                // consuming the remaining budget on it.
+                shrink_or_report_floor!(k);
             }
         }
 
@@ -5593,6 +6212,11 @@ impl NewtonTrustRegionCore {
                 func_evals,
                 grad_evals,
                 hess_evals,
+                TerminationReason::IterationBudget {
+                    iterations: self.max_iterations,
+                    grad_norm: g_norm,
+                    threshold: effective_tol,
+                },
             )),
         })
     }
@@ -6276,10 +6900,7 @@ impl ArcCore {
             if approx_point(seed_x, &x_k) {
                 if let Err(err) = oracle.seed_from_sample(seed_x, seed_sample) {
                     return Err(ArcError::ObjectiveFailed {
-                        message: match err {
-                            ObjectiveEvalError::Recoverable { message }
-                            | ObjectiveEvalError::Fatal { message } => message,
-                        },
+                        message: err.into_message(),
                     });
                 }
             }
@@ -6296,7 +6917,7 @@ impl ArcCore {
             VecDeque::with_capacity(self.history_cap.max(2));
         let (mut f_k, mut g_k, mut h_k) = match initial {
             Ok(sample) => sample,
-            Err(ObjectiveEvalError::Recoverable { .. }) => {
+            Err(err) if err.is_recoverable() => {
                 if matches!(self.fallback_policy, FallbackPolicy::AutoBfgs) {
                     return self.run_bfgs_fallback(
                         obj_fn,
@@ -6309,7 +6930,8 @@ impl ArcCore {
                 }
                 return Err(ArcError::NonFiniteObjective);
             }
-            Err(ObjectiveEvalError::Fatal { message }) => {
+            Err(err) => {
+                        let message = err.into_message();
                 return Err(ArcError::ObjectiveFailed { message });
             }
         };
@@ -6338,6 +6960,10 @@ impl ArcCore {
         }
         let mut model_failure_streak = 0usize;
         let mut h_model_workspace = Array2::<f64>::zeros((n, n));
+        // Consecutive rejected trials; reset on every acceptance. Paired
+        // with the `sigma_max` ceiling to detect a saturated model the
+        // same way `NewtonTrustRegionCore` detects a collapsed radius.
+        let mut consecutive_rejections = 0usize;
 
         for k in 0..self.max_iterations {
             // Per-iter observer notification. Mirrors `NewtonTrustRegionCore::run`;
@@ -6370,6 +6996,10 @@ impl ArcCore {
                     func_evals,
                     grad_evals,
                     hess_evals,
+                    TerminationReason::GradientTolerance {
+                        grad_norm: g_norm,
+                        threshold: effective_tol,
+                    },
                 ));
             }
 
@@ -6436,7 +7066,7 @@ impl ArcCore {
             if candidate.predicted_decrease <= ARC_NUMERICAL_CONV_FACTOR * f_scale
                 && reduced_hessian_is_positive_semidefinite(h_model, Some(&active))
             {
-                return Ok(Solution::gradient_based_with_status(
+                return Ok(Solution::gradient_based(
                     x_k,
                     f_k,
                     g_k,
@@ -6446,7 +7076,11 @@ impl ArcCore {
                     func_evals,
                     grad_evals,
                     hess_evals,
-                    OptimizationStatus::NumericallyConverged,
+                    TerminationReason::ModelNoiseFloor {
+                        predicted_decrease: candidate.predicted_decrease,
+                        noise_floor: ARC_NUMERICAL_CONV_FACTOR * f_scale,
+                        grad_norm: g_norm,
+                    },
                 ));
             }
 
@@ -6460,7 +7094,7 @@ impl ArcCore {
             );
             let (f_trial, g_trial, h_trial) = match primary_sample {
                 Ok(sample) => sample,
-                Err(ObjectiveEvalError::Recoverable { .. }) => {
+                Err(err) if err.is_recoverable() => {
                     // At negative curvature the cubic model has two opposing
                     // escape orientations.  Eigenvector sign is arbitrary, and
                     // one orientation can enter an objective-domain wall (for
@@ -6504,16 +7138,18 @@ impl ArcCore {
                     candidate = antipodal_candidate;
                     match antipodal_sample {
                         Ok(sample) => sample,
-                        Err(ObjectiveEvalError::Recoverable { .. }) => {
+                        Err(err) if err.is_recoverable() => {
                             self.escalate_sigma_on_failure(&mut model_failure_streak);
                             continue;
                         }
-                        Err(ObjectiveEvalError::Fatal { message }) => {
+                        Err(err) => {
+                        let message = err.into_message();
                             return Err(ArcError::ObjectiveFailed { message });
                         }
                     }
                 }
-                Err(ObjectiveEvalError::Fatal { message }) => {
+                Err(err) => {
+                        let message = err.into_message();
                     return Err(ArcError::ObjectiveFailed { message });
                 }
             };
@@ -6552,6 +7188,10 @@ impl ArcCore {
                     func_evals,
                     grad_evals,
                     hess_evals,
+                    TerminationReason::GradientTolerance {
+                        grad_norm: g_trial_norm,
+                        threshold: effective_tol,
+                    },
                 ));
             }
             let rho = (f_k - f_trial) / denom;
@@ -6598,6 +7238,42 @@ impl ArcCore {
                 f_k = f_trial;
                 g_k = g_trial;
                 h_k = h_trial;
+                consecutive_rejections = 0;
+            } else {
+                consecutive_rejections += 1;
+                // ARC escalates `sigma` instead of shrinking a radius,
+                // so its analogue of "the region cannot shrink further"
+                // is "the regularization cannot grow further". Once
+                // sigma is pinned at its ceiling and trials keep being
+                // rejected, every remaining iteration re-solves the same
+                // saturated model and re-evaluates the objective for a
+                // step that will be rejected again. Report the floor
+                // instead of spending the budget on it. The reported
+                // radius is `1/sigma`, the trust-region length scale the
+                // cubic model is equivalent to.
+                if self.sigma >= self.sigma_max {
+                    let g_proj_now = self.projected_gradient(&x_k, &g_k);
+                    let g_now = g_proj_now.dot(&g_proj_now).sqrt();
+                    return Err(ArcError::TrustRegionRejectFloor {
+                        last_solution: Box::new(Solution::gradient_based(
+                            x_k,
+                            f_k,
+                            g_k,
+                            g_now,
+                            Some(h_k),
+                            k + 1,
+                            func_evals,
+                            grad_evals,
+                            hess_evals,
+                            TerminationReason::TrustRegionRejectFloor {
+                                radius: 1.0 / self.sigma,
+                                floor: 1.0 / self.sigma_max,
+                                consecutive_rejections,
+                                grad_norm: g_now,
+                            },
+                        )),
+                    });
+                }
             }
 
             // Canonical ARC sigma update:
@@ -6627,6 +7303,11 @@ impl ArcCore {
                 func_evals,
                 grad_evals,
                 hess_evals,
+                TerminationReason::IterationBudget {
+                    iterations: self.max_iterations,
+                    grad_norm: g_norm,
+                    threshold: effective_tol,
+                },
             )),
         })
     }
@@ -6644,6 +7325,10 @@ struct BfgsCore {
     tau_g: f64,
     bounds: Option<BoxSpec>,
     flat_step_policy: FlatStepPolicy,
+    /// Seed for `rng_state`, retained so `reset_run_state` can restart
+    /// the jiggle stream and make repeated runs on one solver bitwise
+    /// reproducible.
+    rng_seed: u64,
     rng_state: u64,
     flat_accept_streak: usize,
     rescue_policy: RescuePolicy,
@@ -6836,6 +7521,110 @@ impl BfgsCore {
             }
         }
         Ok(())
+    }
+
+    /// Return every per-run field to its start-of-run value.
+    ///
+    /// `run` takes `&mut self`, so a `Bfgs` can legitimately be run more
+    /// than once — a multistart driver reusing one configured solver
+    /// across seeds is the obvious case. Before this existed the reset
+    /// was an ad-hoc list of eight assignments at the top of `run`, and
+    /// it was missing `stall_noimprove_streak` and `no_improve_streak`
+    /// among others. A leftover streak from a previous run makes the
+    /// *next* run's very first iteration eligible for a stall exit: at
+    /// `k = 0` the flat-objective half of that test is trivially
+    /// satisfied (`f_last_accepted == f_k`), so a carried-over streak
+    /// can return a "converged" solution after a single iteration at a
+    /// point the optimizer never worked on.
+    ///
+    /// The `let Self { .. }` destructure below is the enforcement
+    /// mechanism: it is exhaustive, so adding a field to [`BfgsCore`]
+    /// will not compile until the author has classified it as
+    /// configuration (preserved) or per-run state (reset). A reset that
+    /// can silently fall behind the struct is the defect; a reset the
+    /// compiler checks is the fix.
+    fn reset_run_state(&mut self) {
+        let Self {
+            // --- configuration: deliberately preserved across runs ---
+            x0: _,
+            tolerance: _,
+            max_iterations: _,
+            c1,
+            c2,
+            tau_f: _,
+            tau_g: _,
+            bounds: _,
+            flat_step_policy: _,
+            rescue_policy: _,
+            stall_policy: _,
+            tol_f_rel: _,
+            max_no_improve: _,
+            initial_b_inv: _,
+            initial_sample: _,
+            gradient_tolerance: _,
+            initial_metric: _,
+            observer: _,
+            axis_step_caps: _,
+            value_probe_memo_capacity: _,
+            // A consumer-installed hook, not accumulated state: it is
+            // taken and put back within one iteration (see the cost-stall
+            // block), so it is never left mid-run.
+            stall_resolver: _,
+            rng_seed,
+            // --- per-run state: reset ---
+            rng_state,
+            flat_accept_streak,
+            stall_noimprove_streak,
+            curv_slack_scale,
+            grad_drop_factor,
+            no_improve_streak,
+            gll,
+            c1_adapt,
+            c2_adapt,
+            wolfe_fail_streak,
+            primary_strategy,
+            trust_radius,
+            global_best,
+            nonfinite_seen,
+            wolfe_clean_successes,
+            bt_clean_successes,
+            ls_failures_in_row,
+            chol_fail_iters,
+            spd_fail_seen,
+            initial_grad_norm,
+            local_mode,
+            cost_stall,
+        } = self;
+
+        // Re-seeding the jiggle stream is what makes two identical runs
+        // on one solver produce identical answers. A carried-over stream
+        // position is a hidden input.
+        *rng_state = *rng_seed;
+        *flat_accept_streak = 0;
+        *stall_noimprove_streak = 0;
+        *curv_slack_scale = 1.0;
+        *grad_drop_factor = 0.9;
+        *no_improve_streak = 0;
+        gll.clear();
+        gll.set_cap(8);
+        *c1_adapt = *c1;
+        *c2_adapt = *c2;
+        *wolfe_fail_streak = 0;
+        *primary_strategy = LineSearchStrategy::StrongWolfe;
+        *trust_radius = 1.0;
+        *global_best = None;
+        *nonfinite_seen = false;
+        *wolfe_clean_successes = 0;
+        *bt_clean_successes = 0;
+        *ls_failures_in_row = 0;
+        *chol_fail_iters = 0;
+        *spd_fail_seen = false;
+        *initial_grad_norm = 0.0;
+        *local_mode = false;
+        // Keep the configured guard, discard its accumulated window.
+        if let Some(state) = cost_stall.as_mut() {
+            *state = CostStallState::new(state.config);
+        }
     }
 
     #[inline]
@@ -7046,6 +7835,7 @@ impl BfgsCore {
             tau_g: 1e2,
             bounds: None,
             flat_step_policy: FlatStepPolicy::MidpointWithJiggle { scale: 1e-3 },
+            rng_seed: 0xB5F0_D00D_1234_5678u64,
             rng_state: 0xB5F0_D00D_1234_5678u64,
             flat_accept_streak: 0,
             rescue_policy: RescuePolicy::CoordinateHybrid {
@@ -7333,6 +8123,10 @@ impl BfgsCore {
     where
         ObjFn: FirstOrderObjective,
     {
+        // `run` takes `&mut self` and may be called repeatedly on one
+        // configured solver. Start from a clean slate every time, or a
+        // previous run's streaks decide this run's termination.
+        self.reset_run_state();
         let n = self.x0.len();
         // Resolve `with_initial_metric` into the existing
         // `initial_b_inv` slot so the rest of the loop is unchanged.
@@ -7419,19 +8213,15 @@ impl BfgsCore {
             if approx_point(seed_x, &x_k) {
                 oracle
                     .seed_from_sample(seed_x, seed_sample)
-                    .map_err(|err| match err {
-                        ObjectiveEvalError::Recoverable { message }
-                        | ObjectiveEvalError::Fatal { message } => {
-                            BfgsError::ObjectiveFailed { message }
-                        }
+                    .map_err(|err| BfgsError::ObjectiveFailed {
+                        message: err.into_message(),
                     })?;
             }
         }
         let initial = oracle
             .eval_cost_grad(obj_fn, &x_k, &mut func_evals, &mut grad_evals)
-            .map_err(|err| match err {
-                ObjectiveEvalError::Recoverable { message }
-                | ObjectiveEvalError::Fatal { message } => BfgsError::ObjectiveFailed { message },
+            .map_err(|err| BfgsError::ObjectiveFailed {
+                message: err.into_message(),
             })?;
         let (mut f_k, mut g_k) = initial;
         if !f_k.is_finite() || g_k.iter().any(|v| !v.is_finite()) {
@@ -7461,15 +8251,6 @@ impl BfgsCore {
                 message: "trust radius is non-finite".to_string(),
             });
         }
-        self.wolfe_fail_streak = 0;
-        self.wolfe_clean_successes = 0;
-        self.bt_clean_successes = 0;
-        self.ls_failures_in_row = 0;
-        self.nonfinite_seen = false;
-        self.chol_fail_iters = 0;
-        self.spd_fail_seen = false;
-        self.flat_accept_streak = 0;
-
         let mut b_inv = if let Some(h0) = self.initial_b_inv.clone() {
             if h0.nrows() == n && h0.ncols() == n && h0.iter().all(|v| v.is_finite()) {
                 h0
@@ -7535,6 +8316,7 @@ impl BfgsCore {
             if g_norm < effective_tol {
                 let sol = Solution::gradient_based(
                     x_k, f_k, g_k, g_norm, None, k, func_evals, grad_evals, 0,
+                    TerminationReason::GradientTolerance { grad_norm: g_norm, threshold: effective_tol },
                 );
                 log::info!(
                     "[BFGS] Converged by gradient: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
@@ -7719,6 +8501,7 @@ impl BfgsCore {
                                                 func_evals,
                                                 grad_evals,
                                                 0,
+                                                TerminationReason::GradientTolerance { grad_norm: gb_norm, threshold: effective_tol },
                                             ));
                                         }
                                         x_k = self.project_point(&b.x);
@@ -7760,6 +8543,7 @@ impl BfgsCore {
                                             func_evals,
                                             grad_evals,
                                             0,
+                                            TerminationReason::GradientTolerance { grad_norm: g_proj_new.dot(&g_proj_new).sqrt(), threshold: effective_tol },
                                         ));
                                     }
                                     x_k = x_new;
@@ -7784,6 +8568,7 @@ impl BfgsCore {
                                         func_evals,
                                         grad_evals,
                                         0,
+                                        TerminationReason::LineSearchFailed { grad_norm: g_norm },
                                     );
                                     if let Some(b) = self.global_best.as_ref()
                                         && b.f < f_k - eps_f(f_k, self.tau_f)
@@ -7799,6 +8584,7 @@ impl BfgsCore {
                                             func_evals,
                                             grad_evals,
                                             0,
+                                            TerminationReason::LineSearchFailed { grad_norm: gb_proj.dot(&gb_proj).sqrt() },
                                         );
                                     }
                                     log::warn!(
@@ -7825,6 +8611,7 @@ impl BfgsCore {
                                         func_evals,
                                         grad_evals,
                                         0,
+                                        TerminationReason::LineSearchFailed { grad_norm: g_norm },
                                     );
                                     return Err(BfgsError::LineSearchFailed {
                                         last_solution: Box::new(ls),
@@ -7911,6 +8698,7 @@ impl BfgsCore {
                                             func_evals,
                                             grad_evals,
                                             0,
+                                            TerminationReason::GradientTolerance { grad_norm: g_proj_new.dot(&g_proj_new).sqrt(), threshold: effective_tol },
                                         ));
                                     }
                                     x_k = x_new;
@@ -7946,6 +8734,7 @@ impl BfgsCore {
                                                 func_evals,
                                                 grad_evals,
                                                 0,
+                                                TerminationReason::GradientTolerance { grad_norm: gb_norm, threshold: effective_tol },
                                             ));
                                         }
                                         x_k = self.project_point(&b.x);
@@ -7973,6 +8762,7 @@ impl BfgsCore {
                                         func_evals,
                                         grad_evals,
                                         0,
+                                        TerminationReason::LineSearchFailed { grad_norm: g_norm },
                                     );
                                     if let Some(b) = self.global_best.as_ref()
                                         && b.f < f_k - eps_f(f_k, self.tau_f)
@@ -7988,6 +8778,7 @@ impl BfgsCore {
                                             func_evals,
                                             grad_evals,
                                             0,
+                                            TerminationReason::LineSearchFailed { grad_norm: b_proj.dot(&b_proj).sqrt() },
                                         );
                                     }
                                     log::warn!(
@@ -8014,6 +8805,7 @@ impl BfgsCore {
                                         func_evals,
                                         grad_evals,
                                         0,
+                                        TerminationReason::LineSearchFailed { grad_norm: g_norm },
                                     );
                                     return Err(BfgsError::LineSearchFailed {
                                         last_solution: Box::new(ls),
@@ -8100,8 +8892,9 @@ impl BfgsCore {
                                     &mut grad_evals,
                                 ) {
                                     Ok(sample) => sample,
-                                    Err(ObjectiveEvalError::Recoverable { .. }) => continue,
-                                    Err(ObjectiveEvalError::Fatal { message }) => {
+                                    Err(err) if err.is_recoverable() => continue,
+                                    Err(err) => {
+                        let message = err.into_message();
                                         return Err(BfgsError::ObjectiveFailed { message });
                                     }
                                 };
@@ -8144,10 +8937,11 @@ impl BfgsCore {
                                     &mut grad_evals,
                                 ) {
                                     Ok(sample) => sample,
-                                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                                    Err(err) if err.is_recoverable() => {
                                         (f64::NAN, Array1::zeros(x_scaled.len()))
                                     }
-                                    Err(ObjectiveEvalError::Fatal { message }) => {
+                                    Err(err) => {
+                        let message = err.into_message();
                                         return Err(BfgsError::ObjectiveFailed { message });
                                     }
                                 };
@@ -8235,6 +9029,7 @@ impl BfgsCore {
                     func_evals,
                     grad_evals,
                     0,
+                    TerminationReason::GradientTolerance { grad_norm: g_proj_next.dot(&g_proj_next).sqrt(), threshold: effective_tol },
                 ));
             }
 
@@ -8264,12 +9059,24 @@ impl BfgsCore {
                     );
                 self.stall_resolver = resolver_slot;
                 if let Some(halt) = halt {
-                    let status = if halt.converged {
-                        OptimizationStatus::CostStallConverged
+                    let stall_cfg = self
+                        .cost_stall
+                        .as_ref()
+                        .expect("cost_stall guard presence checked above");
+                    let reason = if halt.converged {
+                        TerminationReason::CostStallStationary {
+                            grad_norm: halt.grad_norm,
+                            threshold: stall_cfg.config.projected_grad_tol,
+                            window: stall_cfg.config.window,
+                        }
                     } else {
-                        OptimizationStatus::CostStallFloor
+                        TerminationReason::CostStallFloor {
+                            grad_norm: halt.grad_norm,
+                            threshold: stall_cfg.config.projected_grad_tol,
+                            window: stall_cfg.config.window,
+                        }
                     };
-                    let mut sol = Solution::gradient_based_with_status(
+                    let sol = Solution::gradient_based(
                         halt.point,
                         halt.value,
                         halt.grad,
@@ -8279,9 +9086,8 @@ impl BfgsCore {
                         func_evals,
                         grad_evals,
                         0,
-                        status,
+                        reason,
                     );
-                    sol.stationarity_kind = StationarityKind::CostStall;
                     log::info!(
                         "[BFGS] Cost-stall exit ({}): iters={}, f={:.6e}, ||g_proj||={:.3e}",
                         if halt.converged {
@@ -8478,6 +9284,12 @@ impl BfgsCore {
                     func_evals,
                     grad_evals,
                     0,
+                    TerminationReason::SmallStepFlatObjective {
+                        step_norm: step_len,
+                        objective_change: f_next - f_k,
+                        grad_norm: gnext_norm,
+                        threshold: effective_tol,
+                    },
                 );
                 log::info!(
                     "[BFGS] Converged by small step/flat f: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
@@ -8514,6 +9326,11 @@ impl BfgsCore {
                         func_evals,
                         grad_evals,
                         0,
+                        TerminationReason::RelativeStationarityWindow {
+                            grad_inf: g_inf,
+                            threshold: effective_tol * (1.0 + x_inf),
+                            window,
+                        },
                     );
                     log::info!(
                         "[BFGS] Converged (flat/stalled): iters={}, f={:.6e}, ||g||={:.3e}",
@@ -8592,6 +9409,11 @@ impl BfgsCore {
             func_evals,
             grad_evals,
             0,
+            TerminationReason::IterationBudget {
+                iterations: self.max_iterations,
+                grad_norm: final_g_norm,
+                threshold: effective_tol,
+            },
         ));
         log::warn!(
             "[BFGS] Max iterations reached: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
@@ -8812,7 +9634,7 @@ where
     /// numerical failure, a placeholder built from the initial point).
     pub fn run_report(&mut self) -> OptimizationReport {
         let outcome = self.core.run(&mut self.obj_fn);
-        bfgs_outcome_into_report(&self.core.x0, outcome)
+        outcome_into_report(&self.core.x0, outcome)
     }
 
     #[cfg(test)]
@@ -8944,7 +9766,11 @@ where
     /// a follow-up `NewtonTrustRegion::with_initial_trust_radius`.
     pub fn run_report(&mut self) -> OptimizationReport {
         let outcome = self.core.run(&mut self.obj_fn);
-        let mut report = newton_outcome_into_report(&self.core.x0, outcome);
+        let mut report = outcome_into_report(&self.core.x0, outcome);
+        // The matrix-free path never materializes a Hessian: what the
+        // solver counted into `hess_evals` are Hessian-vector products.
+        report.diagnostics.hvp_evals = report.diagnostics.hess_evals;
+        report.diagnostics.hess_evals = 0;
         report.diagnostics.final_trust_radius = self.core.last_trust_radius;
         report
     }
@@ -9072,7 +9898,7 @@ where
     /// follow-up call.
     pub fn run_report(&mut self) -> OptimizationReport {
         let outcome = self.core.run(&mut self.obj_fn);
-        let mut report = arc_outcome_into_report(&self.core.x0, outcome);
+        let mut report = outcome_into_report(&self.core.x0, outcome);
         report.diagnostics.final_regularization = Some(self.core.sigma);
         report
     }
@@ -9290,10 +10116,11 @@ impl MatrixFreeTrustRegionCore {
         };
         let mut sample = match seed_eval {
             Ok(s) => s,
-            Err(ObjectiveEvalError::Recoverable { .. }) => {
+            Err(err) if err.is_recoverable() => {
                 return Err(MatrixFreeTrustRegionError::NonFiniteObjective);
             }
-            Err(ObjectiveEvalError::Fatal { message }) => {
+            Err(err) => {
+                        let message = err.into_message();
                 return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
             }
         };
@@ -9337,6 +10164,11 @@ impl MatrixFreeTrustRegionCore {
             });
         }
 
+        // Consecutive trials that produced no accepted step; reset on
+        // every acceptance. Reported with the reject-floor termination
+        // so a consumer can tell a region that collapsed after one bad
+        // trial from one that ground through dozens.
+        let mut consecutive_rejections = 0usize;
         for k in 0..self.max_iterations {
             self.last_trust_radius = Some(trust_radius);
             // Per-iter observer notification. Mirrors NewtonTR / ARC.
@@ -9380,10 +10212,15 @@ impl MatrixFreeTrustRegionCore {
                             func_evals,
                             grad_evals,
                             hvp_evals,
+                            TerminationReason::GradientTolerance {
+                                grad_norm: g_proj_norm,
+                                threshold: effective_tol,
+                            },
                         );
                         return Ok(sol);
                     }
-                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    Err(err) if err.is_recoverable() => {
+                        consecutive_rejections += 1;
                         trust_radius *= 0.25;
                         if trust_radius < self.trust_radius_min {
                             let last = Box::new(Solution::gradient_based(
@@ -9396,6 +10233,12 @@ impl MatrixFreeTrustRegionCore {
                                 func_evals,
                                 grad_evals,
                                 hvp_evals,
+                                TerminationReason::TrustRegionRejectFloor {
+                                    radius: trust_radius,
+                                    floor: self.trust_radius_min,
+                                    consecutive_rejections,
+                                    grad_norm: g_proj_norm,
+                                },
                             ));
                             return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
                                 last_solution: last,
@@ -9403,7 +10246,8 @@ impl MatrixFreeTrustRegionCore {
                         }
                         continue;
                     }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
+                    Err(err) => {
+                        let message = err.into_message();
                         return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
                     }
                 }
@@ -9533,11 +10377,16 @@ impl MatrixFreeTrustRegionCore {
                         func_evals,
                         grad_evals,
                         hvp_evals,
+                        TerminationReason::GradientTolerance {
+                            grad_norm: g_proj_norm,
+                            threshold: effective_tol,
+                        },
                     );
                     return Ok(sol);
                 }
-                Err(ObjectiveEvalError::Recoverable { .. }) => {
+                Err(err) if err.is_recoverable() => {
                     // CG failed recoverably; shrink and retry.
+                    consecutive_rejections += 1;
                     trust_radius *= 0.25;
                     if trust_radius < self.trust_radius_min {
                         let last = Box::new(Solution::gradient_based(
@@ -9550,6 +10399,12 @@ impl MatrixFreeTrustRegionCore {
                             func_evals,
                             grad_evals,
                             hvp_evals,
+                            TerminationReason::TrustRegionRejectFloor {
+                                radius: trust_radius,
+                                floor: self.trust_radius_min,
+                                consecutive_rejections,
+                                grad_norm: g_proj_norm,
+                            },
                         ));
                         return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
                             last_solution: last,
@@ -9557,11 +10412,13 @@ impl MatrixFreeTrustRegionCore {
                     }
                     continue;
                 }
-                Err(ObjectiveEvalError::Fatal { message }) => {
+                Err(err) => {
+                        let message = err.into_message();
                     return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
                 }
             };
             if predicted <= 0.0 || !predicted.is_finite() {
+                consecutive_rejections += 1;
                 trust_radius *= 0.25;
                 if trust_radius < self.trust_radius_min {
                     let last = Box::new(Solution::gradient_based(
@@ -9574,6 +10431,12 @@ impl MatrixFreeTrustRegionCore {
                         func_evals,
                         grad_evals,
                         hvp_evals,
+                        TerminationReason::TrustRegionRejectFloor {
+                            radius: trust_radius,
+                            floor: self.trust_radius_min,
+                            consecutive_rejections,
+                            grad_norm: g_proj_norm,
+                        },
                     ));
                     return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
                         last_solution: last,
@@ -9603,7 +10466,7 @@ impl MatrixFreeTrustRegionCore {
                     trust_radius,
                 ) {
                     Ok(None) => {
-                        let sol = Solution::gradient_based_with_status(
+                        let sol = Solution::gradient_based(
                             x_k.clone(),
                             sample.value,
                             sample.gradient.clone(),
@@ -9613,7 +10476,11 @@ impl MatrixFreeTrustRegionCore {
                             func_evals,
                             grad_evals,
                             hvp_evals,
-                            OptimizationStatus::NumericallyConverged,
+                            TerminationReason::ModelNoiseFloor {
+                                predicted_decrease: predicted,
+                                noise_floor: (1.0 + sample.value.abs()) * f64::EPSILON,
+                                grad_norm: g_proj_norm,
+                            },
                         );
                         return Ok(sol);
                     }
@@ -9630,22 +10497,26 @@ impl MatrixFreeTrustRegionCore {
                                     });
                                 }
                             }
-                            Err(ObjectiveEvalError::Recoverable { .. }) => {
+                            Err(err) if err.is_recoverable() => {
+                                consecutive_rejections += 1;
                                 trust_radius *= 0.25;
                                 continue;
                             }
-                            Err(ObjectiveEvalError::Fatal { message }) => {
+                            Err(err) => {
+                        let message = err.into_message();
                                 return Err(MatrixFreeTrustRegionError::ObjectiveFailed {
                                     message,
                                 });
                             }
                         }
                     }
-                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    Err(err) if err.is_recoverable() => {
+                        consecutive_rejections += 1;
                         trust_radius *= 0.25;
                         continue;
                     }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
+                    Err(err) => {
+                        let message = err.into_message();
                         return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
                     }
                 }
@@ -9681,6 +10552,7 @@ impl MatrixFreeTrustRegionCore {
                         if predicted_feas <= 0.0 || !predicted_feas.is_finite() {
                             // Projected step is no longer a descent direction
                             // for the quadratic model; shrink and retry.
+                            consecutive_rejections += 1;
                             trust_radius *= 0.25;
                             if trust_radius < self.trust_radius_min {
                                 let last = Box::new(Solution::gradient_based(
@@ -9693,6 +10565,12 @@ impl MatrixFreeTrustRegionCore {
                                     func_evals,
                                     grad_evals,
                                     hvp_evals,
+                                    TerminationReason::TrustRegionRejectFloor {
+                                        radius: trust_radius,
+                                        floor: self.trust_radius_min,
+                                        consecutive_rejections,
+                                        grad_norm: g_proj_norm,
+                                    },
                                 ));
                                 return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
                                     last_solution: last,
@@ -9702,7 +10580,8 @@ impl MatrixFreeTrustRegionCore {
                         }
                         predicted_feas
                     }
-                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    Err(err) if err.is_recoverable() => {
+                        consecutive_rejections += 1;
                         trust_radius *= 0.5;
                         if trust_radius < self.trust_radius_min {
                             let last = Box::new(Solution::gradient_based(
@@ -9715,6 +10594,12 @@ impl MatrixFreeTrustRegionCore {
                                 func_evals,
                                 grad_evals,
                                 hvp_evals,
+                                TerminationReason::TrustRegionRejectFloor {
+                                    radius: trust_radius,
+                                    floor: self.trust_radius_min,
+                                    consecutive_rejections,
+                                    grad_norm: g_proj_norm,
+                                },
                             ));
                             return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
                                 last_solution: last,
@@ -9722,7 +10607,8 @@ impl MatrixFreeTrustRegionCore {
                         }
                         continue;
                     }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
+                    Err(err) => {
+                        let message = err.into_message();
                         return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
                     }
                 }
@@ -9732,7 +10618,8 @@ impl MatrixFreeTrustRegionCore {
             let trial_eval = obj_fn.eval_value_grad_op(&x_trial);
             let trial = match trial_eval {
                 Ok(t) => t,
-                Err(ObjectiveEvalError::Recoverable { .. }) => {
+                Err(err) if err.is_recoverable() => {
+                    consecutive_rejections += 1;
                     trust_radius *= 0.5;
                     if trust_radius < self.trust_radius_min {
                         let last = Box::new(Solution::gradient_based(
@@ -9745,6 +10632,12 @@ impl MatrixFreeTrustRegionCore {
                             func_evals,
                             grad_evals,
                             hvp_evals,
+                            TerminationReason::TrustRegionRejectFloor {
+                                radius: trust_radius,
+                                floor: self.trust_radius_min,
+                                consecutive_rejections,
+                                grad_norm: g_proj_norm,
+                            },
                         ));
                         return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
                             last_solution: last,
@@ -9752,13 +10645,15 @@ impl MatrixFreeTrustRegionCore {
                     }
                     continue;
                 }
-                Err(ObjectiveEvalError::Fatal { message }) => {
+                Err(err) => {
+                        let message = err.into_message();
                     return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
                 }
             };
             func_evals += 1;
             grad_evals += 1;
             if !trial.value.is_finite() || trial.gradient.iter().any(|v| !v.is_finite()) {
+                consecutive_rejections += 1;
                 trust_radius *= 0.5;
                 if trust_radius < self.trust_radius_min {
                     let last = Box::new(Solution::gradient_based(
@@ -9771,6 +10666,12 @@ impl MatrixFreeTrustRegionCore {
                         func_evals,
                         grad_evals,
                         hvp_evals,
+                        TerminationReason::TrustRegionRejectFloor {
+                            radius: trust_radius,
+                            floor: self.trust_radius_min,
+                            consecutive_rejections,
+                            grad_norm: g_proj_norm,
+                        },
                     ));
                     return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
                         last_solution: last,
@@ -9808,15 +10709,21 @@ impl MatrixFreeTrustRegionCore {
                             func_evals,
                             grad_evals,
                             hvp_evals,
+                            TerminationReason::GradientTolerance {
+                                grad_norm: g_trial_norm,
+                                threshold: effective_tol,
+                            },
                         );
                         return Ok(sol);
                     }
                     Ok(Some(_)) => {}
-                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    Err(err) if err.is_recoverable() => {
+                        consecutive_rejections += 1;
                         trust_radius *= 0.5;
                         continue;
                     }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
+                    Err(err) => {
+                        let message = err.into_message();
                         return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
                     }
                 }
@@ -9846,6 +10753,7 @@ impl MatrixFreeTrustRegionCore {
                 // Accept.
                 x_k = x_trial;
                 sample = trial;
+                consecutive_rejections = 0;
                 if rho > 0.75 && on_boundary {
                     trust_radius = (trust_radius * 2.0).min(self.trust_radius_max);
                 } else if rho < 0.25 {
@@ -9853,6 +10761,7 @@ impl MatrixFreeTrustRegionCore {
                 }
             } else {
                 // Reject.
+                consecutive_rejections += 1;
                 trust_radius *= 0.25;
                 if trust_radius < self.trust_radius_min {
                     let last = Box::new(Solution::gradient_based(
@@ -9865,6 +10774,12 @@ impl MatrixFreeTrustRegionCore {
                         func_evals,
                         grad_evals,
                         hvp_evals,
+                        TerminationReason::TrustRegionRejectFloor {
+                            radius: trust_radius,
+                            floor: self.trust_radius_min,
+                            consecutive_rejections,
+                            grad_norm: g_proj_norm,
+                        },
                     ));
                     return Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor {
                         last_solution: last,
@@ -9885,6 +10800,10 @@ impl MatrixFreeTrustRegionCore {
             func_evals,
             grad_evals,
             hvp_evals,
+            TerminationReason::GradientTolerance {
+                grad_norm: g_proj_norm,
+                threshold: effective_tol,
+            },
         ));
         Err(MatrixFreeTrustRegionError::MaxIterationsReached {
             last_solution: last,
@@ -10200,77 +11119,9 @@ where
 
     pub fn run_report(&mut self) -> OptimizationReport {
         let outcome = self.core.run(&mut self.obj_fn);
-        let mut report = matrix_free_outcome_into_report(&self.core.x0, outcome);
+        let mut report = outcome_into_report(&self.core.x0, outcome);
         report.diagnostics.final_trust_radius = self.core.last_trust_radius;
         report
-    }
-}
-
-fn matrix_free_outcome_into_report(
-    x0: &Array1<f64>,
-    outcome: Result<Solution, MatrixFreeTrustRegionError>,
-) -> OptimizationReport {
-    match outcome {
-        Ok(solution) => {
-            let diagnostics = OptimizationDiagnostics {
-                func_evals: solution.func_evals,
-                grad_evals: solution.grad_evals,
-                hess_evals: 0,
-                hvp_evals: solution.hess_evals,
-                ..OptimizationDiagnostics::default()
-            };
-            // Honor any solver-set status hint (e.g.
-            // `NumericallyConverged` from the rho-noise-floor guard);
-            // otherwise the `Ok(_)` outcome maps to `Converged`.
-            let status = solution
-                .status_hint
-                .unwrap_or(OptimizationStatus::Converged);
-            OptimizationReport {
-                solution,
-                status,
-                diagnostics,
-            }
-        }
-        Err(MatrixFreeTrustRegionError::MaxIterationsReached { last_solution }) => {
-            let solution = *last_solution;
-            let diagnostics = OptimizationDiagnostics {
-                func_evals: solution.func_evals,
-                grad_evals: solution.grad_evals,
-                hess_evals: 0,
-                hvp_evals: solution.hess_evals,
-                ..OptimizationDiagnostics::default()
-            };
-            OptimizationReport {
-                solution,
-                status: OptimizationStatus::MaxIterations,
-                diagnostics,
-            }
-        }
-        Err(MatrixFreeTrustRegionError::TrustRegionRejectFloor { last_solution }) => {
-            let solution = *last_solution;
-            let diagnostics = OptimizationDiagnostics {
-                func_evals: solution.func_evals,
-                grad_evals: solution.grad_evals,
-                hess_evals: 0,
-                hvp_evals: solution.hess_evals,
-                ..OptimizationDiagnostics::default()
-            };
-            OptimizationReport {
-                solution,
-                status: OptimizationStatus::TrustRegionRejectFloor,
-                diagnostics,
-            }
-        }
-        Err(MatrixFreeTrustRegionError::ObjectiveFailed { .. }) => OptimizationReport {
-            solution: placeholder_solution(x0),
-            status: OptimizationStatus::ObjectiveFailed,
-            diagnostics: OptimizationDiagnostics::default(),
-        },
-        Err(_) => OptimizationReport {
-            solution: placeholder_solution(x0),
-            status: OptimizationStatus::NumericalFailure,
-            diagnostics: OptimizationDiagnostics::default(),
-        },
     }
 }
 
@@ -10335,8 +11186,8 @@ impl FixedPointCore {
                                 func_evals += 1;
                                 sample
                             }
-                            Err(ObjectiveEvalError::Recoverable { message })
-                            | Err(ObjectiveEvalError::Fatal { message }) => {
+                            Err(err) => {
+                                let message = err.into_message();
                                 return Err(FixedPointError::ObjectiveFailed { message });
                             }
                         }
@@ -10347,8 +11198,8 @@ impl FixedPointCore {
                             func_evals += 1;
                             sample
                         }
-                        Err(ObjectiveEvalError::Recoverable { message })
-                        | Err(ObjectiveEvalError::Fatal { message }) => {
+                        Err(err) => {
+                            let message = err.into_message();
                             return Err(FixedPointError::ObjectiveFailed { message });
                         }
                     }
@@ -10359,18 +11210,16 @@ impl FixedPointCore {
                         func_evals += 1;
                         sample
                     }
-                    Err(ObjectiveEvalError::Recoverable { message })
-                    | Err(ObjectiveEvalError::Fatal { message }) => {
+                    Err(err) => {
+                        let message = err.into_message();
                         return Err(FixedPointError::ObjectiveFailed { message });
                     }
                 }
             };
-            let value = recover_on_nonfinite_cost(sample.value).map_err(|err| match err {
-                ObjectiveEvalError::Recoverable { message }
-                | ObjectiveEvalError::Fatal { message } => {
-                    FixedPointError::ObjectiveFailed { message }
-                }
-            })?;
+            let value = recover_on_nonfinite_cost(sample.value)
+                .map_err(|err| FixedPointError::ObjectiveFailed {
+                    message: err.into_message(),
+                })?;
             if sample.step.len() != x_k.len() {
                 return Err(FixedPointError::StepDimensionMismatch {
                     expected: x_k.len(),
@@ -10382,7 +11231,14 @@ impl FixedPointCore {
             }
             last_point = x_k.clone();
             if matches!(sample.status, FixedPointStatus::Stop) {
-                return Ok(Solution::fixed_point(x_k, value, 0.0, k, func_evals));
+                return Ok(Solution::fixed_point(
+                    x_k,
+                    value,
+                    0.0,
+                    k,
+                    func_evals,
+                    TerminationReason::FixedPointRequestedStop { step_norm: 0.0 },
+                ));
             }
             let x_next = self.project_point(&(&x_k + &sample.step));
             let applied_step = &x_next - &x_k;
@@ -10399,6 +11255,10 @@ impl FixedPointCore {
                     step_norm,
                     k + 1,
                     func_evals,
+                    TerminationReason::StepNormTolerance {
+                        step_norm,
+                        threshold: self.tolerance,
+                    },
                 ));
             }
             x_k = x_next;
@@ -10410,6 +11270,11 @@ impl FixedPointCore {
                 last_step_norm,
                 self.max_iterations,
                 func_evals,
+                TerminationReason::IterationBudget {
+                    iterations: self.max_iterations,
+                    grad_norm: last_step_norm,
+                    threshold: self.tolerance,
+                },
             )),
         })
     }
@@ -10462,6 +11327,17 @@ where
     pub fn run(&mut self) -> Result<Solution, FixedPointError> {
         self.core.run(&mut self.obj_fn)
     }
+
+    /// Run and return a structured report.
+    ///
+    /// Present on every solver so a caller can read
+    /// [`TerminationReason`] without knowing which solver it is driving
+    /// — the absence of this method on `FixedPoint` was one reason
+    /// consumers reached for solver-specific error matching instead.
+    pub fn run_report(&mut self) -> OptimizationReport {
+        let outcome = self.core.run(&mut self.obj_fn);
+        outcome_into_report(&self.core.x0, outcome)
+    }
 }
 
 /// A line search algorithm that finds a step size satisfying the Strong Wolfe conditions.
@@ -10512,8 +11388,9 @@ where
         }
         let mut f_i = match bfgs_eval_cost(oracle, obj_fn, &x_new, &mut func_evals) {
             Ok(f) => f,
-            Err(ObjectiveEvalError::Recoverable { .. }) => f64::NAN,
-            Err(ObjectiveEvalError::Fatal { message }) => {
+            Err(err) if err.is_recoverable() => f64::NAN,
+            Err(err) => {
+                        let message = err.into_message();
                 return Err(LineSearchError::ObjectiveFailed {
                     message: message,
                     func_evals,
@@ -10616,7 +11493,7 @@ where
         let (f_full, g_i) =
             match bfgs_eval_cost_grad(oracle, obj_fn, &x_new, &mut func_evals, &mut grad_evals) {
                 Ok(sample) => sample,
-                Err(ObjectiveEvalError::Recoverable { .. }) => {
+                Err(err) if err.is_recoverable() => {
                     core.nonfinite_seen = true;
                     if alpha_prev == 0.0 {
                         alpha_i *= 0.5;
@@ -10631,7 +11508,8 @@ where
                     }
                     continue;
                 }
-                Err(ObjectiveEvalError::Fatal { message }) => {
+                Err(err) => {
+                        let message = err.into_message();
                     return Err(LineSearchError::ObjectiveFailed {
                         message: message,
                         func_evals,
@@ -10854,8 +11732,9 @@ where
         }
         let mut f_new = match bfgs_eval_cost(oracle, obj_fn, &x_new, &mut func_evals) {
             Ok(f) => f,
-            Err(ObjectiveEvalError::Recoverable { .. }) => f64::NAN,
-            Err(ObjectiveEvalError::Fatal { message }) => {
+            Err(err) if err.is_recoverable() => f64::NAN,
+            Err(err) => {
+                        let message = err.into_message();
                 return Err(LineSearchError::ObjectiveFailed {
                     message: message,
                     func_evals,
@@ -10901,7 +11780,7 @@ where
                 match bfgs_eval_cost_grad(oracle, obj_fn, &x_new, &mut func_evals, &mut grad_evals)
                 {
                     Ok(sample) => sample,
-                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    Err(err) if err.is_recoverable() => {
                         core.nonfinite_seen = true;
                         alpha *= rho;
                         if alpha < 1e-16 {
@@ -10912,7 +11791,8 @@ where
                         }
                         continue;
                     }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
+                    Err(err) => {
+                        let message = err.into_message();
                         return Err(LineSearchError::ObjectiveFailed {
                             message: message,
                             func_evals,
@@ -11157,10 +12037,11 @@ where
             let (f_j, g_j) =
                 match bfgs_eval_cost_grad(oracle, obj_fn, &x_j, &mut func_evals, &mut grad_evals) {
                     Ok(sample) => sample,
-                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    Err(err) if err.is_recoverable() => {
                         (f64::NAN, Array1::zeros(x_j.len()))
                     }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
+                    Err(err) => {
+                        let message = err.into_message();
                         return Err(LineSearchError::ObjectiveFailed {
                             message: message,
                             func_evals,
@@ -11250,7 +12131,7 @@ where
                 match bfgs_eval_cost_grad(oracle, obj_fn, &x_mid, &mut func_evals, &mut grad_evals)
                 {
                     Ok(sample) => sample,
-                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    Err(err) if err.is_recoverable() => {
                         core.nonfinite_seen = true;
                         let tighten_lo = g_lo_dot_d.abs() > g_hi_dot_d.abs();
                         if tighten_lo {
@@ -11262,7 +12143,8 @@ where
                         }
                         continue;
                     }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
+                    Err(err) => {
+                        let message = err.into_message();
                         return Err(LineSearchError::ObjectiveFailed {
                             message: message,
                             func_evals,
@@ -11406,8 +12288,9 @@ where
         }
         let mut f_j = match bfgs_eval_cost(oracle, obj_fn, &x_j, &mut func_evals) {
             Ok(f) => f,
-            Err(ObjectiveEvalError::Recoverable { .. }) => f64::NAN,
-            Err(ObjectiveEvalError::Fatal { message }) => {
+            Err(err) if err.is_recoverable() => f64::NAN,
+            Err(err) => {
+                        let message = err.into_message();
                 return Err(LineSearchError::ObjectiveFailed {
                     message: message,
                     func_evals,
@@ -11452,7 +12335,7 @@ where
             let (f_full, g_j) =
                 match bfgs_eval_cost_grad(oracle, obj_fn, &x_j, &mut func_evals, &mut grad_evals) {
                     Ok(sample) => sample,
-                    Err(ObjectiveEvalError::Recoverable { .. }) => {
+                    Err(err) if err.is_recoverable() => {
                         core.nonfinite_seen = true;
                         let to_hi = (alpha_hi - alpha_j).abs() <= (alpha_j - alpha_lo).abs();
                         if to_hi {
@@ -11466,7 +12349,8 @@ where
                         }
                         continue;
                     }
-                    Err(ObjectiveEvalError::Fatal { message }) => {
+                    Err(err) => {
+                        let message = err.into_message();
                         return Err(LineSearchError::ObjectiveFailed {
                             message: message,
                             func_evals,
@@ -11674,7 +12558,7 @@ mod tests {
     use super::{
         AcceptedStep, ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, BacktrackConfig,
         BatchZerothOrderObjective, Bfgs, BfgsError, Bounds, CostStallConfig, CostStallState,
-        CostStallSummary, StallResolution, StallResolver,
+        CostStallSummary, StallResolution, StallResolver, TerminationReason,
         FallbackPolicy, FiniteDiffGradient, FirstOrderCache, FirstOrderObjective,
         FirstOrderObjectiveInto, FirstOrderSample, FirstOrderWorkspace, FixedPoint,
         FixedPointObjective, FixedPointSample, FixedPointStatus, FusedObjective, GradientTolerance,
@@ -12093,7 +12977,7 @@ mod tests {
             .eval_cost(&array![0.0])
             .expect_err("shape mismatch must fail");
 
-        assert!(matches!(err, ObjectiveEvalError::Fatal { .. }));
+        assert!(err.is_fatal());
     }
 
     /// The Rosenbrock function, a classic non-convex benchmark with a minimum at [1, 1].
@@ -12311,7 +13195,7 @@ mod tests {
         let err = objective
             .eval_grad(&array![0.0])
             .expect_err("non-finite finite-difference probes should be recoverable");
-        assert!(matches!(err, ObjectiveEvalError::Recoverable { .. }));
+        assert!(err.is_recoverable());
     }
 
     #[test]
@@ -14340,6 +15224,9 @@ mod tests {
                     0,
                     0,
                     0,
+                    TerminationReason::LineSearchFailed {
+                        grad_norm: g_k.dot(&g_k).sqrt(),
+                    },
                 )),
                 max_attempts,
                 failure_reason,
@@ -16988,5 +17875,299 @@ mod added_primitive_tests {
         )
         .unwrap();
         assert!(out.is_none());
+    }
+}
+
+#[cfg(test)]
+mod termination_provenance_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// A quadratic with an exactly known minimizer at `x = 1`.
+    struct Quadratic;
+    impl ZerothOrderObjective for Quadratic {
+        fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+            Ok(x.iter().map(|v| (v - 1.0).powi(2)).sum())
+        }
+    }
+    impl FirstOrderObjective for Quadratic {
+        fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+            Ok(FirstOrderSample {
+                value: x.iter().map(|v| (v - 1.0).powi(2)).sum(),
+                gradient: x.mapv(|v| 2.0 * (v - 1.0)),
+            })
+        }
+    }
+
+    #[test]
+    fn every_solution_names_the_test_that_stopped_it() {
+        let mut solver = Bfgs::new(array![-3.0, 4.0], Quadratic)
+            .with_tolerance(Tolerance::new(1e-9).unwrap())
+            .with_max_iterations(MaxIterations::new(200).unwrap());
+        let report = solver.run_report();
+        assert!(
+            report.status.is_success(),
+            "expected success, got {:?} ({})",
+            report.status,
+            report.solution.termination
+        );
+        // The status is DERIVED from the reason, so the two can never
+        // disagree — that is the invariant, not a coincidence.
+        assert_eq!(report.status, report.solution.termination.status());
+        let evidence = report
+            .solution
+            .termination
+            .stationarity_evidence()
+            .expect("a successful stop must carry the quantity it was decided against");
+        assert!(
+            evidence.measured <= evidence.threshold,
+            "{} claims stationarity with |g|={:.3e} > tol={:.3e}",
+            report.solution.termination,
+            evidence.measured,
+            evidence.threshold,
+        );
+    }
+
+    #[test]
+    fn relative_window_exit_is_reported_as_weaker_than_the_absolute_test() {
+        // The two exits are both `Ok(_)` and were historically
+        // indistinguishable, yet the window exit compares an L-infinity
+        // norm against a threshold scaled by `1 + ‖x‖∞`. A consumer that
+        // certifies optimality has to be able to tell them apart.
+        let absolute = TerminationReason::GradientTolerance {
+            grad_norm: 1.0e-9,
+            threshold: 1.0e-8,
+        };
+        let windowed = TerminationReason::RelativeStationarityWindow {
+            grad_inf: 2.0e-7,
+            threshold: 1.0e-8 * (1.0 + 30.0),
+            window: 3,
+        };
+        assert_eq!(absolute.status(), OptimizationStatus::Converged);
+        assert_eq!(windowed.status(), OptimizationStatus::Converged);
+        assert!(absolute.is_stationary_claim() && windowed.is_stationary_claim());
+
+        let a = absolute.stationarity_evidence().unwrap();
+        let w = windowed.stationarity_evidence().unwrap();
+        assert_eq!(a.norm, StationarityNorm::L2);
+        assert_eq!(a.scaling, StationarityScaling::Absolute);
+        assert_eq!(w.norm, StationarityNorm::LInf);
+        assert_eq!(w.scaling, StationarityScaling::RelativeToIterate);
+        assert!(
+            w.threshold > a.threshold * 30.0,
+            "the window exit's threshold must be visibly the looser one"
+        );
+    }
+
+    #[test]
+    fn a_reused_solver_does_not_inherit_the_previous_runs_streaks() {
+        // `run` takes `&mut self`, so one configured solver can be driven
+        // repeatedly — a multistart driver over seeds is the normal case.
+        // A per-run counter left behind by run N makes run N+1 eligible
+        // for a stall exit on its very first iteration, because at k = 0
+        // the flat-objective half of that test is trivially true
+        // (`f_last_accepted == f_k`). The observable symptom is a
+        // "converged" answer after one iteration at a point the
+        // optimizer never worked on.
+        //
+        // The objective has to be one BFGS cannot solve in a single
+        // step, or `iterations == 1` is the correct answer and the
+        // truncation is invisible: an exact line search on a separable
+        // quadratic lands on the minimizer from the identity metric in
+        // one step. Rosenbrock takes tens.
+        struct Rosenbrock;
+        impl ZerothOrderObjective for Rosenbrock {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                Ok((1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2))
+            }
+        }
+        impl FirstOrderObjective for Rosenbrock {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                Ok(FirstOrderSample {
+                    value: (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2),
+                    gradient: array![
+                        -2.0 * (1.0 - x[0]) - 400.0 * x[0] * (x[1] - x[0].powi(2)),
+                        200.0 * (x[1] - x[0].powi(2)),
+                    ],
+                })
+            }
+        }
+
+        let mut solver = Bfgs::new(array![-1.2, 1.0], Rosenbrock)
+            .with_tolerance(Tolerance::new(1e-8).unwrap())
+            .with_max_iterations(MaxIterations::new(500).unwrap());
+        // `StallPolicy::On { window: 3 }` is the default, so the
+        // relative-window exit this test is about is already live.
+
+        let first = solver.run_report();
+        assert!(
+            first.solution.iterations > 5,
+            "the fixture must take enough iterations for a truncation to              be visible; got {}",
+            first.solution.iterations
+        );
+
+        let second = solver.run_report();
+        assert!(
+            second.solution.iterations > 1,
+            "second run stopped after {} iteration(s) via {} — a carried-over \
+             streak, not a real stop",
+            second.solution.iterations,
+            second.solution.termination,
+        );
+        // Same solver, same seed, same objective: the second run must
+        // reproduce the first exactly, including its stop reason. This is
+        // the assertion that catches ANY per-run field the reset misses,
+        // not just the streaks.
+        assert_eq!(first.solution.iterations, second.solution.iterations);
+        assert_eq!(
+            first.solution.termination.label(),
+            second.solution.termination.label()
+        );
+        assert_eq!(first.solution.final_point, second.solution.final_point);
+        assert_eq!(first.solution.func_evals, second.solution.func_evals);
+        assert_eq!(first.solution.grad_evals, second.solution.grad_evals);
+    }
+
+    #[test]
+    fn objective_error_carries_the_producers_typed_error() {
+        // The classification is made once, by the producer, and travels.
+        // Re-deriving it downstream from the rendered text is the defect
+        // this exists to prevent.
+        #[derive(Debug, thiserror::Error)]
+        #[error("inner solve did not converge at this trial point")]
+        struct InnerNotConverged {
+            cycles: usize,
+        }
+
+        let err = ObjectiveEvalError::recoverable_from(InnerNotConverged { cycles: 7 })
+            .with_context("outer fixed-point evaluation");
+
+        assert!(err.is_recoverable(), "the producer said recoverable");
+        assert!(
+            err.message()
+                .starts_with("outer fixed-point evaluation: inner solve"),
+            "context must prefix without discarding the original: {}",
+            err.message()
+        );
+        let recovered = err
+            .downcast_ref::<InnerNotConverged>()
+            .expect("the typed source must survive the crossing");
+        assert_eq!(recovered.cycles, 7);
+        // And the classification is NOT recoverable from the text: the
+        // same prose can be produced fatally.
+        let fatal = ObjectiveEvalError::fatal(err.message());
+        assert!(fatal.is_fatal());
+        assert_eq!(fatal.message(), err.message());
+    }
+
+    #[test]
+    fn newton_reports_the_reject_floor_instead_of_grinding_the_budget() {
+        // An objective whose gradient points somewhere its value does not
+        // reward: every trust-region trial is rejected, so the radius
+        // collapses. Before the floor was detected the loop consumed its
+        // whole iteration budget re-evaluating an unmovable point.
+        struct AlwaysRejects {
+            evals: usize,
+        }
+        impl ZerothOrderObjective for AlwaysRejects {
+            fn eval_cost(&mut self, _x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                self.evals += 1;
+                Ok(1.0)
+            }
+        }
+        impl FirstOrderObjective for AlwaysRejects {
+            fn eval_grad(
+                &mut self,
+                _x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                self.evals += 1;
+                Ok(FirstOrderSample {
+                    value: 1.0,
+                    gradient: array![1.0, 1.0],
+                })
+            }
+        }
+        impl SecondOrderObjective for AlwaysRejects {
+            fn eval_hessian(
+                &mut self,
+                _x: &Array1<f64>,
+            ) -> Result<SecondOrderSample, ObjectiveEvalError> {
+                self.evals += 1;
+                Ok(SecondOrderSample {
+                    value: 1.0,
+                    gradient: array![1.0, 1.0],
+                    hessian: Some(Array2::eye(2)),
+                })
+            }
+        }
+
+        let mut solver = NewtonTrustRegion::new(array![0.0, 0.0], AlwaysRejects { evals: 0 })
+            .with_max_iterations(MaxIterations::new(5000).unwrap());
+        let report = solver.run_report();
+        assert_eq!(
+            report.status,
+            OptimizationStatus::TrustRegionRejectFloor,
+            "got {} instead",
+            report.solution.termination
+        );
+        match report.solution.termination {
+            TerminationReason::TrustRegionRejectFloor {
+                radius,
+                floor,
+                consecutive_rejections,
+                ..
+            } => {
+                assert!(radius <= floor, "radius {radius:e} vs floor {floor:e}");
+                assert!(consecutive_rejections > 0);
+            }
+            other => panic!("unexpected reason: {other}"),
+        }
+        assert!(
+            report.solution.iterations < 5000,
+            "the loop should stop at the floor, not at the budget"
+        );
+        assert!(
+            !report.solution.termination.is_stationary_claim(),
+            "a collapsed region is not a stationarity claim"
+        );
+    }
+
+    #[test]
+    fn iteration_budget_exhaustion_makes_no_stationarity_claim() {
+        struct Rosenbrock;
+        impl ZerothOrderObjective for Rosenbrock {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                Ok((1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2))
+            }
+        }
+        impl FirstOrderObjective for Rosenbrock {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                Ok(FirstOrderSample {
+                    value: (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2),
+                    gradient: array![
+                        -2.0 * (1.0 - x[0]) - 400.0 * x[0] * (x[1] - x[0].powi(2)),
+                        200.0 * (x[1] - x[0].powi(2)),
+                    ],
+                })
+            }
+        }
+        let mut solver = Bfgs::new(array![-1.2, 1.0], Rosenbrock)
+            .with_tolerance(Tolerance::new(1e-14).unwrap())
+            .with_max_iterations(MaxIterations::new(2).unwrap());
+        let report = solver.run_report();
+        assert_eq!(report.status, OptimizationStatus::MaxIterations);
+        assert!(!report.solution.termination.is_stationary_claim());
+        assert!(
+            report.solution.termination.stationarity_evidence().is_none(),
+            "a budget exhaustion has no threshold it was judged against"
+        );
+        // The gradient is still readable — it just carries no verdict.
+        assert!(report.solution.termination.grad_norm().is_some());
     }
 }
