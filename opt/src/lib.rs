@@ -8650,6 +8650,20 @@ where
         self
     }
 
+    /// Disable BFGS's generic three-iterate relative-stall exit.
+    ///
+    /// Use this when the consumer owns a stronger termination guard and a
+    /// mandatory final stationarity certificate. The generic exit scales its
+    /// projected-gradient threshold by `(1 + ||x||_inf)`; in log-parameter
+    /// coordinates a harmless large coordinate can therefore authorize an
+    /// early stop on a different, still-descending coordinate. Disabling that
+    /// duplicate authority leaves ordinary gradient convergence, line-search
+    /// failure, and the iteration budget unchanged.
+    pub fn without_relative_stall(mut self) -> Self {
+        self.core.stall_policy = StallPolicy::Off;
+        self
+    }
+
     /// Hand the solver a precomputed `(x0, sample)` pair so its first
     /// internal evaluation is served from cache instead of re-running
     /// the objective. Use this when the caller has already evaluated
@@ -15449,6 +15463,28 @@ mod tests {
         assert_eq!(
             sol.iterations, 0,
             "BFGS should detect convergence at iter 0"
+        );
+    }
+
+    #[test]
+    fn bfgs_consumer_can_remove_the_generic_relative_stall_authority() {
+        let default = Bfgs::new(array![0.0], CountingQuadratic::new(false));
+        assert!(
+            matches!(
+                default.core.stall_policy,
+                super::StallPolicy::On { window: 3 }
+            ),
+            "the generic relative-stall exit remains the default"
+        );
+
+        let certified_consumer =
+            Bfgs::new(array![0.0], CountingQuadratic::new(false)).without_relative_stall();
+        assert!(
+            matches!(
+                certified_consumer.core.stall_policy,
+                super::StallPolicy::Off
+            ),
+            "a consumer with its own guard and certificate must have one termination authority"
         );
     }
 
