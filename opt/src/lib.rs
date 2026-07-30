@@ -1754,8 +1754,7 @@ pub fn find_root_bracketed<E>(
     // next point. The real residuals above remain the sign certificate.
     let mut lower_weight = lower_value;
     let mut upper_weight = upper_value;
-    let mut func_evals = 2usize;
-    for iterations in 1..=config.max_iterations {
+    for (iteration_index, iterations) in (1..=config.max_iterations).enumerate() {
         let denominator = upper_weight - lower_weight;
         let interpolated = (lower * upper_weight - upper * lower_weight) / denominator;
         let midpoint = lower + (upper - lower) * 0.5;
@@ -1765,7 +1764,7 @@ pub fn find_root_bracketed<E>(
             midpoint
         };
         let value = evaluate(&mut oracle, at)?;
-        func_evals += 1;
+        let func_evals = iteration_index + 3;
         if value.abs() <= config.residual_tolerance {
             return Ok(BracketedRootSolution {
                 root: at,
