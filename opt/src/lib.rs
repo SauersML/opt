@@ -2931,28 +2931,6 @@ impl LineSearchError {
         }
     }
 
-    fn add_eval_counts(mut self, extra_func_evals: usize, extra_grad_evals: usize) -> Self {
-        match &mut self {
-            LineSearchError::MaxAttempts {
-                func_evals,
-                grad_evals,
-                ..
-            }
-            | LineSearchError::StepSizeTooSmall {
-                func_evals,
-                grad_evals,
-            }
-            | LineSearchError::ObjectiveFailed {
-                func_evals,
-                grad_evals,
-                ..
-            } => {
-                *func_evals += extra_func_evals;
-                *grad_evals += extra_grad_evals;
-            }
-        }
-        self
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14355,6 +14333,9 @@ mod tests {
         let g_k = array![-10.0];
         let mut core = super::BfgsCore::new(x_k.clone());
         core.bounds = Some(bounds(array![-10.0], array![6.0], 1e-12).spec);
+        // This regression is about bracketing/zoom. Keep the independent
+        // gradient-norm-drop acceptor from ending the expansion at alpha=1.
+        core.grad_drop_factor = 0.01;
         let mut oracle = super::FirstOrderCache::new(x_k.len());
         let mut objective = bfgs_oracle(|x: &Array1<f64>| {
             let residual = x[0] - 5.0;
