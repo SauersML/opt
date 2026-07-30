@@ -11752,7 +11752,7 @@ where
     let epsF = eps_f(f_k, core.tau_f);
     let mut best = ProbeBest::new(x_k, f_k, g_k);
     for _ in 0..max_attempts {
-        let (x_new, s, kinked) = core.project_with_step(x_k, d_k, alpha_i);
+        let (x_new, s, _) = core.project_with_step(x_k, d_k, alpha_i);
         let step_ok = !core.projected_step_small(x_k, &s);
         if !step_ok {
             return Err(LineSearchError::StepSizeTooSmall {
@@ -11820,21 +11820,6 @@ where
         let armijo_strict = f_i > f_k + c1 * gkTs + epsF;
         let prev_worse = func_evals > 1 && f_i >= f_prev - epsF;
         if armijo_strict || prev_worse {
-            let kink_lo = if alpha_prev > 0.0 {
-                let (_, _, kink_prev) = core.project_with_step(x_k, d_k, alpha_prev);
-                kink_prev
-            } else {
-                false
-            };
-            if kink_lo || kinked {
-                let fallback =
-                    bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
-                return fallback
-                    .map(|(a, f, g, fe, ge, kind)| {
-                        (a, f, g, fe + func_evals, ge + grad_evals, kind)
-                    })
-                    .map_err(|e| e.add_eval_counts(func_evals, grad_evals));
-            }
             let r = zoom(
                 core,
                 obj_fn,
@@ -11912,21 +11897,6 @@ where
         let armijo_strict = f_i > f_k + c1 * gkTs + epsF;
         let prev_worse = func_evals > 1 && f_i >= f_prev - epsF;
         if armijo_strict || prev_worse {
-            let kink_lo = if alpha_prev > 0.0 {
-                let (_, _, kink_prev) = core.project_with_step(x_k, d_k, alpha_prev);
-                kink_prev
-            } else {
-                false
-            };
-            if kink_lo || kinked {
-                let fallback =
-                    bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
-                return fallback
-                    .map(|(a, f, g, fe, ge, kind)| {
-                        (a, f, g, fe + func_evals, ge + grad_evals, kind)
-                    })
-                    .map_err(|e| e.add_eval_counts(func_evals, grad_evals));
-            }
             let g_proj_i = core.projected_gradient(&x_new, &g_i);
             let g_i_dot_d = directional_derivative(&g_proj_i, &s, alpha_i, d_k);
             let r = zoom(
@@ -12359,19 +12329,18 @@ where
         } else {
             false
         };
-        if kink_lo || kink_hi {
-            let fallback = bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
-            return fallback
-                .map(|(a, f, g, fe, ge, kind)| (a, f, g, fe + func_evals, ge + grad_evals, kind));
-        }
+        // Projection makes φ(α) continuous and piecewise smooth.  A projected
+        // endpoint invalidates derivative-based interpolation, not the bracket.
+        let bracket_has_kink = kink_lo || kink_hi;
         let tiny_bracket = (alpha_hi - alpha_lo).abs() <= 1e-12;
         let flat_f = (f_hi - f_lo).abs() <= epsF;
         let similar_slope = lo_deriv_known
             && hi_deriv_known
             && (g_hi_dot_d.abs() - g_lo_dot_d.abs()).abs()
                 <= core.curv_slack_scale * eps_g(g_proj_k, d_k, core.tau_g);
-        // Endpoint rescue on tiny brackets or flat ends with mismatched slopes.
-        if tiny_bracket || (flat_f && !similar_slope) {
+        // Endpoint rescue is useful only once the bracket itself is tiny.
+        // Re-evaluating a known endpoint of a flat bracket cannot refine it.
+        if tiny_bracket {
             let (mut alpha_j, choose_lo) = match (lo_deriv_known, hi_deriv_known) {
                 (true, true) => {
                     if g_lo_dot_d.abs() <= g_hi_dot_d.abs() {
@@ -12391,22 +12360,13 @@ where
             if alpha_j <= f64::EPSILON {
                 alpha_j = 0.5 * (alpha_lo + alpha_hi);
             }
-            let (x_j, s_j, kink_mid) = core.project_with_step(x_k, d_k, alpha_j);
+            let (x_j, s_j, _) = core.project_with_step(x_k, d_k, alpha_j);
             let step_ok = !core.projected_step_small(x_k, &s_j);
             if !step_ok {
                 return Err(LineSearchError::StepSizeTooSmall {
                     func_evals,
                     grad_evals,
                 });
-            }
-            if kink_mid {
-                let fallback =
-                    bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
-                return fallback
-                    .map(|(a, f, g, fe, ge, kind)| {
-                        (a, f, g, fe + func_evals, ge + grad_evals, kind)
-                    })
-                    .map_err(|e| e.add_eval_counts(func_evals, grad_evals));
             }
             let (f_j, g_j) =
                 match bfgs_eval_cost_grad(oracle, obj_fn, &x_j, &mut func_evals, &mut grad_evals) {
@@ -12484,22 +12444,13 @@ where
         }
         if flat_f && similar_slope {
             let alpha_mid = 0.5 * (alpha_lo + alpha_hi);
-            let (x_mid, s_mid, kink_mid) = core.project_with_step(x_k, d_k, alpha_mid);
+            let (x_mid, s_mid, _) = core.project_with_step(x_k, d_k, alpha_mid);
             let step_ok = !core.projected_step_small(x_k, &s_mid);
             if !step_ok {
                 return Err(LineSearchError::StepSizeTooSmall {
                     func_evals,
                     grad_evals,
                 });
-            }
-            if kink_mid {
-                let fallback =
-                    bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
-                return fallback
-                    .map(|(a, f, g, fe, ge, kind)| {
-                        (a, f, g, fe + func_evals, ge + grad_evals, kind)
-                    })
-                    .map_err(|e| e.add_eval_counts(func_evals, grad_evals));
             }
             let (f_mid, g_mid) =
                 match bfgs_eval_cost_grad(oracle, obj_fn, &x_mid, &mut func_evals, &mut grad_evals)
@@ -12606,7 +12557,8 @@ where
 
             // Fallback to bisection if the interval is too small, derivatives unknown,
             // or if function values at the interval ends are infinite, preventing unstable interpolation.
-            if alpha_diff < min_alpha_step
+            if bracket_has_kink
+                || alpha_diff < min_alpha_step
                 || !f_lo_i.is_finite()
                 || !f_hi_i.is_finite()
                 || !lo_deriv_known
@@ -12647,18 +12599,13 @@ where
             alpha_j
         };
 
-        let (x_j, s_j, kink_j) = core.project_with_step(x_k, d_k, alpha_j);
+        let (x_j, s_j, _) = core.project_with_step(x_k, d_k, alpha_j);
         let step_ok = !core.projected_step_small(x_k, &s_j);
         if !step_ok {
             return Err(LineSearchError::StepSizeTooSmall {
                 func_evals,
                 grad_evals,
             });
-        }
-        if kink_j {
-            let fallback = bfgs_backtracking_line_search(core, obj_fn, oracle, x_k, d_k, f_k, g_k);
-            return fallback
-                .map(|(a, f, g, fe, ge, kind)| (a, f, g, fe + func_evals, ge + grad_evals, kind));
         }
         let mut f_j = match bfgs_eval_cost(oracle, obj_fn, &x_j, &mut func_evals) {
             Ok(f) => f,
@@ -14398,6 +14345,45 @@ mod tests {
         assert!((core.curv_slack_scale - 1.0).abs() < 1e-16);
         assert!((core.grad_drop_factor - 0.9).abs() < 1e-16);
         assert_eq!(core.gll.cap, 1);
+    }
+
+    #[test]
+    fn line_search_preserves_bracket_across_projected_bound_kink() {
+        let x_k = array![0.0];
+        let d_k = array![1.0];
+        let f_k = 25.0;
+        let g_k = array![-10.0];
+        let mut core = super::BfgsCore::new(x_k.clone());
+        core.bounds = Some(bounds(array![-10.0], array![6.0], 1e-12).spec);
+        let mut oracle = super::FirstOrderCache::new(x_k.len());
+        let mut objective = bfgs_oracle(|x: &Array1<f64>| {
+            let residual = x[0] - 5.0;
+            (residual * residual, array![2.0 * residual])
+        });
+
+        let (alpha, value, gradient, _, _, kind) = super::line_search(
+            &mut core,
+            &mut objective,
+            &mut oracle,
+            &x_k,
+            &d_k,
+            f_k,
+            &g_k,
+            1e-4,
+            0.1,
+        )
+        .expect("zoom must retain the smooth side of a bound-kink bracket");
+
+        assert!(
+            (alpha - 5.0).abs() < 1e-12,
+            "expected the interior minimizer, got alpha={alpha}"
+        );
+        assert!(value.abs() < 1e-24, "expected zero objective, got {value:e}");
+        assert!(
+            gradient[0].abs() < 1e-12,
+            "expected a stationary minimizer, got gradient={gradient:?}"
+        );
+        assert!(matches!(kind, super::AcceptKind::StrongWolfe));
     }
 
     #[test]
