@@ -1,6 +1,6 @@
 [package]
 name = "opt"
-version = "0.8.0"
+version = "0.8.1"
 authors = ["Paul Kernfeld <paulkernfeld@gmail.com>", "SauersML"]
 edition = "2024"
 license = "AGPL-3.0-or-later"
@@ -12,7 +12,7 @@ keywords = ["optimization", "bfgs", "newton"]
 categories = ["science", "algorithms"]
 
 [dependencies]
-faer = "0.24.4"
+faer = { version = "0.24.4", default-features = false, features = ["std", "linalg", "rayon"] }
 log = "0.4.33"
 ndarray = "0.17.2"
 thiserror = "2.0.19"

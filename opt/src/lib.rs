@@ -99,7 +99,6 @@
 //! assert!((x_min[1] - 1.0).abs() < 1e-5);
 //! ```
 
-use faer::linalg::solvers::SelfAdjointEigen;
 use faer::{Mat, Side};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::collections::VecDeque;
@@ -271,7 +270,6 @@ pub fn escalate_ridge<T>(
     })
 }
 
-
 // =====================================================================
 // Exact PSD trust-region subproblem
 // =====================================================================
@@ -302,7 +300,7 @@ pub const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;
 #[must_use]
 pub fn accumulation_growth(operations: usize) -> f64 {
     let scaled = operations as f64 * UNIT_ROUNDOFF;
-    if !(scaled < 1.0) {
+    if !scaled.is_finite() || scaled >= 1.0 {
         return f64::INFINITY;
     }
     scaled / (1.0 - scaled)
@@ -366,20 +364,20 @@ pub fn solve_psd_trust_region(
     let mut symmetric = gram.to_owned();
     symmetric += &gram.t();
     symmetric *= 0.5;
-    let faer_matrix =
-        Mat::<f64>::from_fn(dimension, dimension, |row, col| symmetric[[row, col]]);
-    let eigen = faer_matrix.self_adjoint_eigen(Side::Lower).map_err(|error| {
-        PsdTrustRegionError::InvalidInput(format!(
-            "PSD trust-region eigendecomposition failed: {error:?}"
-        ))
-    })?;
+    let faer_matrix = Mat::<f64>::from_fn(dimension, dimension, |row, col| symmetric[[row, col]]);
+    let eigen = faer_matrix
+        .self_adjoint_eigen(Side::Lower)
+        .map_err(|error| {
+            PsdTrustRegionError::InvalidInput(format!(
+                "PSD trust-region eigendecomposition failed: {error:?}"
+            ))
+        })?;
     let diagonal = eigen.S().column_vector().as_mat();
     let vectors = eigen.U();
     let eigenvalues = Array1::from_shape_fn(dimension, |index| diagonal[(index, 0)]);
     let eigenvectors =
         Array2::from_shape_fn((dimension, dimension), |(row, col)| vectors[(row, col)]);
-    if eigenvalues.iter().any(|v| !v.is_finite()) || eigenvectors.iter().any(|v| !v.is_finite())
-    {
+    if eigenvalues.iter().any(|v| !v.is_finite()) || eigenvectors.iter().any(|v| !v.is_finite()) {
         return Err(PsdTrustRegionError::InvalidInput(
             "PSD trust-region eigendecomposition produced non-finite output".to_string(),
         ));
@@ -892,8 +890,7 @@ impl TrustRegionPolicy {
         } else {
             (f64::NEG_INFINITY, true)
         };
-        let accepted =
-            rho.is_finite() && rho > self.eta_accept && actual_reduction >= -noise_floor;
+        let accepted = rho.is_finite() && rho > self.eta_accept && actual_reduction >= -noise_floor;
 
         let mut new_radius = radius;
         let mut decision;
@@ -1390,7 +1387,11 @@ pub fn find_root_monotone<E>(
         }
     } else {
         // Search direction: step_sign = -sign(f · F').
-        let step_sign: f64 = if f_init * f_deriv_init < 0.0 { 1.0 } else { -1.0 };
+        let step_sign: f64 = if f_init * f_deriv_init < 0.0 {
+            1.0
+        } else {
+            -1.0
+        };
         let f_init_negative = f_init < 0.0;
         let mut same_side = seed;
         let mut step_mag = (config.initial_bracket_frac * (1.0 + seed.abs())).max(1.0);
@@ -1462,7 +1463,11 @@ pub fn find_root_monotone<E>(
             let halley_denom = 2.0 * f_a_mid * f_a_mid - f_mid * f_aa_mid;
             if halley_denom.is_finite() && halley_denom.abs() > curv_floor {
                 let cand = mid - (2.0 * f_mid * f_a_mid) / halley_denom;
-                if cand > lo && cand < hi { Some(cand) } else { None }
+                if cand > lo && cand < hi {
+                    Some(cand)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1914,6 +1919,7 @@ fn directional_derivative(g: &Array1<f64>, s: &Array1<f64>, alpha: f64, d: &Arra
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn classify_line_search_accept(
     core: &BfgsCore,
     step_ok: bool,
@@ -2362,8 +2368,7 @@ impl ReducedSymmetricSpectrum {
         let diagonal = eigen.S().column_vector().as_mat();
         let vectors = eigen.U();
         let eigenvalues = Array1::from_shape_fn(q, |index| diagonal[(index, 0)]);
-        let eigenvectors =
-            Array2::from_shape_fn((q, q), |(row, col)| vectors[(row, col)]);
+        let eigenvectors = Array2::from_shape_fn((q, q), |(row, col)| vectors[(row, col)]);
         if eigenvalues.iter().any(|value| !value.is_finite())
             || eigenvectors.iter().any(|value| !value.is_finite())
         {
@@ -2389,8 +2394,7 @@ impl ReducedSymmetricSpectrum {
     }
 
     fn gradient_coordinates(&self, gradient: &Array1<f64>) -> Array1<f64> {
-        let reduced_gradient =
-            Array1::from_iter(self.free.iter().map(|&index| gradient[index]));
+        let reduced_gradient = Array1::from_iter(self.free.iter().map(|&index| gradient[index]));
         self.eigenvectors.t().dot(&reduced_gradient)
     }
 
@@ -2404,10 +2408,7 @@ impl ReducedSymmetricSpectrum {
     }
 }
 
-fn reduced_hessian_is_positive_semidefinite(
-    h: &Array2<f64>,
-    active: Option<&[bool]>,
-) -> bool {
+fn reduced_hessian_is_positive_semidefinite(h: &Array2<f64>, active: Option<&[bool]>) -> bool {
     ReducedSymmetricSpectrum::decompose(h, active)
         .is_some_and(|spectrum| !spectrum.has_resolvable_negative_curvature())
 }
@@ -2468,8 +2469,7 @@ fn reduced_negative_curvature_step(
             .unwrap_or(raw_trial);
         let feasible_step = trial - point;
         let h_step = dense.dot(&feasible_step);
-        let predicted = -projected_gradient.dot(&feasible_step)
-            - 0.5 * feasible_step.dot(&h_step);
+        let predicted = -projected_gradient.dot(&feasible_step) - 0.5 * feasible_step.dot(&h_step);
         (feasible_step, predicted)
     };
     let plus_candidate = feasible_candidate(&plus);
@@ -2513,16 +2513,13 @@ fn dense_trust_region_step(
     let mut lambda_hi = 1e-8f64;
     let mut best: Option<(Array1<f64>, f64)> = None;
     for _ in 0..80 {
-        match solve_with_shift(lambda_hi) {
-            Some(s) => {
-                let s_norm = s.dot(&s).sqrt();
-                let pred = predicted(&s);
-                if s_norm.is_finite() && s_norm <= delta && pred.is_finite() && pred > 0.0 {
-                    best = Some((s, pred));
-                    break;
-                }
+        if let Some(s) = solve_with_shift(lambda_hi) {
+            let s_norm = s.dot(&s).sqrt();
+            let pred = predicted(&s);
+            if s_norm.is_finite() && s_norm <= delta && pred.is_finite() && pred > 0.0 {
+                best = Some((s, pred));
+                break;
             }
-            None => {}
         }
         lambda_lo = lambda_hi;
         lambda_hi *= 2.0;
@@ -2832,13 +2829,12 @@ pub enum FallbackPolicy {
 /// `SecondOrderSample { hessian: None }` (i.e. no analytic Hessian was
 /// supplied for this evaluation).
 ///
-/// The default is `FiniteDifference` for backward compatibility with
-/// `opt` 0.2.x. Callers with exact analytic Hessians should set
+/// The default is `FiniteDifference`. Callers with exact analytic Hessians should set
 /// `Error`: a single `None` then surfaces as a fatal evaluation error
 /// instead of silently triggering O(n) extra gradient probes per
 /// iteration. This matters most when each gradient probe is itself
 /// expensive (nested solves, biobank-scale outer iterations).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HessianFallbackPolicy {
     /// Treat a missing Hessian as a fatal evaluation error. Use this
     /// when the caller guarantees the objective always supplies an
@@ -2849,13 +2845,8 @@ pub enum HessianFallbackPolicy {
     /// Estimate the Hessian by finite-differencing the gradient when
     /// it is missing. This is the historical default. Step size comes
     /// from `with_fd_hessian_step`.
+    #[default]
     FiniteDifference,
-}
-
-impl Default for HessianFallbackPolicy {
-    fn default() -> Self {
-        Self::FiniteDifference
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2930,7 +2921,6 @@ impl LineSearchError {
             } => (*func_evals, *grad_evals),
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3137,9 +3127,8 @@ impl Tolerance {
 /// )
 /// ```
 /// `abs` is mandatory; the two relative components are optional and
-/// `0.0` (i.e. "off") by default. Setting `rel_cost = Some(τ)` is the
-/// classic mgcv-style relative-to-objective rule that gam previously
-/// approximated via `outer_scaled_tolerance(τ, |f_0|)`. Setting
+/// `0.0` (i.e. "off") by default. Setting `rel_cost = Some(τ)` is a
+/// scale-aware relative-to-objective rule. Setting
 /// `rel_initial_grad = Some(τ)` is the Eisenstat-Walker shape
 /// (terminate at a fixed fraction of the seed gradient norm).
 ///
@@ -3166,7 +3155,7 @@ impl GradientTolerance {
         }
     }
 
-    /// `‖g‖ ≤ τ * (1 + |f_0|)` — the mgcv `magic` relative-to-cost
+    /// `‖g‖ ≤ τ * (1 + |f_0|)` — a relative-to-initial-cost
     /// rule. Sets `abs = τ` so the absolute and relative thresholds
     /// degenerate to the same value at `f_0 = 0`.
     pub fn relative_to_cost(tau: f64) -> Self {
@@ -3209,9 +3198,8 @@ pub enum InitialMetric {
     /// or from a known curvature scale) but no per-coordinate
     /// information.
     Scalar(f64),
-    /// `H_0^{-1} = diag(diag)`. Per-coordinate scaling — the typical
-    /// shape for penalized likelihoods where the penalty matrix is
-    /// near-diagonal in the smoothing-parameter coordinate system.
+    /// `H_0^{-1} = diag(diag)`. Per-coordinate scaling for objectives
+    /// whose coordinates have different natural curvature scales.
     Diagonal(Array1<f64>),
     /// A complete dense `H_0^{-1}`. The matrix is validated for
     /// shape and finiteness at `run()` time; symmetry is not enforced
@@ -3513,7 +3501,7 @@ pub enum StationarityKind {
     /// tolerance — the stop reason is cost-flatness. Callers read the
     /// paired [`OptimizationStatus`] (`CostStallConverged` vs
     /// `CostStallFloor`) to learn whether that residual was nonetheless
-    /// KKT-stationary (gam#1089/gam#1082).
+    /// KKT-stationary.
     CostStall,
 }
 
@@ -3522,16 +3510,13 @@ pub enum StationarityKind {
 ///
 /// `Bfgs`'s primary exits all AND gradient-smallness with cost/step
 /// smallness (`stagnation_converged`, the `StallPolicy` block, and the
-/// small-step/flat-`f` test). On a flat, weakly-identified valley — the
-/// canonical case being a fully-penalized (double-penalty) REML surface
-/// with a shallow ridge — the objective flatlines while the projected
-/// gradient norm plateaus ABOVE tolerance, so none of those exits ever
-/// fires and BFGS grinds to `max_iterations` (gam#1089: a trivial
-/// n≈30..120 Gaussian fit emitting ~850k cost-only line-search probes
-/// until a wall-clock budget killed it).
+/// small-step/flat-`f` test). On a flat, weakly identified valley, the
+/// objective can stop changing while the projected gradient norm remains
+/// above tolerance, so none of those exits fires and BFGS exhausts
+/// `max_iterations`.
 ///
-/// This config adds the missing mgcv-style score-change stop, gated on
-/// the cost ALONE: watch the accepted-iterate objective and, once it
+/// This config adds a relative score-change stop, gated on the cost
+/// alone: watch the accepted-iterate objective and, once it
 /// stops improving by more than [`rel_tol`](Self::rel_tol) (relative to
 /// `1 + |best|`) over [`window`](Self::window) consecutive accepted
 /// steps, halt at the best-so-far iterate. Whether the halt is reported
@@ -3541,14 +3526,14 @@ pub enum StationarityKind {
 /// versus [`projected_grad_tol`](Self::projected_grad_tol): a stall whose
 /// projected gradient cleared that tolerance is a genuine KKT-stationary
 /// optimum on a flat surface, mirroring `opt`'s own
-/// `GradientTolerance { projected: true }` exit (gam#1082 — the
-/// projected norm is mandatory when bounds are active, since a bound-
+/// `GradientTolerance { projected: true }` exit. The projected norm is
+/// mandatory when bounds are active, since a bound-
 /// pinned near-separable optimum keeps a persistent out-of-bounds
-/// ∂V/∂ρ that inflates the raw norm forever).
+/// gradient component that inflates the raw norm forever.
 ///
 /// The optional [`stuck_grad_ceiling`](Self::stuck_grad_ceiling) /
-/// [`max_stuck_escapes`](Self::max_stuck_escapes) knobs cover the
-/// gam#1426 "stuck stall" case: a cost stall whose best-iterate
+/// [`max_stuck_escapes`](Self::max_stuck_escapes) knobs cover a "stuck
+/// stall": a cost stall whose best-iterate
 /// projected gradient is FAR above tolerance is not a flat valley but an
 /// inconsistent objective/gradient pair (e.g. an inner solve that hit
 /// its own iteration cap), and halting there would ship an under-solved
@@ -3575,7 +3560,7 @@ pub struct CostStallConfig {
     /// When `Some(ceiling)`, a filled-window stall whose best-iterate
     /// projected gradient exceeds `ceiling` is treated as a NON-flat
     /// "stuck" stall: instead of halting, the no-improvement window is
-    /// reset and the optimizer keeps descending (gam#1426). `None`
+    /// reset and the optimizer keeps descending. `None`
     /// disables the escape — every filled window halts. A stall at or
     /// below the ceiling always halts (as converged or floor per
     /// `projected_grad_tol`).
@@ -3700,10 +3685,9 @@ impl CostStallState {
     /// gradient norm)` into the guard. Returns `Some(halt)` when the
     /// objective has stalled over the configured window (and any
     /// stuck-stall escape budget is exhausted), or `None` to keep
-    /// descending. Mirrors gam's `CostStallGuard::observe` (gam#1089/
-    /// gam#1082/gam#1426) restricted to the domain-agnostic core: it does
-    /// NOT know about inner-solver convergence flags, so callers that need
-    /// the gam#1426 "untrustworthy iterate" gate should set a
+    /// descending. The guard deliberately does not know about
+    /// application-specific inner-solver convergence flags, so callers
+    /// that need an "untrustworthy iterate" gate should set a
     /// `stuck_grad_ceiling`, which captures the same "far-above-tolerance
     /// stall is not a flat valley" signal from the projected gradient
     /// alone.
@@ -3730,7 +3714,7 @@ impl CostStallState {
             self.best_grad = Some(grad.clone());
             self.best_grad_norm = grad_proj_norm;
         }
-        // KKT-stationary-at-bound (gam#1082): once the projected gradient
+        // KKT-stationary at a bound: once the projected gradient
         // clears the outer tolerance there is no FEASIBLE descent left, so
         // a still-decreasing raw cost is bound-pinned drift, not progress —
         // treat the step as no-improvement so the window can fill.
@@ -3773,7 +3757,7 @@ impl CostStallState {
             resolver.resolve(&summary) == StallResolution::Escape
                 && self.stuck_escapes < self.config.max_stuck_escapes
         } else if !converged {
-            // Stuck-stall escape (gam#1426): a filled window whose residual is
+            // Stuck-stall escape: a filled window whose residual is
             // far above tolerance is not a flat valley.
             match self.config.stuck_grad_ceiling {
                 Some(ceiling) => {
@@ -4266,6 +4250,7 @@ pub struct Solution {
 }
 
 impl Solution {
+    #[allow(clippy::too_many_arguments)]
     fn gradient_based(
         final_point: Array1<f64>,
         final_value: f64,
@@ -4375,12 +4360,10 @@ pub enum OptimizationStatus {
     ///
     /// This exists because `Bfgs`'s gradient/step exit ANDs
     /// gradient-smallness with cost-smallness, so on a flat, weakly
-    /// identified valley (e.g. a fully-penalized REML double-penalty
-    /// surface) the cost flatlines while `‖g‖` plateaus above tolerance
+    /// identified valley, the cost flatlines while `‖g‖` plateaus above tolerance
     /// and no gradient exit ever fires — BFGS burns its entire
-    /// `max_iterations` budget (gam#1089: a trivial fit emitting ~850k
-    /// cost-only evaluations). The cost-stall exit adds the missing
-    /// mgcv-style score-change stop; this status distinguishes
+    /// `max_iterations` budget. The cost-stall exit adds a relative
+    /// score-change stop; this status distinguishes
     /// "gradient hit tol" (`Converged`) from "cost stalled at a
     /// stationary floor" for callers that care.
     CostStallConverged,
@@ -4390,9 +4373,9 @@ pub enum OptimizationStatus {
     /// FLOOR with residual non-stationarity. Halting here is correct —
     /// no further cost progress is available — but the best iterate is
     /// NOT a stationary optimum, so this is NOT a success. The residual
-    /// gradient lies along weakly-identified directions that do not
-    /// reduce the objective (gam#1082: a bound-pinned near-separable
-    /// optimum whose raw gradient never vanishes).
+    /// gradient lies along weakly identified directions that do not
+    /// reduce the objective, as at a bound-pinned optimum whose raw
+    /// gradient never vanishes.
     CostStallFloor,
 }
 
@@ -4611,11 +4594,11 @@ pub enum ObjectiveEvalKind {
 /// source, the boundary was lossy: a caller with a rich typed error in
 /// hand had to render it to a `String` to cross into `opt`, and any
 /// layer that later needed to re-classify the same failure had nothing
-/// left to consult but the prose. In gam that produced a real defect —
-/// one error variant was classified recoverable at the site that could
+/// left to consult but the prose. That can produce a real defect: one
+/// error variant may be classified recoverable at the site that can
 /// still see its type and fatal at the site that could only see its
-/// text, so a trial the optimizer was equipped to survive aborted the
-/// entire fit (gam#2553). The verdict was carried in prose, and prose
+/// text, so a trial the optimizer is equipped to survive aborts the
+/// entire run. The verdict was carried in prose, and prose
 /// is one `format!` away from silently changing meaning.
 ///
 /// [`recoverable_from`](Self::recoverable_from) and
@@ -4877,9 +4860,9 @@ pub trait FixedPointObjective {
 /// `Send` so the same observer type can be parked behind `Box<dyn ...>`
 /// and shared across solver builders.
 ///
-/// gam uses this to drive its outer-aware inner-PIRLS cap from
-/// *accepted* outer iterations rather than every gradient eval (which
-/// conflates trial-eval probes with real outer steps).
+/// Consumers can use this to drive adaptive work from *accepted*
+/// iterations rather than every gradient evaluation, which would
+/// conflate trial probes with real optimizer steps.
 pub trait OptimizerObserver: Send {
     fn on_iteration_start(&mut self, _info: &IterationInfo) {}
     fn on_step_accepted(&mut self, _info: &StepInfo) {}
@@ -5330,10 +5313,9 @@ where
 const CACHE_POINT_EPS: f64 = 1e-14;
 
 /// Default capacity of the opt-in line-search value-probe memo (see
-/// `Bfgs::with_value_probe_memo`). Matches the size gam used for the
-/// external `value_probe_cache` it maintained around this solver: large
-/// enough to hold every distinct trial an iterate's line search probes
-/// across Wolfe-strategy switches, small enough that the linear bitwise
+/// `Bfgs::with_value_probe_memo`): large enough to hold every distinct
+/// trial an iterate's line search probes across Wolfe-strategy switches,
+/// small enough that the linear bitwise
 /// scan stays cheap relative to one full objective evaluation.
 const VALUE_PROBE_MEMO_DEFAULT_CAPACITY: usize = 256;
 
@@ -5546,14 +5528,13 @@ impl FirstOrderCache {
         // observes (deterministic objective, exact-bits key) while
         // skipping the duplicate work. Disabled memo ⇒ empty vec ⇒ the
         // scan is skipped entirely.
-        if self.probe_memo_capacity > 0 {
-            if let Some((_, outcome)) = self
+        if self.probe_memo_capacity > 0
+            && let Some((_, outcome)) = self
                 .probe_memo
                 .iter()
                 .find(|(px, _)| same_point_bits(px, x))
-            {
-                return outcome.to_result();
-            }
+        {
+            return outcome.to_result();
         }
         let result = obj_fn.eval_cost(x).and_then(recover_on_nonfinite_cost);
         self.remember_probe(x, &result);
@@ -6275,14 +6256,13 @@ impl NewtonTrustRegionCore {
         // (deferred from `with_initial_sample` to keep the builder
         // method infallible). A mismatched seed point quietly falls
         // through to the live evaluation.
-        if let Some((seed_x, seed_sample)) = self.initial_sample.as_ref() {
-            if approx_point(seed_x, &x_k) {
-                if let Err(err) = oracle.seed_from_sample(seed_x, seed_sample) {
-                    return Err(NewtonTrustRegionError::ObjectiveFailed {
-                        message: err.into_message(),
-                    });
-                }
-            }
+        if let Some((seed_x, seed_sample)) = self.initial_sample.as_ref()
+            && approx_point(seed_x, &x_k)
+            && let Err(err) = oracle.seed_from_sample(seed_x, seed_sample)
+        {
+            return Err(NewtonTrustRegionError::ObjectiveFailed {
+                message: err.into_message(),
+            });
         }
         let initial = oracle.eval_cost_grad_hessian(
             obj_fn,
@@ -6310,7 +6290,7 @@ impl NewtonTrustRegionCore {
                 return Err(NewtonTrustRegionError::NonFiniteObjective);
             }
             Err(err) => {
-                        let message = err.into_message();
+                let message = err.into_message();
                 return Err(NewtonTrustRegionError::ObjectiveFailed { message });
             }
         };
@@ -6495,16 +6475,8 @@ impl NewtonTrustRegionCore {
                 rejection_step_cap_fraction: None,
             };
             let hit_boundary = s_norm > 0.99 * trust_radius;
-            let step = policy.update(
-                trust_radius,
-                s_norm,
-                hit_boundary,
-                act_dec,
-                pred_dec,
-                f_k,
-            );
+            let step = policy.update(trust_radius, s_norm, hit_boundary, act_dec, pred_dec, f_k);
             trust_radius = step.new_radius;
-            let rho = step.rho;
             let accepted = step.accepted;
             if let Some(obs) = self.observer.as_mut() {
                 let info = StepInfo {
@@ -6790,9 +6762,7 @@ impl ArcCore {
         if !step_norm.is_finite() || step_norm <= 1e-16 {
             return None;
         }
-        let distortion = (&step - proposed_step)
-            .dot(&(&step - proposed_step))
-            .sqrt();
+        let distortion = (&step - proposed_step).dot(&(&step - proposed_step)).sqrt();
         let proposed_norm = proposed_step.dot(proposed_step).sqrt();
         let projection_changed = distortion > 1e-8 * (1.0 + proposed_norm);
         let (model_delta, _, model_gradient) =
@@ -6802,8 +6772,7 @@ impl ArcCore {
         if !model_delta.is_finite()
             || !model_gradient_norm.is_finite()
             || model_delta > 0.0
-            || (!projection_changed
-                && model_gradient_norm > model_gradient_target.max(1e-14))
+            || (!projection_changed && model_gradient_norm > model_gradient_target.max(1e-14))
         {
             return None;
         }
@@ -6840,9 +6809,8 @@ impl ArcCore {
         let lambda_lower = -spectrum.eigenvalues[0];
         let target_norm = lambda_lower / sigma;
         let gradient_norm = gradient.dot(gradient).sqrt();
-        let gradient_floor = gradient_norm
-            * (spectrum.eigenvalues.len() as f64).sqrt()
-            * f64::EPSILON;
+        let gradient_floor =
+            gradient_norm * (spectrum.eigenvalues.len() as f64).sqrt() * f64::EPSILON;
         let mut base = Array1::<f64>::zeros(spectral_gradient.len());
         let mut minimum_gradient = 0.0_f64;
         let mut minimum_index = 0usize;
@@ -6861,8 +6829,9 @@ impl ArcCore {
         {
             return None;
         }
-        let missing_norm =
-            (target_norm * target_norm - base_norm * base_norm).max(0.0).sqrt();
+        let missing_norm = (target_norm * target_norm - base_norm * base_norm)
+            .max(0.0)
+            .sqrt();
         if !missing_norm.is_finite() || missing_norm <= 0.0 {
             return None;
         }
@@ -6886,8 +6855,7 @@ impl ArcCore {
         primary: &Array1<f64>,
     ) -> Option<Array1<f64>> {
         let spectrum = ReducedSymmetricSpectrum::decompose(hessian, Some(active))?;
-        let (plus, minus) =
-            self.arc_hard_case_steps(&spectrum, gradient, sigma, gradient.len())?;
+        let (plus, minus) = self.arc_hard_case_steps(&spectrum, gradient, sigma, gradient.len())?;
         let plus_distance = (&plus - primary).dot(&(&plus - primary));
         let minus_distance = (&minus - primary).dot(&(&minus - primary));
         if plus_distance > minus_distance {
@@ -6978,10 +6946,8 @@ impl ArcCore {
         if use_mask && !any_free_variables(active) {
             return Some(Array1::<f64>::zeros(g.len()));
         }
-        let spectrum = ReducedSymmetricSpectrum::decompose(
-            h,
-            if use_mask { Some(active) } else { None },
-        )?;
+        let spectrum =
+            ReducedSymmetricSpectrum::decompose(h, if use_mask { Some(active) } else { None })?;
         if spectrum.has_resolvable_negative_curvature() {
             // Global minimizer of
             //   g's + 1/2 s'Hs + sigma/3 ||s||^3
@@ -6996,8 +6962,7 @@ impl ArcCore {
             let spectral_gradient = spectrum.gradient_coordinates(g);
             let minimum = spectrum.eigenvalues[0];
             let lambda_lower = -minimum;
-            let step = if let Some((plus, minus)) =
-                self.arc_hard_case_steps(&spectrum, g, sigma, n)
+            let step = if let Some((plus, minus)) = self.arc_hard_case_steps(&spectrum, g, sigma, n)
             {
                 // The sign of a minimum eigenvector is arbitrary. At a weakly
                 // active bound one sign can point outside the box and project
@@ -7028,10 +6993,9 @@ impl ArcCore {
                     }
                     Some(norm_sq.sqrt() - lambda / sigma)
                 };
-                let mut span = (sigma * g_norm).sqrt().max(
-                    8.0 * spectrum.numerical_floor.max(f64::EPSILON)
-                        * (1.0 + lambda_lower),
-                );
+                let mut span = (sigma * g_norm)
+                    .sqrt()
+                    .max(8.0 * spectrum.numerical_floor.max(f64::EPSILON) * (1.0 + lambda_lower));
                 let mut lambda_high = lambda_lower + span;
                 let mut bracketed = false;
                 for _ in 0..128 {
@@ -7053,15 +7017,12 @@ impl ArcCore {
                     } else {
                         lambda_high = lambda_mid;
                     }
-                    if lambda_high - lambda_low
-                        <= 8.0 * f64::EPSILON * (1.0 + lambda_high.abs())
-                    {
+                    if lambda_high - lambda_low <= 8.0 * f64::EPSILON * (1.0 + lambda_high.abs()) {
                         break;
                     }
                 }
                 let spectral_step = Array1::from_shape_fn(spectral_gradient.len(), |index| {
-                    -spectral_gradient[index]
-                        / (spectrum.eigenvalues[index] + lambda_high)
+                    -spectral_gradient[index] / (spectrum.eigenvalues[index] + lambda_high)
                 });
                 spectrum.embed_step(&spectral_step, n)
             };
@@ -7082,8 +7043,7 @@ impl ArcCore {
                 && step_norm.is_finite()
                 && step_norm > 0.0
                 && model_gradient_norm.is_finite()
-                && model_gradient_norm
-                    <= self.theta * step_norm * step_norm + model_gradient_floor
+                && model_gradient_norm <= self.theta * step_norm * step_norm + model_gradient_floor
             {
                 return Some(step);
             }
@@ -7248,14 +7208,13 @@ impl ArcCore {
         // Seed the cache from a precomputed sample when the caller
         // supplied one via `with_initial_sample`. See the parallel
         // logic in `NewtonTrustRegionCore::run` for the full rationale.
-        if let Some((seed_x, seed_sample)) = self.initial_sample.as_ref() {
-            if approx_point(seed_x, &x_k) {
-                if let Err(err) = oracle.seed_from_sample(seed_x, seed_sample) {
-                    return Err(ArcError::ObjectiveFailed {
-                        message: err.into_message(),
-                    });
-                }
-            }
+        if let Some((seed_x, seed_sample)) = self.initial_sample.as_ref()
+            && approx_point(seed_x, &x_k)
+            && let Err(err) = oracle.seed_from_sample(seed_x, seed_sample)
+        {
+            return Err(ArcError::ObjectiveFailed {
+                message: err.into_message(),
+            });
         }
         let initial = oracle.eval_cost_grad_hessian(
             obj_fn,
@@ -7283,7 +7242,7 @@ impl ArcCore {
                 return Err(ArcError::NonFiniteObjective);
             }
             Err(err) => {
-                        let message = err.into_message();
+                let message = err.into_message();
                 return Err(ArcError::ObjectiveFailed { message });
             }
         };
@@ -7322,14 +7281,14 @@ impl ArcCore {
             // without this hook, callers driving outer-loop bookkeeping
             // off `on_iteration_start` see only the pre-loop call from
             // the seed and miss every real ARC iteration.
-            if k > 0 {
-                if let Some(obs) = self.observer.as_mut() {
-                    obs.on_iteration_start(&IterationInfo {
-                        iter: k,
-                        func_evals,
-                        grad_evals,
-                    });
-                }
+            if k > 0
+                && let Some(obs) = self.observer.as_mut()
+            {
+                obs.on_iteration_start(&IterationInfo {
+                    iter: k,
+                    func_evals,
+                    grad_evals,
+                });
             }
             let g_proj_k = self.projected_gradient(&x_k, &g_k);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
@@ -7370,13 +7329,8 @@ impl ArcCore {
                     self.escalate_sigma_on_failure(&mut model_failure_streak);
                     continue;
                 }
-                match self.solve_arc_subproblem(
-                    h_model,
-                    &g_proj_k,
-                    self.sigma,
-                    Some(&active),
-                    &x_k,
-                ) {
+                match self.solve_arc_subproblem(h_model, &g_proj_k, self.sigma, Some(&active), &x_k)
+                {
                     Some(s) => s,
                     None => {
                         // Failed subproblem solve: moderate growth first, stronger only
@@ -7397,13 +7351,9 @@ impl ArcCore {
                 }
             };
 
-            let Some(mut candidate) = self.prepare_arc_trial(
-                &x_k,
-                &step,
-                &g_proj_k,
-                h_model,
-                &active,
-            ) else {
+            let Some(mut candidate) =
+                self.prepare_arc_trial(&x_k, &step, &g_proj_k, h_model, &active)
+            else {
                 self.escalate_sigma_on_failure(&mut model_failure_streak);
                 continue;
             };
@@ -7459,22 +7409,13 @@ impl ArcCore {
                     // contract.  This is the other mathematical hard-case
                     // solution, not a first-order or approximate fallback.
                     let Some(opposing_step) = self.opposing_arc_hard_case_step(
-                        h_model,
-                        &g_proj_k,
-                        self.sigma,
-                        &active,
-                        &step,
+                        h_model, &g_proj_k, self.sigma, &active, &step,
                     ) else {
                         self.escalate_sigma_on_failure(&mut model_failure_streak);
                         continue;
                     };
-                    let Some(antipodal_candidate) = self.prepare_arc_trial(
-                        &x_k,
-                        &opposing_step,
-                        &g_proj_k,
-                        h_model,
-                        &active,
-                    )
+                    let Some(antipodal_candidate) =
+                        self.prepare_arc_trial(&x_k, &opposing_step, &g_proj_k, h_model, &active)
                     else {
                         self.escalate_sigma_on_failure(&mut model_failure_streak);
                         continue;
@@ -7495,13 +7436,13 @@ impl ArcCore {
                             continue;
                         }
                         Err(err) => {
-                        let message = err.into_message();
+                            let message = err.into_message();
                             return Err(ArcError::ObjectiveFailed { message });
                         }
                     }
                 }
                 Err(err) => {
-                        let message = err.into_message();
+                    let message = err.into_message();
                     return Err(ArcError::ObjectiveFailed { message });
                 }
             };
@@ -7737,16 +7678,15 @@ struct BfgsCore {
     /// equivalent of the historical "objective-side fake-finite-cost"
     /// pattern: shortening the BFGS direction here keeps the line search
     /// honest (no fake costs poisoning Wolfe brackets) while letting the
-    /// caller impose per-axis budgets that differ wildly across parameter
-    /// blocks (e.g. log-λ wants `|d|≤5` but log-κ wants `|d|≤ln 2`).
+    /// caller impose per-axis budgets that differ widely across parameter
+    /// blocks.
     axis_step_caps: Option<Array1<f64>>,
     /// Gradient-independent cost-stall termination (see
     /// [`CostStallConfig`] and `Bfgs::with_cost_stall`). `None` (default)
     /// preserves the historical behavior exactly: the guard is not
     /// consulted and no extra bookkeeping runs. `Some(state)` folds each
     /// accepted iterate into the guard and halts at the best-so-far
-    /// iterate when the objective flatlines over the configured window
-    /// (gam#1089/gam#1082).
+    /// iterate when the objective flatlines over the configured window.
     cost_stall: Option<CostStallState>,
     /// Consumer resolution of a filled cost-stall window; `None` = the
     /// built-in `stuck_grad_ceiling` behaviour, unchanged.
@@ -7991,6 +7931,7 @@ impl BfgsCore {
 
     // Attempt one trust-region dogleg step. Updates trust radius and, on success,
     // returns new (x, f, g) and updates `b_inv` cautiously. On failure, may shrink Δ.
+    #[allow(clippy::too_many_arguments)]
     fn try_trust_region_step<ObjFn>(
         &mut self,
         obj_fn: &mut ObjFn,
@@ -8131,19 +8072,17 @@ impl BfgsCore {
                     for i in 0..n {
                         b_inv[[i, i]] *= 1.0 + 1e-3;
                     }
-                } else {
-                    if !apply_inverse_bfgs_update_in_place(
-                        b_inv,
-                        &s_update,
-                        &y_tilde,
-                        &mut b_inv_backup,
-                    ) {
-                        b_inv.assign(&b_inv_backup);
-                        for i in 0..n {
-                            b_inv[[i, i]] += 1e-6;
-                        }
-                        update_status = "reverted";
+                } else if !apply_inverse_bfgs_update_in_place(
+                    b_inv,
+                    &s_update,
+                    &y_tilde,
+                    &mut b_inv_backup,
+                ) {
+                    b_inv.assign(&b_inv_backup);
+                    for i in 0..n {
+                        b_inv[[i, i]] += 1e-6;
                     }
+                    update_status = "reverted";
                 }
                 if !has_finite_positive_diagonal(b_inv) {
                     for i in 0..n {
@@ -8152,7 +8091,7 @@ impl BfgsCore {
                 }
             } else {
                 self.spd_fail_seen = true;
-                self.chol_fail_iters = self.chol_fail_iters + 1;
+                self.chol_fail_iters += 1;
                 update_status = "skipped";
             }
             if self.spd_fail_seen && self.chol_fail_iters >= 2 {
@@ -8414,7 +8353,7 @@ impl BfgsCore {
         let mut p = &p_u + &(s * t);
         let p_norm = p.dot(&p).sqrt();
         if p_norm.is_finite() && p_norm > delta && delta.is_finite() && delta > 0.0 {
-            p = p * (delta / p_norm);
+            p *= delta / p_norm;
         }
         let pred_dec = self.trust_region_predicted_decrease(
             b_inv,
@@ -8561,14 +8500,14 @@ impl BfgsCore {
         // method to keep `with_initial_sample` infallible). A
         // mismatched seed point quietly falls through to the live
         // evaluation.
-        if let Some((seed_x, seed_sample)) = self.initial_sample.as_ref() {
-            if approx_point(seed_x, &x_k) {
-                oracle
-                    .seed_from_sample(seed_x, seed_sample)
-                    .map_err(|err| BfgsError::ObjectiveFailed {
-                        message: err.into_message(),
-                    })?;
-            }
+        if let Some((seed_x, seed_sample)) = self.initial_sample.as_ref()
+            && approx_point(seed_x, &x_k)
+        {
+            oracle
+                .seed_from_sample(seed_x, seed_sample)
+                .map_err(|err| BfgsError::ObjectiveFailed {
+                    message: err.into_message(),
+                })?;
         }
         let initial = oracle
             .eval_cost_grad(obj_fn, &x_k, &mut func_evals, &mut grad_evals)
@@ -8667,8 +8606,19 @@ impl BfgsCore {
             self.refresh_local_mode(g_norm);
             if g_norm < effective_tol {
                 let sol = Solution::gradient_based(
-                    x_k, f_k, g_k, g_norm, None, k, func_evals, grad_evals, 0,
-                    TerminationReason::GradientTolerance { grad_norm: g_norm, threshold: effective_tol },
+                    x_k,
+                    f_k,
+                    g_k,
+                    g_norm,
+                    None,
+                    k,
+                    func_evals,
+                    grad_evals,
+                    0,
+                    TerminationReason::GradientTolerance {
+                        grad_norm: g_norm,
+                        threshold: effective_tol,
+                    },
                 );
                 log::info!(
                     "[BFGS] Converged by gradient: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
@@ -8853,7 +8803,10 @@ impl BfgsCore {
                                                 func_evals,
                                                 grad_evals,
                                                 0,
-                                                TerminationReason::GradientTolerance { grad_norm: gb_norm, threshold: effective_tol },
+                                                TerminationReason::GradientTolerance {
+                                                    grad_norm: gb_norm,
+                                                    threshold: effective_tol,
+                                                },
                                             ));
                                         }
                                         x_k = self.project_point(&b.x);
@@ -8895,7 +8848,10 @@ impl BfgsCore {
                                             func_evals,
                                             grad_evals,
                                             0,
-                                            TerminationReason::GradientTolerance { grad_norm: g_proj_new.dot(&g_proj_new).sqrt(), threshold: effective_tol },
+                                            TerminationReason::GradientTolerance {
+                                                grad_norm: g_proj_new.dot(&g_proj_new).sqrt(),
+                                                threshold: effective_tol,
+                                            },
                                         ));
                                     }
                                     x_k = x_new;
@@ -8936,7 +8892,9 @@ impl BfgsCore {
                                             func_evals,
                                             grad_evals,
                                             0,
-                                            TerminationReason::LineSearchFailed { grad_norm: gb_proj.dot(&gb_proj).sqrt() },
+                                            TerminationReason::LineSearchFailed {
+                                                grad_norm: gb_proj.dot(&gb_proj).sqrt(),
+                                            },
                                         );
                                     }
                                     log::warn!(
@@ -9050,7 +9008,10 @@ impl BfgsCore {
                                             func_evals,
                                             grad_evals,
                                             0,
-                                            TerminationReason::GradientTolerance { grad_norm: g_proj_new.dot(&g_proj_new).sqrt(), threshold: effective_tol },
+                                            TerminationReason::GradientTolerance {
+                                                grad_norm: g_proj_new.dot(&g_proj_new).sqrt(),
+                                                threshold: effective_tol,
+                                            },
                                         ));
                                     }
                                     x_k = x_new;
@@ -9086,7 +9047,10 @@ impl BfgsCore {
                                                 func_evals,
                                                 grad_evals,
                                                 0,
-                                                TerminationReason::GradientTolerance { grad_norm: gb_norm, threshold: effective_tol },
+                                                TerminationReason::GradientTolerance {
+                                                    grad_norm: gb_norm,
+                                                    threshold: effective_tol,
+                                                },
                                             ));
                                         }
                                         x_k = self.project_point(&b.x);
@@ -9130,7 +9094,9 @@ impl BfgsCore {
                                             func_evals,
                                             grad_evals,
                                             0,
-                                            TerminationReason::LineSearchFailed { grad_norm: b_proj.dot(&b_proj).sqrt() },
+                                            TerminationReason::LineSearchFailed {
+                                                grad_norm: b_proj.dot(&b_proj).sqrt(),
+                                            },
                                         );
                                     }
                                     log::warn!(
@@ -9246,7 +9212,7 @@ impl BfgsCore {
                                     Ok(sample) => sample,
                                     Err(err) if err.is_recoverable() => continue,
                                     Err(err) => {
-                        let message = err.into_message();
+                                        let message = err.into_message();
                                         return Err(BfgsError::ObjectiveFailed { message });
                                     }
                                 };
@@ -9293,7 +9259,7 @@ impl BfgsCore {
                                         (f64::NAN, Array1::zeros(x_scaled.len()))
                                     }
                                     Err(err) => {
-                        let message = err.into_message();
+                                        let message = err.into_message();
                                         return Err(BfgsError::ObjectiveFailed { message });
                                     }
                                 };
@@ -9381,51 +9347,47 @@ impl BfgsCore {
                     func_evals,
                     grad_evals,
                     0,
-                    TerminationReason::GradientTolerance { grad_norm: g_proj_next.dot(&g_proj_next).sqrt(), threshold: effective_tol },
+                    TerminationReason::GradientTolerance {
+                        grad_norm: g_proj_next.dot(&g_proj_next).sqrt(),
+                        threshold: effective_tol,
+                    },
                 ));
             }
 
-            // Gradient-independent cost-stall exit (gam#1089/gam#1082).
+            // Gradient-independent cost-stall exit.
             // Fold this accepted iterate into the guard, using the
             // bound-PROJECTED gradient norm (the KKT residual) so a
             // bound-pinned near-separable optimum whose raw gradient never
             // vanishes can still certify. When the guard reports a stall it
             // returns the best-so-far iterate; the stationarity verdict
             // decides `CostStallConverged` (success) vs `CostStallFloor`.
-            if self.cost_stall.is_some() {
+            if let Some(cost_stall) = self.cost_stall.as_mut() {
                 let g_proj_norm = g_proj_next.dot(&g_proj_next).sqrt();
                 // Move the resolver out for the call: holding `&mut
                 // self.stall_resolver` across the rest of this loop body would
                 // borrow `*self` for longer than the call needs.
                 let mut resolver_slot = self.stall_resolver.take();
-                let halt = self
-                    .cost_stall
-                    .as_mut()
-                    .expect("cost_stall guard presence checked above")
-                    .observe(
-                        &x_next,
-                        f_next,
-                        &g_next,
-                        g_proj_norm,
-                        resolver_slot.as_deref_mut(),
-                    );
+                let halt = cost_stall.observe(
+                    &x_next,
+                    f_next,
+                    &g_next,
+                    g_proj_norm,
+                    resolver_slot.as_deref_mut(),
+                );
                 self.stall_resolver = resolver_slot;
                 if let Some(halt) = halt {
-                    let stall_cfg = self
-                        .cost_stall
-                        .as_ref()
-                        .expect("cost_stall guard presence checked above");
+                    let stall_cfg = &cost_stall.config;
                     let reason = if halt.converged {
                         TerminationReason::CostStallStationary {
                             grad_norm: halt.grad_norm,
-                            threshold: stall_cfg.config.projected_grad_tol,
-                            window: stall_cfg.config.window,
+                            threshold: stall_cfg.projected_grad_tol,
+                            window: stall_cfg.window,
                         }
                     } else {
                         TerminationReason::CostStallFloor {
                             grad_norm: halt.grad_norm,
-                            threshold: stall_cfg.config.projected_grad_tol,
-                            window: stall_cfg.config.window,
+                            threshold: stall_cfg.projected_grad_tol,
+                            window: stall_cfg.window,
                         }
                     };
                     let sol = Solution::gradient_based(
@@ -9547,26 +9509,24 @@ impl BfgsCore {
                                 "[BFGS] s^T y_tilde non-positive/tiny; skipping update and inflating diag."
                             );
                             update_status = "skipped";
-                            self.chol_fail_iters = self.chol_fail_iters + 1;
+                            self.chol_fail_iters += 1;
                             for i in 0..n {
                                 b_inv[[i, i]] *= 1.0 + 1e-3;
                             }
-                        } else {
-                            if !apply_inverse_bfgs_update_in_place(
-                                &mut b_inv,
-                                &s_k,
-                                &y_tilde,
-                                &mut b_inv_backup,
-                            ) {
-                                b_inv.assign(&b_inv_backup);
-                                for i in 0..n {
-                                    b_inv[[i, i]] += 1e-6;
-                                }
-                                update_status = "reverted";
+                        } else if !apply_inverse_bfgs_update_in_place(
+                            &mut b_inv,
+                            &s_k,
+                            &y_tilde,
+                            &mut b_inv_backup,
+                        ) {
+                            b_inv.assign(&b_inv_backup);
+                            for i in 0..n {
+                                b_inv[[i, i]] += 1e-6;
                             }
+                            update_status = "reverted";
                         }
                     } else {
-                        self.chol_fail_iters = self.chol_fail_iters + 1;
+                        self.chol_fail_iters += 1;
                         self.spd_fail_seen = true;
                         log::warn!("[BFGS] B_inv not SPD after ridge; skipping update this iter.");
                         update_status = "skipped";
@@ -9895,10 +9855,9 @@ where
     /// parameter dimension.
     ///
     /// Use this when different parameter blocks have very different natural
-    /// step magnitudes — e.g. a joint solver over log-λ (natural step ≈ 5)
-    /// and log-κ (natural step ≈ ln 2): a single isotropic trust radius
-    /// can't simultaneously give λ headroom while keeping κ from
-    /// oscillating across orders of magnitude per iter. This is the
+    /// step magnitudes: a single isotropic trust radius cannot give a
+    /// wide-scale block enough headroom while keeping a narrow-scale block
+    /// from oscillating across orders of magnitude per iteration. This is the
     /// principled replacement for "objective-side fake-finite-cost on
     /// overreach" patterns: shortening the BFGS direction up front keeps
     /// the line search honest (no sentinel costs poisoning Wolfe brackets).
@@ -9910,11 +9869,9 @@ where
     /// Enable gradient-independent cost-stall termination.
     ///
     /// BFGS's built-in exits all AND gradient-smallness with cost/step
-    /// smallness, so on a flat, weakly-identified valley (the canonical
-    /// case being a fully-penalized REML double-penalty surface) the cost
+    /// smallness, so on a flat, weakly identified valley the cost
     /// flatlines while the projected gradient plateaus above tolerance and
-    /// BFGS grinds all the way to `max_iterations` (gam#1089: ~850k
-    /// cost-only probes on a trivial fit). With this enabled the solver
+    /// BFGS can grind all the way to `max_iterations`. With this enabled the solver
     /// folds each accepted iterate into a [`CostStallConfig`] guard and,
     /// once the objective stops improving by more than `rel_tol` over
     /// `window` consecutive accepted steps, halts at the best-so-far
@@ -9924,8 +9881,8 @@ where
     /// bound-projected gradient cleared `projected_grad_tol` (a genuine
     /// stationary optimum on a flat surface) or
     /// [`OptimizationStatus::CostStallFloor`] otherwise (a
-    /// weakly-identified floor with residual non-stationarity —
-    /// gam#1082). Both cases return `Ok(Solution)`; callers read the
+    /// weakly identified floor with residual non-stationarity). Both
+    /// cases return `Ok(Solution)`; callers read the
     /// `status_hint` to tell converged from floor.
     ///
     /// Calling this twice replaces the previous config. Not calling it
@@ -9961,9 +9918,7 @@ where
     /// cleared on every accepted step (the iterate moves, so old probes
     /// cannot recur) and evicts oldest-first at capacity.
     ///
-    /// Opt-in so cheap objectives pay no bookkeeping. This is the native
-    /// equivalent of the `value_probe_cache` gam maintained around this
-    /// solver.
+    /// Opt-in so cheap objectives pay no bookkeeping.
     pub fn with_value_probe_memo(mut self) -> Self {
         self.core.value_probe_memo_capacity = Some(VALUE_PROBE_MEMO_DEFAULT_CAPACITY);
         self
@@ -10472,7 +10427,7 @@ impl MatrixFreeTrustRegionCore {
                 return Err(MatrixFreeTrustRegionError::NonFiniteObjective);
             }
             Err(err) => {
-                        let message = err.into_message();
+                let message = err.into_message();
                 return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
             }
         };
@@ -10528,22 +10483,21 @@ impl MatrixFreeTrustRegionCore {
             // seed; without this hook observers driving outer
             // bookkeeping (e.g. iter-aware inner caps) miss every real
             // outer iteration.
-            if k > 0 {
-                if let Some(obs) = self.observer.as_mut() {
-                    obs.on_iteration_start(&IterationInfo {
-                        iter: k,
-                        func_evals,
-                        grad_evals,
-                    });
-                }
+            if k > 0
+                && let Some(obs) = self.observer.as_mut()
+            {
+                obs.on_iteration_start(&IterationInfo {
+                    iter: k,
+                    func_evals,
+                    grad_evals,
+                });
             }
             let g_proj = self.projected_gradient(&x_k, &sample.gradient);
             let g_proj_norm = g_proj.dot(&g_proj).sqrt();
             let active = self.active_mask_vec(&x_k, &sample.gradient);
             let mut negative_curvature_step = None;
             if g_proj_norm <= effective_tol {
-                let curvature_active =
-                    self.second_order_active_mask_vec(&x_k, &sample.gradient);
+                let curvature_active = self.second_order_active_mask_vec(&x_k, &sample.gradient);
                 match reduced_negative_curvature_step(
                     &sample.hessian,
                     &curvature_active,
@@ -10765,7 +10719,7 @@ impl MatrixFreeTrustRegionCore {
                     continue;
                 }
                 Err(err) => {
-                        let message = err.into_message();
+                    let message = err.into_message();
                     return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
                 }
             };
@@ -10807,8 +10761,7 @@ impl MatrixFreeTrustRegionCore {
             // justification.
             let f_scale = (1.0 + sample.value.abs()) * f64::EPSILON;
             if predicted <= ARC_NUMERICAL_CONV_FACTOR * f_scale {
-                let curvature_active =
-                    self.second_order_active_mask_vec(&x_k, &sample.gradient);
+                let curvature_active = self.second_order_active_mask_vec(&x_k, &sample.gradient);
                 match reduced_negative_curvature_step(
                     &sample.hessian,
                     &curvature_active,
@@ -10855,7 +10808,7 @@ impl MatrixFreeTrustRegionCore {
                                 continue;
                             }
                             Err(err) => {
-                        let message = err.into_message();
+                                let message = err.into_message();
                                 return Err(MatrixFreeTrustRegionError::ObjectiveFailed {
                                     message,
                                 });
@@ -10998,7 +10951,7 @@ impl MatrixFreeTrustRegionCore {
                     continue;
                 }
                 Err(err) => {
-                        let message = err.into_message();
+                    let message = err.into_message();
                     return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
                 }
             };
@@ -11040,8 +10993,7 @@ impl MatrixFreeTrustRegionCore {
             let g_proj_trial = self.projected_gradient(&x_trial, &trial.gradient);
             let g_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
             if g_trial_norm.is_finite() && g_trial_norm <= effective_tol {
-                let trial_active =
-                    self.second_order_active_mask_vec(&x_trial, &trial.gradient);
+                let trial_active = self.second_order_active_mask_vec(&x_trial, &trial.gradient);
                 match reduced_negative_curvature_step(
                     &trial.hessian,
                     &trial_active,
@@ -11222,6 +11174,7 @@ impl CgScratch {
 /// Caller-owned scratch buffers eliminate per-CG-iter allocations: the
 /// previous implementation allocated `p_new`, `r_new`, and
 /// `-&r_new + beta * &d` on every iteration.
+#[allow(clippy::too_many_arguments)]
 fn operator_steihaug_toint_step(
     op: &OperatorHandle,
     g_proj: &Array1<f64>,
@@ -11568,10 +11521,11 @@ impl FixedPointCore {
                     }
                 }
             };
-            let value = recover_on_nonfinite_cost(sample.value)
-                .map_err(|err| FixedPointError::ObjectiveFailed {
+            let value = recover_on_nonfinite_cost(sample.value).map_err(|err| {
+                FixedPointError::ObjectiveFailed {
                     message: err.into_message(),
-                })?;
+                }
+            })?;
             if sample.step.len() != x_k.len() {
                 return Err(FixedPointError::StepDimensionMismatch {
                     expected: x_k.len(),
@@ -11742,9 +11696,9 @@ where
             Ok(f) => f,
             Err(err) if err.is_recoverable() => f64::NAN,
             Err(err) => {
-                        let message = err.into_message();
+                let message = err.into_message();
                 return Err(LineSearchError::ObjectiveFailed {
-                    message: message,
+                    message,
                     func_evals,
                     grad_evals,
                 });
@@ -11819,10 +11773,8 @@ where
                 func_evals,
                 grad_evals,
             );
-            if r.is_err() {
-                if best.f.is_finite() {
-                    core.global_best = Some(best.clone());
-                }
+            if r.is_err() && best.f.is_finite() {
+                core.global_best = Some(best.clone());
             }
             return r;
         }
@@ -11846,9 +11798,9 @@ where
                     continue;
                 }
                 Err(err) => {
-                        let message = err.into_message();
+                    let message = err.into_message();
                     return Err(LineSearchError::ObjectiveFailed {
-                        message: message,
+                        message,
                         func_evals,
                         grad_evals,
                     });
@@ -11963,10 +11915,8 @@ where
                 func_evals,
                 grad_evals,
             );
-            if r.is_err() {
-                if best.f.is_finite() {
-                    core.global_best = Some(best.clone());
-                }
+            if r.is_err() && best.f.is_finite() {
+                core.global_best = Some(best.clone());
             }
             return r;
         }
@@ -12056,9 +12006,9 @@ where
             Ok(f) => f,
             Err(err) if err.is_recoverable() => f64::NAN,
             Err(err) => {
-                        let message = err.into_message();
+                let message = err.into_message();
                 return Err(LineSearchError::ObjectiveFailed {
-                    message: message,
+                    message,
                     func_evals,
                     grad_evals,
                 });
@@ -12116,7 +12066,7 @@ where
                     Err(err) => {
                         let message = err.into_message();
                         return Err(LineSearchError::ObjectiveFailed {
-                            message: message,
+                            message,
                             func_evals,
                             grad_evals,
                         });
@@ -12349,13 +12299,11 @@ where
             let (f_j, g_j) =
                 match bfgs_eval_cost_grad(oracle, obj_fn, &x_j, &mut func_evals, &mut grad_evals) {
                     Ok(sample) => sample,
-                    Err(err) if err.is_recoverable() => {
-                        (f64::NAN, Array1::zeros(x_j.len()))
-                    }
+                    Err(err) if err.is_recoverable() => (f64::NAN, Array1::zeros(x_j.len())),
                     Err(err) => {
                         let message = err.into_message();
                         return Err(LineSearchError::ObjectiveFailed {
-                            message: message,
+                            message,
                             func_evals,
                             grad_evals,
                         });
@@ -12449,7 +12397,7 @@ where
                     Err(err) => {
                         let message = err.into_message();
                         return Err(LineSearchError::ObjectiveFailed {
-                            message: message,
+                            message,
                             func_evals,
                             grad_evals,
                         });
@@ -12589,9 +12537,9 @@ where
             Ok(f) => f,
             Err(err) if err.is_recoverable() => f64::NAN,
             Err(err) => {
-                        let message = err.into_message();
+                let message = err.into_message();
                 return Err(LineSearchError::ObjectiveFailed {
-                    message: message,
+                    message,
                     func_evals,
                     grad_evals,
                 });
@@ -12651,7 +12599,7 @@ where
                     Err(err) => {
                         let message = err.into_message();
                         return Err(LineSearchError::ObjectiveFailed {
-                            message: message,
+                            message,
                             func_evals,
                             grad_evals,
                         });
@@ -12857,23 +12805,23 @@ mod tests {
     use super::{
         AcceptedStep, ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, BacktrackConfig,
         BatchZerothOrderObjective, Bfgs, BfgsError, Bounds, CostStallConfig, CostStallState,
-        CostStallSummary, StallResolution, StallResolver, TerminationReason,
-        FallbackPolicy, FiniteDiffGradient, FirstOrderCache, FirstOrderObjective,
+        CostStallSummary, FallbackPolicy, FiniteDiffGradient, FirstOrderCache, FirstOrderObjective,
         FirstOrderObjectiveInto, FirstOrderSample, FirstOrderWorkspace, FixedPoint,
         FixedPointObjective, FixedPointSample, FixedPointStatus, FusedObjective, GradientTolerance,
-        HessianFallbackPolicy, HessianMaterialization, HessianOperator, HessianValue, InitialMetric,
-        IterationInfo, LineSearchFailureReason, MatrixFreeTrustRegion, MatrixFreeTrustRegionError,
-        MaxIterations, NewtonTrustRegion, ObjectiveEvalError, OperatorObjective, OperatorSample,
-        OptimizationStatus, OptimizerObserver, Problem, Profile, RidgeSchedule, SecondOrderObjective,
-        SecondOrderObjectiveInto, SecondOrderProblem, SecondOrderSample, SecondOrderWorkspace,
-        Solution, StationarityKind, StepInfo, Tolerance, ZerothOrderObjective,
+        HessianFallbackPolicy, HessianMaterialization, HessianOperator, HessianValue,
+        InitialMetric, IterationInfo, LineSearchFailureReason, MatrixFreeTrustRegion,
+        MatrixFreeTrustRegionError, MaxIterations, NewtonTrustRegion, ObjectiveEvalError,
+        OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver, Problem, Profile,
+        RidgeSchedule, SecondOrderObjective, SecondOrderObjectiveInto, SecondOrderProblem,
+        SecondOrderSample, SecondOrderWorkspace, Solution, StallResolution, StallResolver,
+        StationarityKind, StepInfo, TerminationReason, Tolerance, ZerothOrderObjective,
         backtracking_line_search, escalate_ridge, optimize,
     };
     use ndarray::{Array1, Array2, array};
     use spectral::prelude::*;
 
     // --- Test Harness: Python scipy.optimize Comparison Setup ---
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::Command;
     use std::sync::OnceLock;
     use std::sync::{Arc, Mutex};
@@ -12933,15 +12881,7 @@ mod tests {
         static PYTHON_PATH: OnceLock<Result<String, String>> = OnceLock::new();
         PYTHON_PATH
             .get_or_init(|| {
-                let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                let venv_python = crate_dir.join(".venv/bin/python");
-                let venv_python_str = venv_python.display().to_string();
-                let python = if Path::new(&venv_python).exists() {
-                    venv_python_str.clone()
-                } else {
-                    "python3".to_string()
-                };
-
+                let python = "python3".to_string();
                 let check = Command::new(&python)
                     .arg("-c")
                     .arg("import numpy, scipy")
@@ -12952,39 +12892,10 @@ mod tests {
                     return Ok(python);
                 }
 
-                if python != venv_python_str {
-                    let venv = Command::new("python3")
-                        .arg("-m")
-                        .arg("venv")
-                        .arg(crate_dir.join(".venv"))
-                        .current_dir(&crate_dir)
-                        .output()
-                        .map_err(|e| format!("Failed to create venv: {}", e))?;
-                    if !venv.status.success() {
-                        return Err(format!(
-                            "Failed to create venv: {}",
-                            String::from_utf8_lossy(&venv.stderr)
-                        ));
-                    }
-                }
-
-                let install = Command::new(&venv_python)
-                    .arg("-m")
-                    .arg("pip")
-                    .arg("install")
-                    .arg("numpy")
-                    .arg("scipy")
-                    .current_dir(&crate_dir)
-                    .output()
-                    .map_err(|e| format!("Failed to install numpy/scipy: {}", e))?;
-                if !install.status.success() {
-                    return Err(format!(
-                        "Failed to install numpy/scipy: {}",
-                        String::from_utf8_lossy(&install.stderr)
-                    ));
-                }
-
-                Ok(venv_python_str)
+                Err(format!(
+                    "Python comparison tests require python3 with numpy and scipy: {}",
+                    String::from_utf8_lossy(&check.stderr)
+                ))
             })
             .clone()
     }
@@ -14132,7 +14043,10 @@ mod tests {
         assert!(step[1].abs() < 1e-10);
         let (model_delta, step_norm, model_gradient) =
             core.arc_model_value(&g, &h, sigma, &step, None);
-        assert!(model_delta < 0.0, "hard-case step must decrease the cubic model");
+        assert!(
+            model_delta < 0.0,
+            "hard-case step must decrease the cubic model"
+        );
         assert!((sigma * step_norm - 2.0).abs() < 1e-10);
         assert!(model_gradient.dot(&model_gradient).sqrt() < 1e-10);
     }
@@ -14175,9 +14089,7 @@ mod tests {
                 const LINEAR_Y: f64 = 0.2;
                 let x_sq = x[0] * x[0];
                 SecondOrderSample {
-                    value: 0.25 * (x_sq - 1.0).powi(2)
-                        + 0.5 * x[1] * x[1]
-                        + LINEAR_Y * x[1],
+                    value: 0.25 * (x_sq - 1.0).powi(2) + 0.5 * x[1] * x[1] + LINEAR_Y * x[1],
                     gradient: array![x[0] * (x_sq - 1.0), x[1] + LINEAR_Y],
                     hessian: Some(array![[3.0 * x_sq - 1.0, 0.0], [0.0, 1.0]]),
                 }
@@ -14359,7 +14271,10 @@ mod tests {
             (alpha - 5.0).abs() < 1e-12,
             "expected the interior minimizer, got alpha={alpha}"
         );
-        assert!(value.abs() < 1e-24, "expected zero objective, got {value:e}");
+        assert!(
+            value.abs() < 1e-24,
+            "expected zero objective, got {value:e}"
+        );
         assert!(
             gradient[0].abs() < 1e-12,
             "expected a stationary minimizer, got gradient={gradient:?}"
@@ -16666,8 +16581,8 @@ mod tests {
     // workspace API tests.
     // -----------------------------------------------------------------
 
-    /// `GradientTolerance::relative_to_cost(τ)` reproduces gam's
-    /// historical `outer_scaled_tolerance(τ, |f_0|)` shape.
+    /// `GradientTolerance::relative_to_cost(τ)` follows the documented
+    /// relative-to-initial-cost shape.
     #[test]
     fn gradient_tolerance_relative_to_cost_matches_textbook_form() {
         let tol = GradientTolerance::relative_to_cost(1e-5);
@@ -16925,8 +16840,8 @@ mod tests {
         assert!(report.diagnostics.final_regularization.is_some());
     }
 
-    /// `run_report` must return `MaxIterations` when the solver runs
-    /// out of budget, with the best-seen point in `solution`.
+    // `run_report` must return `MaxIterations` when the solver runs
+    // out of budget, with the best-seen point in `solution`.
     // ---------------------------------------------------------------
     // ARC / MatrixFreeTR 0.5.3 fixes:
     //   - per-iter observer hooks
@@ -17002,8 +16917,8 @@ mod tests {
     /// plateau with a near-singular Hessian direction, a clipped step lands
     /// at a point with strictly lower cost but strictly larger projected
     /// gradient because we have moved off the plateau onto a steeper part
-    /// of the surface — typical of LAML smoothing-parameter optimization
-    /// near saturation. The standard ARC ρ-ratio criterion using
+    /// of the surface, as can happen near saturation in box-constrained
+    /// optimization. The standard ARC ρ-ratio criterion using
     /// `m(s_trial)` (recomputed at the actually-feasible step) correctly
     /// accepts.
     ///
@@ -17445,7 +17360,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Cost-stall termination (gam#1089/gam#1082) and value-probe memo.
+    // Cost-stall termination and value-probe memo.
     // ------------------------------------------------------------------
 
     #[test]
@@ -17482,7 +17397,10 @@ mod tests {
             halt = state.observe(&x, 1.0, &g, g.dot(&g).sqrt(), None);
         }
         let halt = halt.expect("stall should fire once the window fills");
-        assert!(!halt.converged, "large projected gradient ⇒ floor, not converged");
+        assert!(
+            !halt.converged,
+            "large projected gradient ⇒ floor, not converged"
+        );
         assert!((halt.grad_norm - 0.5).abs() < 1e-12);
     }
 
@@ -17604,14 +17522,15 @@ mod tests {
         // and fills the window — so at the moment of the fill the best-so-far
         // and the most recent observation are different points, which is the
         // whole point of this test.
-        assert!(state.observe(&good, 1.0, &g, gn, Some(&mut resolver)).is_none());
+        assert!(
+            state
+                .observe(&good, 1.0, &g, gn, Some(&mut resolver))
+                .is_none()
+        );
         let halt = state
             .observe(&worse, 5.0, &g, gn, Some(&mut resolver))
             .expect("filled window with a Halt resolver must halt");
-        assert_eq!(
-            halt.point, good,
-            "the halt reports the best iterate"
-        );
+        assert_eq!(halt.point, good, "the halt reports the best iterate");
         assert!(
             resolver.seen_points.iter().all(|p| *p == good),
             "the resolver must be shown the BEST iterate, not the most recent: saw {:?}",
@@ -17695,7 +17614,10 @@ mod tests {
             }
         }
         impl FirstOrderObjective for Counting {
-            fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
                 self.calls += 1;
                 Ok(FirstOrderSample {
                     value: x.dot(x),
@@ -17732,7 +17654,10 @@ mod tests {
             }
         }
         impl FirstOrderObjective for Counting {
-            fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
                 self.calls += 1;
                 Ok(FirstOrderSample {
                     value: x.dot(x),
@@ -17765,7 +17690,10 @@ mod tests {
             }
         }
         impl FirstOrderObjective for Counting {
-            fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
                 self.calls += 1;
                 Ok(FirstOrderSample {
                     value: x.dot(x),
@@ -17882,7 +17810,11 @@ mod added_primitive_tests {
         let out: LmOutcome<i32> =
             lm_step(&mut st, &cfg, |_lambda| Ok::<_, ()>(Some(7)), |_c| true).unwrap();
         match out {
-            LmOutcome::Accepted { candidate, lambda, rejects } => {
+            LmOutcome::Accepted {
+                candidate,
+                lambda,
+                rejects,
+            } => {
                 assert_eq!(candidate, 7);
                 assert_eq!(rejects, 0);
                 assert!((lambda - 0.5).abs() < 1e-12);
@@ -17905,7 +17837,9 @@ mod added_primitive_tests {
         )
         .unwrap();
         match out {
-            LmOutcome::Accepted { candidate, rejects, .. } => {
+            LmOutcome::Accepted {
+                candidate, rejects, ..
+            } => {
                 assert_eq!(rejects, 2);
                 assert!(candidate >= 1e-2);
             }
@@ -17932,8 +17866,7 @@ mod added_primitive_tests {
     fn lm_step_propagates_error() {
         let cfg = LmConfig::quartic(1.0, 1e-12, 5);
         let mut st = LmState::new(&cfg);
-        let out: Result<LmOutcome<i32>, &str> =
-            lm_step(&mut st, &cfg, |_l| Err("boom"), |_c| true);
+        let out: Result<LmOutcome<i32>, &str> = lm_step(&mut st, &cfg, |_l| Err("boom"), |_c| true);
         assert_eq!(out, Err("boom"));
     }
 
@@ -17948,7 +17881,11 @@ mod added_primitive_tests {
         let sol = find_root_monotone(
             |a| {
                 let ea = a.exp();
-                Ok::<_, ()>(RootSample { value: ea - 2.0, d1: ea, d2: ea })
+                Ok::<_, ()>(RootSample {
+                    value: ea - 2.0,
+                    d1: ea,
+                    d2: ea,
+                })
             },
             0.0,
             &cfg(),
@@ -17965,7 +17902,11 @@ mod added_primitive_tests {
         let sol = find_root_monotone(
             |a| {
                 let ea = (-a).exp();
-                Ok::<_, ()>(RootSample { value: ea - 0.5, d1: -ea, d2: ea })
+                Ok::<_, ()>(RootSample {
+                    value: ea - 0.5,
+                    d1: -ea,
+                    d2: ea,
+                })
             },
             0.0,
             &cfg(),
@@ -17979,7 +17920,13 @@ mod added_primitive_tests {
     #[test]
     fn root_linear_exact() {
         let sol = find_root_monotone(
-            |a| Ok::<_, ()>(RootSample { value: 2.0 * a - 7.0, d1: 2.0, d2: 0.0 }),
+            |a| {
+                Ok::<_, ()>(RootSample {
+                    value: 2.0 * a - 7.0,
+                    d1: 2.0,
+                    d2: 0.0,
+                })
+            },
             0.0,
             &cfg(),
             None,
@@ -17992,7 +17939,13 @@ mod added_primitive_tests {
     #[test]
     fn root_exact_at_seed_reports_zero_iters() {
         let sol = find_root_monotone(
-            |a| Ok::<_, ()>(RootSample { value: a, d1: 1.0, d2: 0.0 }),
+            |a| {
+                Ok::<_, ()>(RootSample {
+                    value: a,
+                    d1: 1.0,
+                    d2: 0.0,
+                })
+            },
             0.0,
             &cfg(),
             None,
@@ -18005,7 +17958,13 @@ mod added_primitive_tests {
     #[test]
     fn root_analytic_bracket_is_honored() {
         let sol = find_root_monotone(
-            |a| Ok::<_, ()>(RootSample { value: a - 3.0, d1: 1.0, d2: 0.0 }),
+            |a| {
+                Ok::<_, ()>(RootSample {
+                    value: a - 3.0,
+                    d1: 1.0,
+                    d2: 0.0,
+                })
+            },
             5.0,
             &cfg(),
             Some((0.0, 10.0)),
@@ -18017,7 +17976,13 @@ mod added_primitive_tests {
     #[test]
     fn root_degenerate_derivative_errors() {
         let err = find_root_monotone(
-            |a| Ok::<_, ()>(RootSample { value: a - 5.0, d1: 0.0, d2: 0.0 }),
+            |a| {
+                Ok::<_, ()>(RootSample {
+                    value: a - 5.0,
+                    d1: 0.0,
+                    d2: 0.0,
+                })
+            },
             0.0,
             &cfg(),
             None,
@@ -18029,7 +17994,13 @@ mod added_primitive_tests {
     #[test]
     fn root_bracketing_exhausted_with_zero_iters() {
         let err = find_root_monotone(
-            |a| Ok::<_, ()>(RootSample { value: a - 100.0, d1: 1.0, d2: 0.0 }),
+            |a| {
+                Ok::<_, ()>(RootSample {
+                    value: a - 100.0,
+                    d1: 1.0,
+                    d2: 0.0,
+                })
+            },
             0.0,
             &RootConfig::new(1e-12, 0, 64),
             None,
@@ -18040,13 +18011,8 @@ mod added_primitive_tests {
 
     #[test]
     fn root_oracle_error_is_surfaced() {
-        let err = find_root_monotone(
-            |_a| Err::<RootSample, _>("oracle down"),
-            1.0,
-            &cfg(),
-            None,
-        )
-        .unwrap_err();
+        let err = find_root_monotone(|_a| Err::<RootSample, _>("oracle down"), 1.0, &cfg(), None)
+            .unwrap_err();
         assert_eq!(err, RootError::Eval("oracle down"));
     }
 
@@ -18105,13 +18071,7 @@ mod added_primitive_tests {
 
     #[test]
     fn bracketed_root_reports_endpoint_certificate_without_extra_evaluation() {
-        let sol = find_root_bracketed(
-            |x| Ok::<_, ()>(x),
-            0.0,
-            4.0,
-            &bracketed_cfg(),
-        )
-        .unwrap();
+        let sol = find_root_bracketed(Ok::<_, ()>, 0.0, 4.0, &bracketed_cfg()).unwrap();
         assert_eq!(sol.root, 0.0);
         assert_eq!(sol.func_evals, 1);
         assert_eq!(sol.method_used, BracketedRootMethod::LowerEndpoint);
@@ -18119,22 +18079,14 @@ mod added_primitive_tests {
 
     #[test]
     fn bracketed_root_rejects_same_sign_and_non_finite_oracles() {
-        let same_sign = find_root_bracketed(
-            |x| Ok::<_, ()>(x * x + 1.0),
-            -1.0,
-            1.0,
-            &bracketed_cfg(),
-        )
-        .unwrap_err();
+        let same_sign =
+            find_root_bracketed(|x| Ok::<_, ()>(x * x + 1.0), -1.0, 1.0, &bracketed_cfg())
+                .unwrap_err();
         assert!(matches!(same_sign, BracketedRootError::NoSignChange { .. }));
 
-        let non_finite = find_root_bracketed(
-            |_x| Ok::<_, ()>(f64::NAN),
-            -1.0,
-            1.0,
-            &bracketed_cfg(),
-        )
-        .unwrap_err();
+        let non_finite =
+            find_root_bracketed(|_x| Ok::<_, ()>(f64::NAN), -1.0, 1.0, &bracketed_cfg())
+                .unwrap_err();
         assert!(matches!(
             non_finite,
             BracketedRootError::NonFiniteValue { .. }
@@ -18165,8 +18117,15 @@ mod added_primitive_tests {
     fn bidirectional_expands_to_larger_step() {
         // Objective decreasing in step over [0, 4], minimum near step=4.
         // f(step) = (step - 4)^2; current_value at step 0 is 16.
-        let backtrack = BacktrackConfig { initial_step: 0.5, ..BacktrackConfig::default() };
-        let expand = ExpandConfig { expand_factor: 2.0, max_expansions: 8, max_step: 8.0 };
+        let backtrack = BacktrackConfig {
+            initial_step: 0.5,
+            ..BacktrackConfig::default()
+        };
+        let expand = ExpandConfig {
+            expand_factor: 2.0,
+            max_expansions: 8,
+            max_step: 8.0,
+        };
         let accepted = bidirectional_line_search(
             16.0,
             expand,
@@ -18186,7 +18145,11 @@ mod added_primitive_tests {
         // The initial step overshoots (worse than current); expansion cannot
         // start, so it contracts until Armijo-style acceptance holds.
         // f(step) = if step <= 0.3 { -step } else { 10.0 }.
-        let backtrack = BacktrackConfig { initial_step: 1.0, contraction: 0.5, max_steps: 20 };
+        let backtrack = BacktrackConfig {
+            initial_step: 1.0,
+            contraction: 0.5,
+            max_steps: 20,
+        };
         let expand = ExpandConfig::default();
         let accepted = bidirectional_line_search(
             0.0,
@@ -18206,7 +18169,11 @@ mod added_primitive_tests {
 
     #[test]
     fn bidirectional_returns_none_when_nothing_admissible() {
-        let backtrack = BacktrackConfig { initial_step: 1.0, contraction: 0.5, max_steps: 5 };
+        let backtrack = BacktrackConfig {
+            initial_step: 1.0,
+            contraction: 0.5,
+            max_steps: 5,
+        };
         let out = bidirectional_line_search(
             0.0,
             ExpandConfig::default(),
@@ -18505,7 +18472,11 @@ mod termination_provenance_tests {
         assert_eq!(report.status, OptimizationStatus::MaxIterations);
         assert!(!report.solution.termination.is_stationary_claim());
         assert!(
-            report.solution.termination.stationarity_evidence().is_none(),
+            report
+                .solution
+                .termination
+                .stationarity_evidence()
+                .is_none(),
             "a budget exhaustion has no threshold it was judged against"
         );
         // The gradient is still readable — it just carries no verdict.

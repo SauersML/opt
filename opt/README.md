@@ -35,7 +35,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-opt = "0.5.12"
+opt = "0.8.1"
 ```
 
 ### Example: First-Order Optimization
@@ -112,8 +112,4 @@ The crate also includes comparison tests against SciPy through `opt/optimization
 
 ## License
 
-Licensed under either of:
-- Apache License, Version 2.0
-- MIT license
-
-at your option.
+Licensed under AGPL-3.0-or-later.
