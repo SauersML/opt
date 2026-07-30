@@ -12880,7 +12880,7 @@ mod tests {
         static PYTHON_PATH: OnceLock<Result<String, String>> = OnceLock::new();
         PYTHON_PATH
             .get_or_init(|| {
-                let python = "python3".to_string();
+                let python = if cfg!(windows) { "python" } else { "python3" }.to_string();
                 let check = Command::new(&python)
                     .arg("-c")
                     .arg("import numpy, scipy")
