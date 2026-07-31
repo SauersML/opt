@@ -2869,6 +2869,16 @@ enum StallPolicy {
 #[derive(Debug, Clone, Copy)]
 enum AcceptKind {
     StrongWolfe,
+    /// Monotone sufficient-decrease step accepted by the recovery line search.
+    ///
+    /// The primary Strong-Wolfe search still owns curvature-qualified steps.
+    /// Its recovery is deliberately classical Armijo backtracking: once a
+    /// finite trial strictly satisfies sufficient decrease, contracting it
+    /// toward the worse incumbent cannot create useful curvature information.
+    /// The Powell-damped inverse update below preserves a positive-definite
+    /// metric when this weaker, but mathematically valid, globalization
+    /// condition is used.
+    Armijo,
     ApproxWolfe,
     Nonmonotone,
     GradDrop,
@@ -12143,6 +12153,25 @@ where
         ) {
             return Ok((alpha, f_new, g_new, func_evals, grad_evals, kind));
         }
+        // This is the recovery search, not a second Strong-Wolfe search.
+        // classify_line_search_accept above preserves the stronger verdict
+        // whenever curvature happens to hold. Otherwise classical monotone
+        // Armijo sufficient decrease is authoritative: shrinking an already
+        // decreasing step merely walks back toward the worse incumbent and,
+        // on expensive objectives, can spend the entire evaluation budget
+        // without adding information. The inverse update is Powell-damped, so
+        // accepting this globalization condition cannot make its metric
+        // indefinite.
+        if core.accept_armijo(f_k, gkTs, f_new) {
+            return Ok((
+                alpha,
+                f_new,
+                g_new,
+                func_evals,
+                grad_evals,
+                AcceptKind::Armijo,
+            ));
+        }
 
         if (f_new - f_k).abs() <= epsF {
             no_change_count += 1;
@@ -14456,6 +14485,38 @@ mod tests {
             r,
             Err(super::LineSearchError::StepSizeTooSmall { .. })
         ));
+    }
+
+    #[test]
+    fn backtracking_accepts_armijo_descent_without_wolfe_curvature() {
+        let x_k = array![0.0];
+        let mut core = super::BfgsCore::new(x_k.clone());
+        let mut oracle = super::FirstOrderCache::new(x_k.len());
+        let f_k = 0.0;
+        let g_k = array![-1.0];
+        let d_k = array![1.0];
+
+        // A linear descent has no point satisfying the Strong-Wolfe curvature
+        // condition: its directional derivative is -1 everywhere. Classical
+        // Armijo backtracking must accept alpha=1 immediately instead of
+        // halving a strictly improving step toward the incumbent.
+        let (alpha, f_new, _, func_evals, grad_evals, kind) =
+            super::bfgs_backtracking_line_search(
+                &mut core,
+                &mut bfgs_oracle(|x: &Array1<f64>| (-x[0], array![-1.0])),
+                &mut oracle,
+                &x_k,
+                &d_k,
+                f_k,
+                &g_k,
+            )
+            .expect("Armijo recovery must accept a finite sufficient-decrease step");
+
+        assert_eq!(alpha, 1.0);
+        assert_eq!(f_new, -1.0);
+        assert!(matches!(kind, super::AcceptKind::Armijo));
+        assert!(func_evals <= 2, "recovery spent {func_evals} value probes");
+        assert_eq!(grad_evals, 1);
     }
 
     #[test]
