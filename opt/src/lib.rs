@@ -11502,6 +11502,55 @@ struct FixedPointCore {
     initial_sample: Option<(Array1<f64>, FixedPointSample)>,
 }
 
+/// Relaxation weight for the next Picard step, from the two most recent
+/// proposed steps.
+///
+/// A fixed-point map's step field near a fixed point behaves like
+/// `s_{k} ≈ λ s_{k-1}` for the map's dominant multiplier `λ`. Plain Picard
+/// (`x ← x + s`) converges only for `λ ∈ (−1, 1)`; at `λ ≤ −1` it cycles or
+/// diverges — the period-2 orbit that runs to the iteration budget with the
+/// value repeating to every printed digit and the step norm alternating
+/// between two values. Under-relaxation `x ← x + ω s` replaces the multiplier
+/// by `1 + ω(λ − 1)`, which is zero at `ω = 1/(1 − λ)`.
+///
+/// `λ` is read from the steps themselves as the least-squares projection
+/// `λ̂ = ⟨s_k, s_{k-1}⟩ / ⟨s_{k-1}, s_{k-1}⟩` — depth-1 Anderson / Aitken,
+/// no constant and no configuration. The weight is applied ONLY on the
+/// oscillating side (`λ̂ < 0`), so every run whose steps do not alternate
+/// takes `ω = 1` and is bit-identical to before. It is clamped to
+/// `[FIXED_POINT_MIN_RELAXATION, 1]` so a near-`−∞` estimate (a step that
+/// exploded rather than oscillated) cannot freeze the iteration.
+fn fixed_point_relaxation(step: &Array1<f64>, previous_step: &Array1<f64>) -> f64 {
+    if previous_step.len() != step.len() {
+        return 1.0;
+    }
+    let denominator = previous_step.dot(previous_step);
+    if !(denominator > 0.0) || !denominator.is_finite() {
+        return 1.0;
+    }
+    let numerator = step.dot(previous_step);
+    if !numerator.is_finite() {
+        return 1.0;
+    }
+    let multiplier = numerator / denominator;
+    if !(multiplier < 0.0) {
+        // Monotone (or orthogonal) steps: plain Picard, untouched.
+        return 1.0;
+    }
+    let omega = 1.0 / (1.0 - multiplier);
+    if !omega.is_finite() {
+        return 1.0;
+    }
+    omega.clamp(FIXED_POINT_MIN_RELAXATION, 1.0)
+}
+
+/// Floor on the under-relaxation weight. `ω = 1/(1 − λ̂)` reaches this at
+/// `λ̂ = −15`; below that the "oscillation" is a step blowing up rather than
+/// alternating about a fixed point, and shrinking the move further would stall
+/// the iteration instead of stabilizing it — the budget exit is then the honest
+/// outcome.
+const FIXED_POINT_MIN_RELAXATION: f64 = 1.0 / 16.0;
+
 impl FixedPointCore {
     fn new(x0: Array1<f64>) -> Self {
         Self {
@@ -11530,6 +11579,9 @@ impl FixedPointCore {
         let mut last_point = x_k.clone();
         let mut last_value = f64::INFINITY;
         let mut last_step_norm = 0.0;
+        // The previous iteration's box-projected proposed step, which is what
+        // the relaxation reads its multiplier from.
+        let mut previous_step: Option<Array1<f64>> = None;
         for k in 0..self.max_iterations {
             let sample = if k == 0 {
                 if let Some((seed_x, seed_sample)) = self.initial_sample.as_ref() {
@@ -11596,9 +11648,13 @@ impl FixedPointCore {
                     TerminationReason::FixedPointRequestedStop { step_norm: 0.0 },
                 ));
             }
-            let x_next = self.project_point(&(&x_k + &sample.step));
-            let applied_step = &x_next - &x_k;
-            let step_norm = applied_step.dot(&applied_step).sqrt();
+            // Convergence is decided on the step the MAP proposed, projected
+            // onto the box: `s = 0` is what "fixed point" means, and the
+            // relaxation below changes only how far the iterate moves along
+            // it, never what counts as converged.
+            let proposed_next = self.project_point(&(&x_k + &sample.step));
+            let proposed_step = &proposed_next - &x_k;
+            let step_norm = proposed_step.dot(&proposed_step).sqrt();
             if !step_norm.is_finite() {
                 return Err(FixedPointError::NonFiniteStep);
             }
@@ -11617,7 +11673,16 @@ impl FixedPointCore {
                     },
                 ));
             }
-            x_k = x_next;
+            let omega = match previous_step.as_ref() {
+                Some(previous) => fixed_point_relaxation(&proposed_step, previous),
+                None => 1.0,
+            };
+            previous_step = Some(proposed_step.clone());
+            x_k = if omega == 1.0 {
+                proposed_next
+            } else {
+                self.project_point(&(&x_k + &(omega * &proposed_step)))
+            };
         }
         Err(FixedPointError::MaxIterationsReached {
             last_solution: Box::new(Solution::fixed_point(
@@ -13901,6 +13966,109 @@ mod tests {
         let solution = result.expect("solver should wire bounds into Hessian finite differences");
         assert!(solution.final_point[0].abs() < 1e-12);
         assert!(gradient_norm(&solution) <= 1e-12);
+    }
+
+    /// gam#2748 — a fixed-point map whose dominant multiplier is `λ ≤ −1`
+    /// cycles forever under plain Picard: `s(x) = −2x` gives `x ← −x`, a
+    /// period-2 orbit that repeats its value to every digit and runs to the
+    /// iteration budget (measured in production as `EFS hit max_iter=200` four
+    /// times over, at one identical `final_value` and two alternating step
+    /// norms). Under-relaxation reads `λ̂ = −1` off the two most recent steps
+    /// and moves by `ω = 1/(1 − λ̂) = ½`, which lands exactly on the fixed
+    /// point.
+    #[test]
+    fn fixed_point_converges_on_an_oscillating_map_that_picard_cycles_on() {
+        struct PeriodTwo;
+
+        impl FixedPointObjective for PeriodTwo {
+            fn eval_step(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FixedPointSample, ObjectiveEvalError> {
+                Ok(FixedPointSample {
+                    value: x.dot(x),
+                    step: -2.0 * x,
+                    status: FixedPointStatus::Continue,
+                })
+            }
+        }
+
+        // Non-vacuity: plain Picard on this map is an exact 2-cycle — the
+        // iterate returns to where it started every second step, so no
+        // iteration budget can reach the fixed point.
+        let x0 = array![2.0, -1.0];
+        let picard_once: Array1<f64> = &x0 + &(-2.0 * &x0);
+        let picard_twice: Array1<f64> = &picard_once + &(-2.0 * &picard_once);
+        let orbit_defect: f64 = picard_twice
+            .iter()
+            .zip(x0.iter())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            orbit_defect < 1e-18,
+            "the fixture must be a period-2 orbit under plain Picard, defect {orbit_defect}"
+        );
+
+        let mut solver = FixedPoint::new(x0, PeriodTwo)
+            .with_tolerance(tol(1e-8))
+            .with_max_iterations(iters(64));
+        let solution = solver
+            .run()
+            .expect("under-relaxation must converge an oscillating map");
+        assert!(
+            solution.final_point.dot(&solution.final_point).sqrt() < 1e-8,
+            "the relaxed iteration must reach the fixed point, got {:?}",
+            solution.final_point
+        );
+        assert!(step_norm(&solution) <= 1e-8);
+    }
+
+    /// The relaxation weight is the multiplier's own formula, and it is
+    /// EXACTLY 1 on every non-oscillating pair — so a converging Picard run
+    /// takes the same iterates it always did.
+    #[test]
+    fn the_relaxation_weight_is_one_unless_the_steps_alternate() {
+        let previous = array![1.0, -2.0, 0.5];
+        // λ̂ = −1: the period-2 case, ω = ½.
+        assert_eq!(
+            super::fixed_point_relaxation(&(-1.0 * &previous), &previous),
+            0.5
+        );
+        // λ̂ = −3: ω = ¼.
+        assert_eq!(
+            super::fixed_point_relaxation(&(-3.0 * &previous), &previous),
+            0.25
+        );
+        // A contraction (λ̂ = ½) and a growing monotone step (λ̂ = 2) are both
+        // left alone — the relaxation only ever damps an alternation.
+        assert_eq!(
+            super::fixed_point_relaxation(&(0.5 * &previous), &previous),
+            1.0
+        );
+        assert_eq!(
+            super::fixed_point_relaxation(&(2.0 * &previous), &previous),
+            1.0
+        );
+        // An orthogonal step carries no multiplier estimate.
+        assert_eq!(
+            super::fixed_point_relaxation(&array![2.0, 1.0, 0.0], &array![1.0, -2.0, 0.0]),
+            1.0
+        );
+        // A step that exploded rather than alternated is clamped, not frozen.
+        assert_eq!(
+            super::fixed_point_relaxation(&(-1.0e6 * &previous), &previous),
+            super::FIXED_POINT_MIN_RELAXATION
+        );
+        // Degenerate inputs fall back to plain Picard.
+        assert_eq!(
+            super::fixed_point_relaxation(&previous, &array![0.0, 0.0, 0.0]),
+            1.0
+        );
+        assert_eq!(
+            super::fixed_point_relaxation(&previous, &array![1.0, 2.0]),
+            1.0
+        );
     }
 
     #[test]
