@@ -3943,6 +3943,23 @@ pub enum TerminationReason {
         noise_floor: f64,
         grad_norm: f64,
     },
+    /// The model's predicted decrease at an INTERIOR step — where the
+    /// trust radius did not truncate the subproblem, so that decrease is
+    /// the Newton decrement `½ gᵀH⁻¹g` — fell to or below the resolution
+    /// the caller declared with
+    /// [`MatrixFreeTrustRegion::with_model_decrement_tolerance`]. The
+    /// second-order model sees no descent the caller counts as descent.
+    ///
+    /// This is the caller's own stationarity test rather than a gradient
+    /// band: in a flat valley a gradient norm asks for digits the
+    /// objective cannot resolve, while the decrement asks the question the
+    /// caller actually has ("is there any improvement of consequence left
+    /// here?") in the objective's own units.
+    ModelDecrementTolerance {
+        predicted_decrease: f64,
+        threshold: f64,
+        grad_norm: f64,
+    },
     /// The trust radius (or cubic regularization) reached its floor
     /// with `consecutive_rejections` steps rejected in a row: the
     /// region cannot shrink further and no step is acceptable. Further
@@ -4058,6 +4075,7 @@ impl TerminationReason {
             // resolution, not about the gradient: the gradient was never
             // compared to a threshold, so there is no evidence to report.
             Self::ModelNoiseFloor { .. }
+            | Self::ModelDecrementTolerance { .. }
             | Self::TrustRegionRejectFloor { .. }
             | Self::FixedPointRequestedStop { .. }
             | Self::IterationBudget { .. }
@@ -4078,6 +4096,7 @@ impl TerminationReason {
             | Self::CostStallStationary { grad_norm, .. }
             | Self::CostStallFloor { grad_norm, .. }
             | Self::ModelNoiseFloor { grad_norm, .. }
+            | Self::ModelDecrementTolerance { grad_norm, .. }
             | Self::TrustRegionRejectFloor { grad_norm, .. }
             | Self::IterationBudget { grad_norm, .. }
             | Self::LineSearchFailed { grad_norm } => Some(grad_norm),
@@ -4106,6 +4125,7 @@ impl TerminationReason {
                 | Self::RelativeStationarityWindow { .. }
                 | Self::CostStallStationary { .. }
                 | Self::ModelNoiseFloor { .. }
+                | Self::ModelDecrementTolerance { .. }
                 | Self::StepNormTolerance { .. }
         )
     }
@@ -4124,6 +4144,9 @@ impl TerminationReason {
             | Self::StepNormTolerance { .. }
             | Self::FixedPointRequestedStop { .. } => OptimizationStatus::Converged,
             Self::ModelNoiseFloor { .. } => OptimizationStatus::NumericallyConverged,
+            // The caller's declared resolution is a convergence test it
+            // wrote, not a precision floor the arithmetic imposed.
+            Self::ModelDecrementTolerance { .. } => OptimizationStatus::Converged,
             Self::CostStallStationary { .. } => OptimizationStatus::CostStallConverged,
             Self::CostStallFloor { .. } => OptimizationStatus::CostStallFloor,
             Self::TrustRegionRejectFloor { .. } => OptimizationStatus::TrustRegionRejectFloor,
@@ -4152,6 +4175,7 @@ impl TerminationReason {
             Self::CostStallStationary { .. } => "cost_stall_stationary",
             Self::CostStallFloor { .. } => "cost_stall_floor",
             Self::ModelNoiseFloor { .. } => "model_noise_floor",
+            Self::ModelDecrementTolerance { .. } => "model_decrement_tolerance",
             Self::TrustRegionRejectFloor { .. } => "trust_region_reject_floor",
             Self::StepNormTolerance { .. } => "step_norm_tolerance",
             Self::FixedPointRequestedStop { .. } => "fixed_point_requested_stop",
@@ -4204,6 +4228,14 @@ impl std::fmt::Display for TerminationReason {
             } => write!(
                 f,
                 "(pred={predicted_decrease:.6e} <= noise floor {noise_floor:.6e})"
+            ),
+            Self::ModelDecrementTolerance {
+                predicted_decrease,
+                threshold,
+                ..
+            } => write!(
+                f,
+                "(interior Newton decrement {predicted_decrease:.6e} <= {threshold:.6e})"
             ),
             Self::TrustRegionRejectFloor {
                 radius,
@@ -10342,6 +10374,10 @@ struct MatrixFreeTrustRegionCore {
     cg_tol: f64,
     /// CG iteration cap as a multiplier on the parameter dimension.
     cg_max_iter_factor: f64,
+    /// Caller-declared resolution of the objective, read as a stopping
+    /// rule on the model's own predicted decrease at an interior step.
+    /// `None` leaves only the round-off rung (`ModelNoiseFloor`).
+    model_decrement_tolerance: Option<f64>,
     initial_sample: Option<(Array1<f64>, OperatorSample)>,
     hessian_fallback_policy: HessianFallbackPolicy,
     /// Final trust radius observed during the most recent `run`.
@@ -10388,6 +10424,7 @@ impl MatrixFreeTrustRegionCore {
             eta_accept: 0.1,
             cg_tol: 0.1,
             cg_max_iter_factor: 1.0,
+            model_decrement_tolerance: None,
             initial_sample: None,
             hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
             last_trust_radius: None,
@@ -10949,6 +10986,38 @@ impl MatrixFreeTrustRegionCore {
             } else {
                 predicted
             };
+
+            // The caller's resolution rung. On an interior step the CG
+            // reached the model's own minimizer, so `predicted` IS the
+            // Newton decrement `½ gᵀH⁻¹g`; a decrement at or below the
+            // caller's tolerance says the second-order model sees no
+            // descent of consequence left, which is a statement about the
+            // point and not about how the solver got here. Tested before
+            // the trial evaluation, so a stop here also costs no objective
+            // call.
+            let cg_step_norm = cg_scratch.p.dot(&cg_scratch.p).sqrt();
+            if let Some(tolerance) = self.model_decrement_tolerance
+                && cg_step_norm < 0.99 * trust_radius
+                && predicted <= tolerance
+            {
+                let sol = Solution::gradient_based(
+                    x_k.clone(),
+                    sample.value,
+                    sample.gradient.clone(),
+                    g_proj_norm,
+                    None,
+                    k,
+                    func_evals,
+                    grad_evals,
+                    hvp_evals,
+                    TerminationReason::ModelDecrementTolerance {
+                        predicted_decrease: predicted,
+                        threshold: tolerance,
+                        grad_norm: g_proj_norm,
+                    },
+                );
+                return Ok(sol);
+            }
             let trial_eval = obj_fn.eval_value_grad_op(&x_trial);
             let trial = match trial_eval {
                 Ok(t) => t,
@@ -11419,6 +11488,26 @@ where
     /// Eisenstat-Walker one-tenth value.
     pub fn with_cg_tolerance(mut self, tol: f64) -> Self {
         self.core.cg_tol = tol;
+        self
+    }
+
+    /// Stop when the second-order model's predicted decrease at an
+    /// interior step — the Newton decrement `½ gᵀH⁻¹g` — falls to or below
+    /// `tol`, reporting [`TerminationReason::ModelDecrementTolerance`].
+    ///
+    /// This is the caller's resolution of its own objective, in the
+    /// objective's units: "an improvement smaller than this is not an
+    /// improvement". A gradient band cannot express that, because the map
+    /// from a gradient norm to an available decrease is the curvature, and
+    /// in a flat valley it makes the band ask for digits the objective does
+    /// not have — the loop then runs to its iteration budget while every
+    /// step buys nothing. Only interior steps are tested: at the trust
+    /// boundary the model wants to go further, and the radius rather than
+    /// the curvature set the step, so the decrease there is not the
+    /// decrement. Non-finite or non-positive `tol` disables the rung.
+    pub fn with_model_decrement_tolerance(mut self, tol: f64) -> Self {
+        self.core.model_decrement_tolerance =
+            (tol.is_finite() && tol > 0.0).then_some(tol);
         self
     }
 
@@ -16470,6 +16559,82 @@ mod tests {
             .iter()
             .any(|v| (v - 1.0).abs() > 1.0);
         assert!(far, "one 1e-3 step cannot reach the minimum: {:?}", report.solution.final_point);
+    }
+
+    /// The interior-decrement rung stops where the caller's declared
+    /// resolution says nothing of consequence is left, and a step sized by
+    /// the trust radius — where the model wants to go further, so its
+    /// predicted decrease is not the Newton decrement — does not trigger
+    /// it.
+    #[test]
+    fn matrix_free_trust_region_stops_at_the_callers_model_decrement() {
+        let n = 3;
+        // f = ½‖x−1‖² with H = I, so the Newton decrement ½gᵀH⁻¹g at x is
+        // ½‖x−1‖²: 0.125 at this start.
+        let x0 = array![1.5, 1.0, 1.0];
+        let decrement = 0.125_f64;
+
+        let mut solver = MatrixFreeTrustRegion::new(x0.clone(), OperatorQuadratic { n })
+            .with_tolerance(Tolerance::new(1e-12).unwrap())
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_initial_trust_radius(1.0)
+            .with_model_decrement_tolerance(2.0 * decrement);
+        let report = solver.run_report();
+        assert!(
+            matches!(
+                report.solution.termination,
+                TerminationReason::ModelDecrementTolerance { .. }
+            ),
+            "expected the decrement rung, got {:?}",
+            report.solution.termination
+        );
+        assert_eq!(report.status, OptimizationStatus::Converged);
+        assert!(
+            report.solution.iterations <= 1,
+            "the rung fires on the first interior step, got {} iterations",
+            report.solution.iterations
+        );
+        assert_eq!(
+            report.solution.final_point, x0,
+            "a stop declines the step; it does not take it"
+        );
+
+        // Positive control for the boundary guard: the same tolerance, with
+        // a radius that truncates the step. The decrease the model predicts
+        // there (~5e-4) is far below the tolerance, and the rung must still
+        // not fire.
+        let mut boundary = MatrixFreeTrustRegion::new(x0.clone(), OperatorQuadratic { n })
+            .with_tolerance(Tolerance::new(1e-12).unwrap())
+            .with_max_iterations(MaxIterations::new(1).unwrap())
+            .with_initial_trust_radius(1e-3)
+            .with_model_decrement_tolerance(2.0 * decrement);
+        let boundary_report = boundary.run_report();
+        assert_eq!(
+            boundary_report.status,
+            OptimizationStatus::MaxIterations,
+            "a radius-truncated step must not read as the caller's decrement: {:?}",
+            boundary_report.solution.termination
+        );
+
+        // Negative control: without the rung the same solve runs on to the
+        // gradient band and reaches the minimum.
+        let mut exact = MatrixFreeTrustRegion::new(x0, OperatorQuadratic { n })
+            .with_tolerance(Tolerance::new(1e-10).unwrap())
+            .with_max_iterations(MaxIterations::new(50).unwrap())
+            .with_initial_trust_radius(1.0);
+        let exact_report = exact.run_report();
+        assert!(
+            exact_report.status.is_success(),
+            "control run failed: {:?}",
+            exact_report.solution.termination
+        );
+        for value in exact_report.solution.final_point.iter() {
+            assert!(
+                (value - 1.0).abs() < 1e-8,
+                "control must reach the minimum, got {:?}",
+                exact_report.solution.final_point
+            );
+        }
     }
 
     #[test]
