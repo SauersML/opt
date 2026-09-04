@@ -10817,6 +10817,90 @@ impl MatrixFreeTrustRegionCore {
                 continue;
             }
 
+            // The caller's resolution rung: on an INTERIOR step the model's
+            // predicted decrease is the Newton decrement `½ gᵀH⁻¹g`, and a
+            // decrement at or below the caller's declared resolution says the
+            // second-order model sees no descent of consequence left — a
+            // statement about the point, not about how the solver got here.
+            //
+            // But the forcing sequence makes a truncated CG's predicted
+            // decrease a LOWER bound on that decrement, so the test cannot be
+            // applied to it directly: measured on a REML fit at the working
+            // forcing factor (0.5), a step reported 5e-3 where the exact
+            // decrement at the same point was 3.9e-2, and stopping there left
+            // the walk at a point its own certificate refused. A candidate stop
+            // is therefore CONFIRMED by re-solving the subproblem to the
+            // arithmetic's resolution before it is believed. That solve happens
+            // only at a candidate stop, and when the confirmed decrement says
+            // keep going, its step — strictly better than the truncated one —
+            // is the step this iteration goes on to take.
+            if let Some(tolerance) = self.model_decrement_tolerance
+                && predicted <= tolerance
+                && cg_scratch.p.dot(&cg_scratch.p).sqrt() < 0.99 * trust_radius
+            {
+                // `√ε` is the resolution of a quantity formed by summing
+                // products in this arithmetic; the decrement is being compared
+                // against a tolerance, so its own truncation has to sit below
+                // that rather than at the walk's working forcing factor.
+                let confirm_tol = f64::EPSILON.sqrt();
+                match operator_steihaug_toint_step(
+                    &op_handle,
+                    &g_proj,
+                    trust_radius,
+                    if self.bounds.is_some() {
+                        Some(&active)
+                    } else {
+                        None
+                    },
+                    confirm_tol,
+                    cg_max_iter,
+                    &mut hvp_evals,
+                    &mut cg_scratch,
+                ) {
+                    Ok(Some(confirmed)) => {
+                        predicted = confirmed;
+                        if predicted <= tolerance
+                            && cg_scratch.p.dot(&cg_scratch.p).sqrt() < 0.99 * trust_radius
+                        {
+                            let sol = Solution::gradient_based(
+                                x_k.clone(),
+                                sample.value,
+                                sample.gradient.clone(),
+                                g_proj_norm,
+                                None,
+                                k,
+                                func_evals,
+                                grad_evals,
+                                hvp_evals,
+                                TerminationReason::ModelDecrementTolerance {
+                                    predicted_decrease: predicted,
+                                    threshold: tolerance,
+                                    grad_norm: g_proj_norm,
+                                },
+                            );
+                            return Ok(sol);
+                        }
+                    }
+                    // No step and no usable confirmation: the loose step is
+                    // gone from the scratch buffer, so shrink and re-derive
+                    // rather than take a step this solve did not produce.
+                    Ok(None) => {
+                        consecutive_rejections += 1;
+                        trust_radius *= 0.5;
+                        continue;
+                    }
+                    Err(err) if err.is_recoverable() => {
+                        consecutive_rejections += 1;
+                        trust_radius *= 0.5;
+                        continue;
+                    }
+                    Err(err) => {
+                        let message = err.into_message();
+                        return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
+                    }
+                }
+            }
+
             // Numerical-convergence guard: when the predicted reduction
             // from the Steihaug-Toint subsolve drops below the ULP scale
             // of the objective, `rho = actual/predicted` becomes pure
@@ -10987,37 +11071,6 @@ impl MatrixFreeTrustRegionCore {
                 predicted
             };
 
-            // The caller's resolution rung. On an interior step the CG
-            // reached the model's own minimizer, so `predicted` IS the
-            // Newton decrement `½ gᵀH⁻¹g`; a decrement at or below the
-            // caller's tolerance says the second-order model sees no
-            // descent of consequence left, which is a statement about the
-            // point and not about how the solver got here. Tested before
-            // the trial evaluation, so a stop here also costs no objective
-            // call.
-            let cg_step_norm = cg_scratch.p.dot(&cg_scratch.p).sqrt();
-            if let Some(tolerance) = self.model_decrement_tolerance
-                && cg_step_norm < 0.99 * trust_radius
-                && predicted <= tolerance
-            {
-                let sol = Solution::gradient_based(
-                    x_k.clone(),
-                    sample.value,
-                    sample.gradient.clone(),
-                    g_proj_norm,
-                    None,
-                    k,
-                    func_evals,
-                    grad_evals,
-                    hvp_evals,
-                    TerminationReason::ModelDecrementTolerance {
-                        predicted_decrease: predicted,
-                        threshold: tolerance,
-                        grad_norm: g_proj_norm,
-                    },
-                );
-                return Ok(sol);
-            }
             let trial_eval = obj_fn.eval_value_grad_op(&x_trial);
             let trial = match trial_eval {
                 Ok(t) => t,
