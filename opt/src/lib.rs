@@ -10520,6 +10520,10 @@ impl MatrixFreeTrustRegionCore {
         // inner Steihaug-Toint loop — eliminates ~5 `Array1<f64>` of size n
         // allocated per CG step in the previous implementation.
         let mut cg_scratch = CgScratch::with_dim(self.x0.len());
+        // The decrement rung's confirmation solve gets its own buffers: it
+        // answers a different question (the UNCONSTRAINED Newton step) and
+        // must not disturb the step this iteration is about to take.
+        let mut cg_confirm = CgScratch::with_dim(self.x0.len());
         // Resolve the rich `gradient_tolerance` (if set) once using
         // the seed cost and initial projected gradient norm. Falls
         // back to the scalar `tolerance` field.
@@ -10834,19 +10838,30 @@ impl MatrixFreeTrustRegionCore {
             // only at a candidate stop, and when the confirmed decrement says
             // keep going, its step — strictly better than the truncated one —
             // is the step this iteration goes on to take.
+            // `predicted` is the decrease of a step this region and this
+            // forcing factor allowed, so it is at most the unconstrained
+            // decrement — which makes it a free NECESSARY condition for the
+            // rung and a prefilter for the confirmation below.
             if let Some(tolerance) = self.model_decrement_tolerance
                 && predicted <= tolerance
-                && cg_scratch.p.dot(&cg_scratch.p).sqrt() < 0.99 * trust_radius
             {
                 // `√ε` is the resolution of a quantity formed by summing
                 // products in this arithmetic; the decrement is being compared
                 // against a tolerance, so its own truncation has to sit below
                 // that rather than at the walk's working forcing factor.
                 let confirm_tol = f64::EPSILON.sqrt();
+                // The decrement is a property of `(g, H)` at this point, not of
+                // the region: the caller's test asks whether a FULL second-order
+                // step buys anything, so the confirmation solves against the
+                // largest region this solver would ever use. A step that reaches
+                // even that boundary is not a Newton step (the model is
+                // unbounded along it, or the curvature is too weak to turn it
+                // around), and the rung stays silent.
+                let confirm_radius = self.trust_radius_max;
                 match operator_steihaug_toint_step(
                     &op_handle,
                     &g_proj,
-                    trust_radius,
+                    confirm_radius,
                     if self.bounds.is_some() {
                         Some(&active)
                     } else {
@@ -10855,12 +10870,11 @@ impl MatrixFreeTrustRegionCore {
                     confirm_tol,
                     cg_max_iter,
                     &mut hvp_evals,
-                    &mut cg_scratch,
+                    &mut cg_confirm,
                 ) {
-                    Ok(Some(confirmed)) => {
-                        predicted = confirmed;
-                        if predicted <= tolerance
-                            && cg_scratch.p.dot(&cg_scratch.p).sqrt() < 0.99 * trust_radius
+                    Ok(Some(decrement)) => {
+                        if decrement <= tolerance
+                            && cg_confirm.p.dot(&cg_confirm.p).sqrt() < 0.99 * confirm_radius
                         {
                             let sol = Solution::gradient_based(
                                 x_k.clone(),
@@ -10873,7 +10887,7 @@ impl MatrixFreeTrustRegionCore {
                                 grad_evals,
                                 hvp_evals,
                                 TerminationReason::ModelDecrementTolerance {
-                                    predicted_decrease: predicted,
+                                    predicted_decrease: decrement,
                                     threshold: tolerance,
                                     grad_norm: g_proj_norm,
                                 },
@@ -10881,19 +10895,12 @@ impl MatrixFreeTrustRegionCore {
                             return Ok(sol);
                         }
                     }
-                    // No step and no usable confirmation: the loose step is
-                    // gone from the scratch buffer, so shrink and re-derive
-                    // rather than take a step this solve did not produce.
-                    Ok(None) => {
-                        consecutive_rejections += 1;
-                        trust_radius *= 0.5;
-                        continue;
-                    }
-                    Err(err) if err.is_recoverable() => {
-                        consecutive_rejections += 1;
-                        trust_radius *= 0.5;
-                        continue;
-                    }
+                    // A confirmation that produces nothing, or fails
+                    // recoverably, says nothing about the decrement. The
+                    // working step is untouched in its own buffer, so the
+                    // iteration proceeds with it.
+                    Ok(None) => {}
+                    Err(err) if err.is_recoverable() => {}
                     Err(err) => {
                         let message = err.into_message();
                         return Err(MatrixFreeTrustRegionError::ObjectiveFailed { message });
@@ -16652,21 +16659,23 @@ mod tests {
             "a stop declines the step; it does not take it"
         );
 
-        // Positive control for the boundary guard: the same tolerance, with
-        // a radius that truncates the step. The decrease the model predicts
-        // there (~5e-4) is far below the tolerance, and the rung must still
-        // not fire.
-        let mut boundary = MatrixFreeTrustRegion::new(x0.clone(), OperatorQuadratic { n })
+        // Positive control for the confirmation: FAR from the minimum, with a
+        // radius so small that the step this region allows predicts only
+        // ~1e-2 — below the tolerance — while the unconstrained decrement at
+        // the same point is 50. The truncated number must not be believed, so
+        // the run reaches its budget instead of stopping.
+        let far = array![11.0, 1.0, 1.0];
+        let mut truncated = MatrixFreeTrustRegion::new(far, OperatorQuadratic { n })
             .with_tolerance(Tolerance::new(1e-12).unwrap())
             .with_max_iterations(MaxIterations::new(1).unwrap())
             .with_initial_trust_radius(1e-3)
-            .with_model_decrement_tolerance(2.0 * decrement);
-        let boundary_report = boundary.run_report();
+            .with_model_decrement_tolerance(0.1);
+        let truncated_report = truncated.run_report();
         assert_eq!(
-            boundary_report.status,
+            truncated_report.status,
             OptimizationStatus::MaxIterations,
-            "a radius-truncated step must not read as the caller's decrement: {:?}",
-            boundary_report.solution.termination
+            "a truncated step's decrease is not the decrement and must not stop the walk: {:?}",
+            truncated_report.solution.termination
         );
 
         // Negative control: without the rung the same solve runs on to the
