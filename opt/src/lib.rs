@@ -878,19 +878,39 @@ impl TrustRegionPolicy {
         // reachable: a plateau, a saturated barrier, or any objective that
         // returns a constant over a region all produce an exactly-zero
         // reduction. Require a positive floor before the guard can fire.
-        let within_noise_floor = noise_floor > 0.0 && actual_reduction.abs() <= noise_floor;
+        //
+        // A step is numerically neutral only when NEITHER side of the ratio
+        // is resolvable: the objective did not move beyond its round-off
+        // floor AND the model did not promise more than that floor. When
+        // the model predicts a reduction the objective can resolve and the
+        // objective realizes none, that is not a plateau — it is the model
+        // being wrong at this radius — and the ratio (≈ 0) has to say so.
+        // Judging the realized change alone promoted exactly that case to
+        // `rho = 1`: a joint Newton whose quadratic model was built from a
+        // singular-information gradient kept proposing `|δ|∞ ≈ 4e-14` with
+        // `pred = 0.27`, realized nothing, and was told "accepted, grow"
+        // for forty cycles in a row.
+        let within_noise_floor = noise_floor > 0.0
+            && actual_reduction.abs() <= noise_floor
+            && predicted_reduction.abs() <= noise_floor;
         let (rho, predicted_nonpositive) = if within_noise_floor {
-            // Realized change is at the round-off floor: the step neither
-            // helped nor hurt beyond noise, so treat it as a numerically
-            // neutral (converged) step with rho = 1 rather than dividing
-            // two round-off-level quantities.
+            // Realized change is at the round-off floor and so was the
+            // model's promise: the step neither helped nor hurt beyond
+            // noise, so treat it as a numerically neutral (converged) step
+            // with rho = 1 rather than dividing two round-off-level
+            // quantities.
             (1.0, false)
         } else if predicted_finite_positive {
             (actual_reduction / predicted_reduction, false)
         } else {
             (f64::NEG_INFINITY, true)
         };
-        let accepted = rho.is_finite() && rho > self.eta_accept && actual_reduction >= -noise_floor;
+        // Outside the neutral band an accepted step is a REAL descent: one the
+        // objective resolves above its own floor. A realized change inside
+        // the floor against a resolvable prediction is a ratio of noise to
+        // a promise, and `eta_accept = 0` must not read that as descent.
+        let accepted = within_noise_floor
+            || (rho.is_finite() && rho > self.eta_accept && actual_reduction > noise_floor);
 
         let mut new_radius = radius;
         let mut decision;
@@ -18582,5 +18602,33 @@ mod trust_region_policy_noise_floor_tests {
         assert!(step.within_noise_floor);
         assert_eq!(step.rho, 1.0);
         assert!(step.accepted);
+    }
+
+    /// The neutral band is two-sided. A realized change inside the floor is
+    /// neutral only when the model promised no more than the floor; against
+    /// a resolvable prediction it is the model being wrong, and the step is
+    /// rejected with the ratio the numbers actually give, not promoted to
+    /// `rho = 1` and grown.
+    #[test]
+    fn a_resolvable_prediction_that_realizes_nothing_is_rejected_not_neutral() {
+        // objective_scale = 1e3 => noise_floor = 1e3 * 1e-14 = 1e-11.
+        let policy = TrustRegionPolicy::noise_aware(1.0e-12, 1.0e6, 1.0e-14);
+        let step = policy.update(9.483e-3, 9.483e-3, true, 1.137e-13, 2.741e-1, 1.0e3);
+        assert!(!step.within_noise_floor);
+        assert!((step.rho - 1.137e-13 / 2.741e-1).abs() < 1e-20);
+        assert!(!step.accepted);
+        assert_eq!(step.decision, TrustRegionDecision::ShrinkOnRejection);
+        // x0.25 shrink = 2.37e-3, capped at 0.5 * step_norm = 4.74e-3: the shrink binds.
+        assert!((step.new_radius - 0.25 * 9.483e-3).abs() < 1e-15);
+        // The same realized change against a promise inside the floor is neutral.
+        let neutral = policy.update(9.483e-3, 9.483e-3, true, 1.137e-13, 5.0e-12, 1.0e3);
+        assert!(neutral.within_noise_floor);
+        assert_eq!(neutral.rho, 1.0);
+        assert!(neutral.accepted);
+        // A realized change inside the floor is not a descent either, even
+        // with `eta_accept = 0`: the ratio is noise over a promise.
+        let inside = policy.update(1.0, 1.0, false, 5.0e-12, 1.0e-6, 1.0e3);
+        assert!(!inside.within_noise_floor);
+        assert!(!inside.accepted);
     }
 }
