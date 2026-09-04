@@ -11068,6 +11068,19 @@ impl MatrixFreeTrustRegionCore {
             let on_boundary = step_norm >= 0.99 * trust_radius;
 
             let accepted = rho >= self.eta_accept && actual.is_finite();
+            // One line per iteration at `debug`: without it a 200-iteration
+            // walk that ends on its budget leaves no trace of WHY (rejected
+            // steps, a collapsing radius, a model that keeps over-promising).
+            log::debug!(
+                "[MatrixFreeTR] iter={k} f={:.9e} |g_proj|={:.3e} radius={:.3e} step={:.3e} predicted={:.3e} actual={:.3e} rho={:.3e} on_boundary={on_boundary} accepted={accepted}",
+                sample.value,
+                g_proj_norm,
+                trust_radius,
+                step_norm,
+                predicted,
+                actual,
+                rho
+            );
             if let Some(obs) = self.observer.as_mut() {
                 let info = StepInfo {
                     iter: k,
@@ -11123,6 +11136,13 @@ impl MatrixFreeTrustRegionCore {
 
         let g_proj = self.projected_gradient(&x_k, &sample.gradient);
         let g_proj_norm = g_proj.dot(&g_proj).sqrt();
+        // The budget is what stopped the walk, and the status a consumer
+        // reads is derived from this reason (`TerminationReason::status`):
+        // labelling the last iterate `GradientTolerance` here made
+        // `run_report` return `OptimizationStatus::Converged` for a walk that
+        // never met its tolerance — measured on a gaussian REML fit at
+        // n = 50,000: 200 iterations, `|g| = 5.2e-2` against `7.5e-4`,
+        // reported converged, caught only by the caller's own certificate.
         let last = Box::new(Solution::gradient_based(
             x_k,
             sample.value,
@@ -11133,7 +11153,8 @@ impl MatrixFreeTrustRegionCore {
             func_evals,
             grad_evals,
             hvp_evals,
-            TerminationReason::GradientTolerance {
+            TerminationReason::IterationBudget {
+                iterations: self.max_iterations,
                 grad_norm: g_proj_norm,
                 threshold: effective_tol,
             },
@@ -16252,6 +16273,35 @@ mod tests {
         // Solution; we just assert it was non-zero (a real algorithm
         // ran).
         assert!(solution.hess_evals > 0);
+    }
+
+    /// A walk stopped by its iteration budget is reported as such: the
+    /// last iterate carries `IterationBudget`, so the report's status is
+    /// `MaxIterations`, never `Converged`. One iteration inside a trust
+    /// region of `1e-3` cannot cross the distance `~8.8` to the quadratic's
+    /// minimum.
+    #[test]
+    fn matrix_free_trust_region_budget_exit_reports_max_iterations() {
+        let n = 3;
+        let x0 = array![5.0, -2.0, 7.0];
+        let mut solver = MatrixFreeTrustRegion::new(x0, OperatorQuadratic { n })
+            .with_max_iterations(MaxIterations::new(1).unwrap())
+            .with_tolerance(Tolerance::new(1e-8).unwrap())
+            .with_initial_trust_radius(1e-3);
+        let report = solver.run_report();
+        assert_eq!(
+            report.status,
+            OptimizationStatus::MaxIterations,
+            "a budget exit must not read as convergence; gradient norm {:?}",
+            report.solution.final_gradient_norm
+        );
+        assert_eq!(report.solution.iterations, 1);
+        let far = report
+            .solution
+            .final_point
+            .iter()
+            .any(|v| (v - 1.0).abs() > 1.0);
+        assert!(far, "one 1e-3 step cannot reach the minimum: {:?}", report.solution.final_point);
     }
 
     #[test]
