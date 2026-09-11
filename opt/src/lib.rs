@@ -8471,7 +8471,11 @@ impl BfgsCore {
         2.0 * u - 1.0
     }
 
-    fn run<ObjFn>(&mut self, obj_fn: &mut ObjFn) -> Result<Solution, BfgsError>
+    fn run<ObjFn>(
+        &mut self,
+        obj_fn: &mut ObjFn,
+        metric_output: Option<&mut Option<Array2<f64>>>,
+    ) -> Result<Solution, BfgsError>
     where
         ObjFn: FirstOrderObjective,
     {
@@ -8613,1193 +8617,1225 @@ impl BfgsCore {
             Array2::<f64>::eye(n)
         };
 
-        // Initialize adaptive state
-        self.gll.clear();
-        self.gll.push(f_k);
-        self.global_best = Some(ProbeBest::new(&x_k, f_k, &g_k));
-        self.c1_adapt = self.c1;
-        self.c2_adapt = self.c2;
-        self.primary_strategy = LineSearchStrategy::StrongWolfe;
-        self.wolfe_fail_streak = 0;
-        // Initialize trust radius from gradient scale
-        let g0_norm = g_proj_k.dot(&g_proj_k).sqrt();
-        self.initial_grad_norm = g0_norm;
-        self.local_mode = false;
-        let delta0 = if g0_norm.is_finite() && g0_norm > 0.0 {
-            (10.0 / g0_norm).min(1.0)
-        } else {
-            1.0
-        };
-        self.trust_radius = delta0;
-        // Resolve the rich `gradient_tolerance` (if set) once using
-        // the seed cost and initial projected gradient norm. Falls
-        // back to the scalar `tolerance` field. The two BFGS
-        // termination paths that consult `self.tolerance` against a
-        // gradient norm consume `effective_tol` instead.
-        let effective_tol = match &self.gradient_tolerance {
-            Some(g) => g.threshold(f_k, g0_norm),
-            None => self.tolerance,
-        };
-        if let Some(obs) = self.observer.as_mut() {
-            obs.on_iteration_start(&IterationInfo {
-                iter: 0,
-                func_evals,
-                grad_evals,
-            });
-        }
-
-        let mut f_last_accepted = f_k;
-        for k in 0..self.max_iterations {
-            // reset per-iteration state
-            self.nonfinite_seen = false;
-            self.chol_fail_iters = 0;
-            self.spd_fail_seen = false;
-            g_proj_k = self.projected_gradient(&x_k, &g_k);
-            let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
-            if !g_norm.is_finite() {
-                log::warn!(
-                    "[BFGS] Non-finite gradient norm at iter {}: g_norm={:?}",
-                    k,
-                    g_norm
-                );
-                return Err(BfgsError::GradientIsNaN);
-            }
-            self.refresh_local_mode(g_norm);
-            if g_norm < effective_tol {
-                let sol = Solution::gradient_based(
-                    x_k,
-                    f_k,
-                    g_k,
-                    g_norm,
-                    None,
-                    k,
+        let result = (|| {
+            // Initialize adaptive state
+            self.gll.clear();
+            self.gll.push(f_k);
+            self.global_best = Some(ProbeBest::new(&x_k, f_k, &g_k));
+            self.c1_adapt = self.c1;
+            self.c2_adapt = self.c2;
+            self.primary_strategy = LineSearchStrategy::StrongWolfe;
+            self.wolfe_fail_streak = 0;
+            // Initialize trust radius from gradient scale
+            let g0_norm = g_proj_k.dot(&g_proj_k).sqrt();
+            self.initial_grad_norm = g0_norm;
+            self.local_mode = false;
+            let delta0 = if g0_norm.is_finite() && g0_norm > 0.0 {
+                (10.0 / g0_norm).min(1.0)
+            } else {
+                1.0
+            };
+            self.trust_radius = delta0;
+            // Resolve the rich `gradient_tolerance` (if set) once using
+            // the seed cost and initial projected gradient norm. Falls
+            // back to the scalar `tolerance` field. The two BFGS
+            // termination paths that consult `self.tolerance` against a
+            // gradient norm consume `effective_tol` instead.
+            let effective_tol = match &self.gradient_tolerance {
+                Some(g) => g.threshold(f_k, g0_norm),
+                None => self.tolerance,
+            };
+            if let Some(obs) = self.observer.as_mut() {
+                obs.on_iteration_start(&IterationInfo {
+                    iter: 0,
                     func_evals,
                     grad_evals,
-                    0,
-                    TerminationReason::GradientTolerance {
-                        grad_norm: g_norm,
-                        threshold: effective_tol,
-                    },
-                );
-                log::info!(
-                    "[BFGS] Converged by gradient: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
-                    k,
-                    sol.final_value,
-                    sol.final_gradient_norm
-                        .expect("gradient-based solution must report gradient norm"),
-                    sol.func_evals,
-                    sol.grad_evals,
-                    self.trust_radius
-                );
-                return Ok(sol);
+                });
             }
 
-            let mut present_d_k = -b_inv.dot(&g_proj_k);
-            self.constrain_search_direction(&x_k, &active_mask, &mut present_d_k)?;
-            // Enforce descent direction; reset if needed
-            let gdotd = g_proj_k.dot(&present_d_k);
-            let dnorm = present_d_k.dot(&present_d_k).sqrt();
-            let tiny_d = dnorm <= 1e-14 * (1.0 + x_k.dot(&x_k).sqrt());
-            let eps_dir = eps_g(&g_proj_k, &present_d_k, self.tau_g);
-            if gdotd >= -eps_dir || tiny_d {
-                log::warn!("[BFGS] Non-descent direction; resetting to -g and B_inv=I.");
-                b_inv = Array2::eye(n);
-                present_d_k = -g_proj_k.clone();
+            let mut f_last_accepted = f_k;
+            for k in 0..self.max_iterations {
+                // reset per-iteration state
+                self.nonfinite_seen = false;
+                self.chol_fail_iters = 0;
+                self.spd_fail_seen = false;
+                g_proj_k = self.projected_gradient(&x_k, &g_k);
+                let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
+                if !g_norm.is_finite() {
+                    log::warn!(
+                        "[BFGS] Non-finite gradient norm at iter {}: g_norm={:?}",
+                        k,
+                        g_norm
+                    );
+                    return Err(BfgsError::GradientIsNaN);
+                }
+                self.refresh_local_mode(g_norm);
+                if g_norm < effective_tol {
+                    let sol = Solution::gradient_based(
+                        x_k,
+                        f_k,
+                        g_k,
+                        g_norm,
+                        None,
+                        k,
+                        func_evals,
+                        grad_evals,
+                        0,
+                        TerminationReason::GradientTolerance {
+                            grad_norm: g_norm,
+                            threshold: effective_tol,
+                        },
+                    );
+                    log::info!(
+                        "[BFGS] Converged by gradient: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
+                        k,
+                        sol.final_value,
+                        sol.final_gradient_norm
+                            .expect("gradient-based solution must report gradient norm"),
+                        sol.func_evals,
+                        sol.grad_evals,
+                        self.trust_radius
+                    );
+                    return Ok(sol);
+                }
+
+                let mut present_d_k = -b_inv.dot(&g_proj_k);
                 self.constrain_search_direction(&x_k, &active_mask, &mut present_d_k)?;
-            }
+                // Enforce descent direction; reset if needed
+                let gdotd = g_proj_k.dot(&present_d_k);
+                let dnorm = present_d_k.dot(&present_d_k).sqrt();
+                let tiny_d = dnorm <= 1e-14 * (1.0 + x_k.dot(&x_k).sqrt());
+                let eps_dir = eps_g(&g_proj_k, &present_d_k, self.tau_g);
+                if gdotd >= -eps_dir || tiny_d {
+                    log::warn!("[BFGS] Non-descent direction; resetting to -g and B_inv=I.");
+                    b_inv = Array2::eye(n);
+                    present_d_k = -g_proj_k.clone();
+                    self.constrain_search_direction(&x_k, &active_mask, &mut present_d_k)?;
+                }
 
-            // --- Adaptive Hybrid Line Search Execution ---
-            let active_before = active_mask.clone();
-            let (alpha_k, mut f_next, mut g_next, f_evals, g_evals, mut accept_kind) = {
-                let search_result = match self.primary_strategy {
-                    LineSearchStrategy::StrongWolfe => line_search(
-                        self,
-                        obj_fn,
-                        &mut oracle,
-                        &x_k,
-                        &present_d_k,
-                        f_k,
-                        &g_k,
-                        self.c1_adapt,
-                        self.c2_adapt,
-                    ),
-                    LineSearchStrategy::Backtracking => bfgs_backtracking_line_search(
-                        self,
-                        obj_fn,
-                        &mut oracle,
-                        &x_k,
-                        &present_d_k,
-                        f_k,
-                        &g_k,
-                    ),
+                // --- Adaptive Hybrid Line Search Execution ---
+                let active_before = active_mask.clone();
+                let (alpha_k, mut f_next, mut g_next, f_evals, g_evals, mut accept_kind) = {
+                    let search_result = match self.primary_strategy {
+                        LineSearchStrategy::StrongWolfe => line_search(
+                            self,
+                            obj_fn,
+                            &mut oracle,
+                            &x_k,
+                            &present_d_k,
+                            f_k,
+                            &g_k,
+                            self.c1_adapt,
+                            self.c2_adapt,
+                        ),
+                        LineSearchStrategy::Backtracking => bfgs_backtracking_line_search(
+                            self,
+                            obj_fn,
+                            &mut oracle,
+                            &x_k,
+                            &present_d_k,
+                            f_k,
+                            &g_k,
+                        ),
+                    };
+
+                    match search_result {
+                        Ok(result) => {
+                            // Reset failure streak and relax toward canonical constants
+                            self.wolfe_fail_streak = 0;
+                            self.ls_failures_in_row = 0;
+                            // Drift c1/c2 back toward canonical quickly on success
+                            if self.wolfe_clean_successes >= 2 || self.bt_clean_successes >= 2 {
+                                self.c1_adapt = self.c1;
+                                self.c2_adapt = self.c2;
+                            } else {
+                                self.c1_adapt = (self.c1_adapt * 0.9).max(self.c1);
+                                self.c2_adapt = (self.c2_adapt * 1.1).min(self.c2);
+                            }
+                            match self.primary_strategy {
+                                LineSearchStrategy::StrongWolfe => {
+                                    self.wolfe_clean_successes += 1;
+                                    self.bt_clean_successes = 0;
+                                    if self.wolfe_clean_successes >= 3 {
+                                        self.gll.set_cap(8);
+                                    }
+                                }
+                                LineSearchStrategy::Backtracking => {
+                                    self.bt_clean_successes += 1;
+                                    self.wolfe_clean_successes = 0;
+                                }
+                            }
+                            result
+                        }
+                        Err(e) => {
+                            // Attribute the failed primary line-search's eval cost to the
+                            // run totals before fallback. Otherwise diagnostics undercount
+                            // exactly the failure modes that drive wall time.
+                            let (fe, ge) = e.eval_counts();
+                            func_evals += fe;
+                            grad_evals += ge;
+                            // The primary strategy failed.
+                            match e {
+                                LineSearchError::StepSizeTooSmall { .. } => {
+                                    log::debug!("[BFGS] Line search failed: step size too small.");
+                                }
+                                LineSearchError::MaxAttempts { attempts, .. } => {
+                                    log::debug!(
+                                        "[BFGS] Line search failed: max attempts reached ({attempts})."
+                                    );
+                                }
+                                LineSearchError::ObjectiveFailed { message, .. } => {
+                                    return Err(BfgsError::ObjectiveFailed { message });
+                                }
+                            }
+                            // Attempt fallback if the primary strategy was StrongWolfe.
+                            if matches!(self.primary_strategy, LineSearchStrategy::StrongWolfe) {
+                                let streak = self.wolfe_fail_streak + 1;
+                                self.wolfe_fail_streak = streak;
+                                log::warn!(
+                                    "[BFGS Adaptive] Strong Wolfe failed at iter {}. Falling back to Backtracking.",
+                                    k
+                                );
+                                // Adapt c1/c2 on failures
+                                if streak == 1 {
+                                    self.c2_adapt = 0.5;
+                                }
+                                if streak >= 2 {
+                                    self.c2_adapt = 0.1;
+                                    self.c1_adapt = 1e-3;
+                                }
+                                self.ls_failures_in_row += 1;
+                                if self.ls_failures_in_row >= 2 {
+                                    self.gll.set_cap(10);
+                                }
+                                let fallback_result = bfgs_backtracking_line_search(
+                                    self,
+                                    obj_fn,
+                                    &mut oracle,
+                                    &x_k,
+                                    &present_d_k,
+                                    f_k,
+                                    &g_k,
+                                );
+                                if let Ok(result) = fallback_result {
+                                    // Fallback succeeded.
+                                    result
+                                } else {
+                                    // The fallback also failed. Terminate with the informative error.
+                                    // First, attribute the failed line-search's eval cost to the
+                                    // run totals — otherwise the reported func_evals/grad_evals
+                                    // silently drop the failure path that actually drove wall time.
+                                    if let Err(ref e) = fallback_result {
+                                        let (fe, ge) = e.eval_counts();
+                                        func_evals += fe;
+                                        grad_evals += ge;
+                                    }
+                                    let (max_attempts, failure_reason) = match fallback_result {
+                                        Err(LineSearchError::MaxAttempts { attempts, .. }) => {
+                                            (attempts, LineSearchFailureReason::MaxAttempts)
+                                        }
+                                        Err(LineSearchError::StepSizeTooSmall { .. }) => (
+                                            BACKTRACKING_MAX_ATTEMPTS,
+                                            LineSearchFailureReason::StepSizeTooSmall,
+                                        ),
+                                        Err(LineSearchError::ObjectiveFailed {
+                                            message, ..
+                                        }) => {
+                                            return Err(BfgsError::ObjectiveFailed { message });
+                                        }
+                                        Ok(_) => unreachable!(
+                                            "entered fallback failure branch with Ok line-search result"
+                                        ),
+                                    };
+                                    // Salvage best point seen during line search if any
+                                    if let Some(b) = self.global_best.clone() {
+                                        let epsF = eps_f(f_k, self.tau_f);
+                                        let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
+                                        let gb_proj = self.projected_gradient(&b.x, &b.g);
+                                        let gb_norm = gb_proj.dot(&gb_proj).sqrt();
+                                        let drop_factor = self.grad_drop_factor;
+                                        if (b.f <= f_k + epsF && gb_norm <= drop_factor * gk_norm)
+                                            || (b.f < f_k - epsF)
+                                        {
+                                            let rel_impr = (f_k - b.f).abs() / (1.0 + f_k.abs());
+                                            if self.update_no_improve_streak(rel_impr)
+                                                && self
+                                                    .stagnation_converged(&gb_proj, effective_tol)
+                                            {
+                                                return Ok(Solution::gradient_based(
+                                                    b.x.clone(),
+                                                    b.f,
+                                                    b.g.clone(),
+                                                    gb_norm,
+                                                    None,
+                                                    k,
+                                                    func_evals,
+                                                    grad_evals,
+                                                    0,
+                                                    TerminationReason::GradientTolerance {
+                                                        grad_norm: gb_norm,
+                                                        threshold: effective_tol,
+                                                    },
+                                                ));
+                                            }
+                                            x_k = self.project_point(&b.x);
+                                            f_k = b.f;
+                                            g_k = b.g.clone();
+                                            g_proj_k = gb_proj;
+                                            if let Some(bounds) = &self.bounds {
+                                                active_mask = bounds.active_mask(&x_k, &g_k);
+                                            }
+                                            for i in 0..n {
+                                                b_inv[[i, i]] *= 1.0 + 1e-3;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                    // Try full trust-region dogleg fallback before giving up
+                                    if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(
+                                        obj_fn,
+                                        &mut oracle,
+                                        &mut b_inv,
+                                        &x_k,
+                                        f_k,
+                                        &g_k,
+                                        &mut func_evals,
+                                        &mut grad_evals,
+                                    ) {
+                                        let g_proj_new = self.projected_gradient(&x_new, &g_new);
+                                        let rel_impr = (f_k - f_new).abs() / (1.0 + f_k.abs());
+                                        if self.update_no_improve_streak(rel_impr)
+                                            && self.stagnation_converged(&g_proj_new, effective_tol)
+                                        {
+                                            return Ok(Solution::gradient_based(
+                                                x_new,
+                                                f_new,
+                                                g_new,
+                                                g_proj_new.dot(&g_proj_new).sqrt(),
+                                                None,
+                                                k + 1,
+                                                func_evals,
+                                                grad_evals,
+                                                0,
+                                                TerminationReason::GradientTolerance {
+                                                    grad_norm: g_proj_new.dot(&g_proj_new).sqrt(),
+                                                    threshold: effective_tol,
+                                                },
+                                            ));
+                                        }
+                                        x_k = x_new;
+                                        f_k = f_new;
+                                        g_k = g_new;
+                                        g_proj_k = g_proj_new;
+                                        if let Some(bounds) = &self.bounds {
+                                            active_mask = bounds.active_mask(&x_k, &g_k);
+                                        }
+                                        self.ls_failures_in_row = 0;
+                                        continue;
+                                    }
+                                    self.trust_radius = (self.trust_radius * 0.7).max(1e-12);
+                                    if self.nonfinite_seen {
+                                        let mut ls = Solution::gradient_based(
+                                            x_k.clone(),
+                                            f_k,
+                                            g_k.clone(),
+                                            g_norm,
+                                            None,
+                                            k,
+                                            func_evals,
+                                            grad_evals,
+                                            0,
+                                            TerminationReason::LineSearchFailed {
+                                                grad_norm: g_norm,
+                                            },
+                                        );
+                                        if let Some(b) = self.global_best.as_ref()
+                                            && b.f < f_k - eps_f(f_k, self.tau_f)
+                                        {
+                                            let gb_proj = self.projected_gradient(&b.x, &b.g);
+                                            ls = Solution::gradient_based(
+                                                b.x.clone(),
+                                                b.f,
+                                                b.g.clone(),
+                                                gb_proj.dot(&gb_proj).sqrt(),
+                                                None,
+                                                k,
+                                                func_evals,
+                                                grad_evals,
+                                                0,
+                                                TerminationReason::LineSearchFailed {
+                                                    grad_norm: gb_proj.dot(&gb_proj).sqrt(),
+                                                },
+                                            );
+                                        }
+                                        log::warn!(
+                                            "[BFGS] Line search failed at iter {} (nonfinite seen), fe={}, ge={}, Δ={:.3e}",
+                                            k,
+                                            func_evals,
+                                            grad_evals,
+                                            self.trust_radius
+                                        );
+                                        return Err(BfgsError::LineSearchFailed {
+                                            last_solution: Box::new(ls),
+                                            max_attempts,
+                                            failure_reason,
+                                        });
+                                    }
+                                    if self.ls_failures_in_row >= 2 {
+                                        let ls = Solution::gradient_based(
+                                            x_k.clone(),
+                                            f_k,
+                                            g_k.clone(),
+                                            g_norm,
+                                            None,
+                                            k,
+                                            func_evals,
+                                            grad_evals,
+                                            0,
+                                            TerminationReason::LineSearchFailed {
+                                                grad_norm: g_norm,
+                                            },
+                                        );
+                                        return Err(BfgsError::LineSearchFailed {
+                                            last_solution: Box::new(ls),
+                                            max_attempts,
+                                            failure_reason,
+                                        });
+                                    }
+                                    continue;
+                                }
+                            } else {
+                                // The robust Backtracking strategy has failed. This is a critical problem.
+                                // Reset the Hessian and try one last time with a steepest descent direction.
+                                //
+                                // CRITICAL: use the *projected* gradient and route through
+                                // `constrain_search_direction`. Otherwise the reset direction
+                                // ignores the active-set mask, bound clamping, AND the per-axis
+                                // step caps installed via `with_axis_step_caps`; a single bad
+                                // BFGS direction can then trigger a reset that takes an
+                                // unbounded raw-gradient step.
+                                self.ls_failures_in_row += 1;
+                                log::error!(
+                                    "[BFGS Adaptive] CRITICAL: Backtracking failed at iter {}. Resetting Hessian.",
+                                    k
+                                );
+                                b_inv = Array2::<f64>::eye(n);
+                                let g_proj_now = self.projected_gradient(&x_k, &g_k);
+                                present_d_k = -g_proj_now;
+                                self.constrain_search_direction(
+                                    &x_k,
+                                    &active_mask,
+                                    &mut present_d_k,
+                                )?;
+                                let fallback_result = bfgs_backtracking_line_search(
+                                    self,
+                                    obj_fn,
+                                    &mut oracle,
+                                    &x_k,
+                                    &present_d_k,
+                                    f_k,
+                                    &g_k,
+                                );
+                                if let Ok(result) = fallback_result {
+                                    result
+                                } else {
+                                    if let Err(ref e) = fallback_result {
+                                        let (fe, ge) = e.eval_counts();
+                                        func_evals += fe;
+                                        grad_evals += ge;
+                                    }
+                                    let (max_attempts, failure_reason) = match fallback_result {
+                                        Err(LineSearchError::MaxAttempts { attempts, .. }) => {
+                                            (attempts, LineSearchFailureReason::MaxAttempts)
+                                        }
+                                        Err(LineSearchError::StepSizeTooSmall { .. }) => (
+                                            BACKTRACKING_MAX_ATTEMPTS,
+                                            LineSearchFailureReason::StepSizeTooSmall,
+                                        ),
+                                        Err(LineSearchError::ObjectiveFailed {
+                                            message, ..
+                                        }) => {
+                                            return Err(BfgsError::ObjectiveFailed { message });
+                                        }
+                                        Ok(_) => unreachable!(
+                                            "entered fallback failure branch with Ok line-search result"
+                                        ),
+                                    };
+                                    // Full trust-region dogleg fallback
+                                    if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(
+                                        obj_fn,
+                                        &mut oracle,
+                                        &mut b_inv,
+                                        &x_k,
+                                        f_k,
+                                        &g_k,
+                                        &mut func_evals,
+                                        &mut grad_evals,
+                                    ) {
+                                        let g_proj_new = self.projected_gradient(&x_new, &g_new);
+                                        let rel_impr = (f_k - f_new).abs() / (1.0 + f_k.abs());
+                                        if self.update_no_improve_streak(rel_impr)
+                                            && self.stagnation_converged(&g_proj_new, effective_tol)
+                                        {
+                                            return Ok(Solution::gradient_based(
+                                                x_new,
+                                                f_new,
+                                                g_new,
+                                                g_proj_new.dot(&g_proj_new).sqrt(),
+                                                None,
+                                                k + 1,
+                                                func_evals,
+                                                grad_evals,
+                                                0,
+                                                TerminationReason::GradientTolerance {
+                                                    grad_norm: g_proj_new.dot(&g_proj_new).sqrt(),
+                                                    threshold: effective_tol,
+                                                },
+                                            ));
+                                        }
+                                        x_k = x_new;
+                                        f_k = f_new;
+                                        g_k = g_new;
+                                        g_proj_k = g_proj_new;
+                                        if let Some(bounds) = &self.bounds {
+                                            active_mask = bounds.active_mask(&x_k, &g_k);
+                                        }
+                                        self.ls_failures_in_row = 0;
+                                        continue;
+                                    }
+                                    if let Some(b) = self.global_best.clone() {
+                                        let epsF = eps_f(f_k, self.tau_f);
+                                        let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
+                                        let gb_proj = self.projected_gradient(&b.x, &b.g);
+                                        let gb_norm = gb_proj.dot(&gb_proj).sqrt();
+                                        let drop_factor = self.grad_drop_factor;
+                                        if (b.f <= f_k + epsF && gb_norm <= drop_factor * gk_norm)
+                                            || (b.f < f_k - epsF)
+                                        {
+                                            let rel_impr = (f_k - b.f).abs() / (1.0 + f_k.abs());
+                                            if self.update_no_improve_streak(rel_impr)
+                                                && self
+                                                    .stagnation_converged(&gb_proj, effective_tol)
+                                            {
+                                                return Ok(Solution::gradient_based(
+                                                    b.x.clone(),
+                                                    b.f,
+                                                    b.g.clone(),
+                                                    gb_norm,
+                                                    None,
+                                                    k,
+                                                    func_evals,
+                                                    grad_evals,
+                                                    0,
+                                                    TerminationReason::GradientTolerance {
+                                                        grad_norm: gb_norm,
+                                                        threshold: effective_tol,
+                                                    },
+                                                ));
+                                            }
+                                            x_k = self.project_point(&b.x);
+                                            f_k = b.f;
+                                            g_k = b.g.clone();
+                                            g_proj_k = gb_proj;
+                                            if let Some(bounds) = &self.bounds {
+                                                active_mask = bounds.active_mask(&x_k, &g_k);
+                                            }
+                                            for i in 0..n {
+                                                b_inv[[i, i]] *= 1.0 + 1e-3;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                    self.trust_radius = (self.trust_radius * 0.7).max(1e-12);
+                                    if self.nonfinite_seen {
+                                        let mut ls = Solution::gradient_based(
+                                            x_k.clone(),
+                                            f_k,
+                                            g_k.clone(),
+                                            g_norm,
+                                            None,
+                                            k,
+                                            func_evals,
+                                            grad_evals,
+                                            0,
+                                            TerminationReason::LineSearchFailed {
+                                                grad_norm: g_norm,
+                                            },
+                                        );
+                                        if let Some(b) = self.global_best.as_ref()
+                                            && b.f < f_k - eps_f(f_k, self.tau_f)
+                                        {
+                                            let b_proj = self.projected_gradient(&b.x, &b.g);
+                                            ls = Solution::gradient_based(
+                                                b.x.clone(),
+                                                b.f,
+                                                b.g.clone(),
+                                                b_proj.dot(&b_proj).sqrt(),
+                                                None,
+                                                k,
+                                                func_evals,
+                                                grad_evals,
+                                                0,
+                                                TerminationReason::LineSearchFailed {
+                                                    grad_norm: b_proj.dot(&b_proj).sqrt(),
+                                                },
+                                            );
+                                        }
+                                        log::warn!(
+                                            "[BFGS] Line search failed at iter {} (nonfinite seen), fe={}, ge={}, Δ={:.3e}",
+                                            k,
+                                            func_evals,
+                                            grad_evals,
+                                            self.trust_radius
+                                        );
+                                        return Err(BfgsError::LineSearchFailed {
+                                            last_solution: Box::new(ls),
+                                            max_attempts,
+                                            failure_reason,
+                                        });
+                                    }
+                                    if self.ls_failures_in_row >= 2 {
+                                        let ls = Solution::gradient_based(
+                                            x_k.clone(),
+                                            f_k,
+                                            g_k.clone(),
+                                            g_norm,
+                                            None,
+                                            k,
+                                            func_evals,
+                                            grad_evals,
+                                            0,
+                                            TerminationReason::LineSearchFailed {
+                                                grad_norm: g_norm,
+                                            },
+                                        );
+                                        return Err(BfgsError::LineSearchFailed {
+                                            last_solution: Box::new(ls),
+                                            max_attempts,
+                                            failure_reason,
+                                        });
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                 };
 
-                match search_result {
-                    Ok(result) => {
-                        // Reset failure streak and relax toward canonical constants
-                        self.wolfe_fail_streak = 0;
-                        self.ls_failures_in_row = 0;
-                        // Drift c1/c2 back toward canonical quickly on success
-                        if self.wolfe_clean_successes >= 2 || self.bt_clean_successes >= 2 {
-                            self.c1_adapt = self.c1;
-                            self.c2_adapt = self.c2;
-                        } else {
-                            self.c1_adapt = (self.c1_adapt * 0.9).max(self.c1);
-                            self.c2_adapt = (self.c2_adapt * 1.1).min(self.c2);
-                        }
-                        match self.primary_strategy {
-                            LineSearchStrategy::StrongWolfe => {
-                                self.wolfe_clean_successes += 1;
-                                self.bt_clean_successes = 0;
-                                if self.wolfe_clean_successes >= 3 {
-                                    self.gll.set_cap(8);
+                // Optional coordinate rescue after consecutive flat accepts
+                let mut s_override: Option<Array1<f64>> = None;
+                let mut rescued = false;
+                if self.rescue_enabled() {
+                    let epsF_iter = eps_f(f_k, self.tau_f);
+                    let flat_now = (f_next - f_k).abs() <= epsF_iter;
+                    if flat_now && self.flat_accept_streak >= 2 {
+                        let x_base = self.project_point(&(&x_k + &(alpha_k * &present_d_k)));
+                        let g_proj_base = self.projected_gradient(&x_base, &g_next);
+                        let gnext_norm0 = g_proj_base.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        let delta = self.trust_radius;
+                        let eta = (0.2 * delta).min(1.0 / (1.0 + gnext_norm0));
+                        if eta.is_finite() && eta > 0.0 {
+                            let n = x_k.len();
+                            let mut best_x = None;
+                            let mut best_f = f_next;
+                            let mut best_g = g_next.clone();
+                            // Budgeted coordinate subset selection
+                            let k = n.min(8);
+                            let mut idx: Vec<usize> = (0..n).collect();
+                            idx.sort_by(|&i, &j| {
+                                g_next[i]
+                                    .abs()
+                                    .partial_cmp(&g_next[j].abs())
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                    .reverse()
+                            });
+                            let (use_hybrid, pool_mult, rescue_heads) = match self.rescue_policy {
+                                RescuePolicy::Off => (false, 1.0, 0),
+                                RescuePolicy::CoordinateHybrid { pool_mult, heads } => {
+                                    (true, pool_mult, heads)
                                 }
-                            }
-                            LineSearchStrategy::Backtracking => {
-                                self.bt_clean_successes += 1;
-                                self.wolfe_clean_successes = 0;
-                            }
-                        }
-                        result
-                    }
-                    Err(e) => {
-                        // Attribute the failed primary line-search's eval cost to the
-                        // run totals before fallback. Otherwise diagnostics undercount
-                        // exactly the failure modes that drive wall time.
-                        let (fe, ge) = e.eval_counts();
-                        func_evals += fe;
-                        grad_evals += ge;
-                        // The primary strategy failed.
-                        match e {
-                            LineSearchError::StepSizeTooSmall { .. } => {
-                                log::debug!("[BFGS] Line search failed: step size too small.");
-                            }
-                            LineSearchError::MaxAttempts { attempts, .. } => {
-                                log::debug!(
-                                    "[BFGS] Line search failed: max attempts reached ({attempts})."
-                                );
-                            }
-                            LineSearchError::ObjectiveFailed { message, .. } => {
-                                return Err(BfgsError::ObjectiveFailed { message });
-                            }
-                        }
-                        // Attempt fallback if the primary strategy was StrongWolfe.
-                        if matches!(self.primary_strategy, LineSearchStrategy::StrongWolfe) {
-                            let streak = self.wolfe_fail_streak + 1;
-                            self.wolfe_fail_streak = streak;
-                            log::warn!(
-                                "[BFGS Adaptive] Strong Wolfe failed at iter {}. Falling back to Backtracking.",
-                                k
-                            );
-                            // Adapt c1/c2 on failures
-                            if streak == 1 {
-                                self.c2_adapt = 0.5;
-                            }
-                            if streak >= 2 {
-                                self.c2_adapt = 0.1;
-                                self.c1_adapt = 1e-3;
-                            }
-                            self.ls_failures_in_row += 1;
-                            if self.ls_failures_in_row >= 2 {
-                                self.gll.set_cap(10);
-                            }
-                            let fallback_result = bfgs_backtracking_line_search(
-                                self,
-                                obj_fn,
-                                &mut oracle,
-                                &x_k,
-                                &present_d_k,
-                                f_k,
-                                &g_k,
-                            );
-                            if let Ok(result) = fallback_result {
-                                // Fallback succeeded.
-                                result
-                            } else {
-                                // The fallback also failed. Terminate with the informative error.
-                                // First, attribute the failed line-search's eval cost to the
-                                // run totals — otherwise the reported func_evals/grad_evals
-                                // silently drop the failure path that actually drove wall time.
-                                if let Err(ref e) = fallback_result {
-                                    let (fe, ge) = e.eval_counts();
-                                    func_evals += fe;
-                                    grad_evals += ge;
-                                }
-                                let (max_attempts, failure_reason) = match fallback_result {
-                                    Err(LineSearchError::MaxAttempts { attempts, .. }) => {
-                                        (attempts, LineSearchFailureReason::MaxAttempts)
-                                    }
-                                    Err(LineSearchError::StepSizeTooSmall { .. }) => (
-                                        BACKTRACKING_MAX_ATTEMPTS,
-                                        LineSearchFailureReason::StepSizeTooSmall,
-                                    ),
-                                    Err(LineSearchError::ObjectiveFailed { message, .. }) => {
-                                        return Err(BfgsError::ObjectiveFailed { message });
-                                    }
-                                    Ok(_) => unreachable!(
-                                        "entered fallback failure branch with Ok line-search result"
-                                    ),
-                                };
-                                // Salvage best point seen during line search if any
-                                if let Some(b) = self.global_best.clone() {
-                                    let epsF = eps_f(f_k, self.tau_f);
-                                    let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
-                                    let gb_proj = self.projected_gradient(&b.x, &b.g);
-                                    let gb_norm = gb_proj.dot(&gb_proj).sqrt();
-                                    let drop_factor = self.grad_drop_factor;
-                                    if (b.f <= f_k + epsF && gb_norm <= drop_factor * gk_norm)
-                                        || (b.f < f_k - epsF)
-                                    {
-                                        let rel_impr = (f_k - b.f).abs() / (1.0 + f_k.abs());
-                                        if self.update_no_improve_streak(rel_impr)
-                                            && self.stagnation_converged(&gb_proj, effective_tol)
-                                        {
-                                            return Ok(Solution::gradient_based(
-                                                b.x.clone(),
-                                                b.f,
-                                                b.g.clone(),
-                                                gb_norm,
-                                                None,
-                                                k,
-                                                func_evals,
-                                                grad_evals,
-                                                0,
-                                                TerminationReason::GradientTolerance {
-                                                    grad_norm: gb_norm,
-                                                    threshold: effective_tol,
-                                                },
-                                            ));
-                                        }
-                                        x_k = self.project_point(&b.x);
-                                        f_k = b.f;
-                                        g_k = b.g.clone();
-                                        g_proj_k = gb_proj;
-                                        if let Some(bounds) = &self.bounds {
-                                            active_mask = bounds.active_mask(&x_k, &g_k);
-                                        }
-                                        for i in 0..n {
-                                            b_inv[[i, i]] *= 1.0 + 1e-3;
-                                        }
-                                        continue;
-                                    }
-                                }
-                                // Try full trust-region dogleg fallback before giving up
-                                if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(
-                                    obj_fn,
-                                    &mut oracle,
-                                    &mut b_inv,
-                                    &x_k,
-                                    f_k,
-                                    &g_k,
-                                    &mut func_evals,
-                                    &mut grad_evals,
-                                ) {
-                                    let g_proj_new = self.projected_gradient(&x_new, &g_new);
-                                    let rel_impr = (f_k - f_new).abs() / (1.0 + f_k.abs());
-                                    if self.update_no_improve_streak(rel_impr)
-                                        && self.stagnation_converged(&g_proj_new, effective_tol)
-                                    {
-                                        return Ok(Solution::gradient_based(
-                                            x_new,
-                                            f_new,
-                                            g_new,
-                                            g_proj_new.dot(&g_proj_new).sqrt(),
-                                            None,
-                                            k + 1,
-                                            func_evals,
-                                            grad_evals,
-                                            0,
-                                            TerminationReason::GradientTolerance {
-                                                grad_norm: g_proj_new.dot(&g_proj_new).sqrt(),
-                                                threshold: effective_tol,
-                                            },
-                                        ));
-                                    }
-                                    x_k = x_new;
-                                    f_k = f_new;
-                                    g_k = g_new;
-                                    g_proj_k = g_proj_new;
-                                    if let Some(bounds) = &self.bounds {
-                                        active_mask = bounds.active_mask(&x_k, &g_k);
-                                    }
-                                    self.ls_failures_in_row = 0;
-                                    continue;
-                                }
-                                self.trust_radius = (self.trust_radius * 0.7).max(1e-12);
-                                if self.nonfinite_seen {
-                                    let mut ls = Solution::gradient_based(
-                                        x_k.clone(),
-                                        f_k,
-                                        g_k.clone(),
-                                        g_norm,
-                                        None,
-                                        k,
-                                        func_evals,
-                                        grad_evals,
-                                        0,
-                                        TerminationReason::LineSearchFailed { grad_norm: g_norm },
-                                    );
-                                    if let Some(b) = self.global_best.as_ref()
-                                        && b.f < f_k - eps_f(f_k, self.tau_f)
-                                    {
-                                        let gb_proj = self.projected_gradient(&b.x, &b.g);
-                                        ls = Solution::gradient_based(
-                                            b.x.clone(),
-                                            b.f,
-                                            b.g.clone(),
-                                            gb_proj.dot(&gb_proj).sqrt(),
-                                            None,
-                                            k,
-                                            func_evals,
-                                            grad_evals,
-                                            0,
-                                            TerminationReason::LineSearchFailed {
-                                                grad_norm: gb_proj.dot(&gb_proj).sqrt(),
-                                            },
-                                        );
-                                    }
-                                    log::warn!(
-                                        "[BFGS] Line search failed at iter {} (nonfinite seen), fe={}, ge={}, Δ={:.3e}",
-                                        k,
-                                        func_evals,
-                                        grad_evals,
-                                        self.trust_radius
-                                    );
-                                    return Err(BfgsError::LineSearchFailed {
-                                        last_solution: Box::new(ls),
-                                        max_attempts,
-                                        failure_reason,
-                                    });
-                                }
-                                if self.ls_failures_in_row >= 2 {
-                                    let ls = Solution::gradient_based(
-                                        x_k.clone(),
-                                        f_k,
-                                        g_k.clone(),
-                                        g_norm,
-                                        None,
-                                        k,
-                                        func_evals,
-                                        grad_evals,
-                                        0,
-                                        TerminationReason::LineSearchFailed { grad_norm: g_norm },
-                                    );
-                                    return Err(BfgsError::LineSearchFailed {
-                                        last_solution: Box::new(ls),
-                                        max_attempts,
-                                        failure_reason,
-                                    });
-                                }
-                                continue;
-                            }
-                        } else {
-                            // The robust Backtracking strategy has failed. This is a critical problem.
-                            // Reset the Hessian and try one last time with a steepest descent direction.
-                            //
-                            // CRITICAL: use the *projected* gradient and route through
-                            // `constrain_search_direction`. Otherwise the reset direction
-                            // ignores the active-set mask, bound clamping, AND the per-axis
-                            // step caps installed via `with_axis_step_caps`; a single bad
-                            // BFGS direction can then trigger a reset that takes an
-                            // unbounded raw-gradient step.
-                            self.ls_failures_in_row += 1;
-                            log::error!(
-                                "[BFGS Adaptive] CRITICAL: Backtracking failed at iter {}. Resetting Hessian.",
-                                k
-                            );
-                            b_inv = Array2::<f64>::eye(n);
-                            let g_proj_now = self.projected_gradient(&x_k, &g_k);
-                            present_d_k = -g_proj_now;
-                            self.constrain_search_direction(&x_k, &active_mask, &mut present_d_k)?;
-                            let fallback_result = bfgs_backtracking_line_search(
-                                self,
-                                obj_fn,
-                                &mut oracle,
-                                &x_k,
-                                &present_d_k,
-                                f_k,
-                                &g_k,
-                            );
-                            if let Ok(result) = fallback_result {
-                                result
-                            } else {
-                                if let Err(ref e) = fallback_result {
-                                    let (fe, ge) = e.eval_counts();
-                                    func_evals += fe;
-                                    grad_evals += ge;
-                                }
-                                let (max_attempts, failure_reason) = match fallback_result {
-                                    Err(LineSearchError::MaxAttempts { attempts, .. }) => {
-                                        (attempts, LineSearchFailureReason::MaxAttempts)
-                                    }
-                                    Err(LineSearchError::StepSizeTooSmall { .. }) => (
-                                        BACKTRACKING_MAX_ATTEMPTS,
-                                        LineSearchFailureReason::StepSizeTooSmall,
-                                    ),
-                                    Err(LineSearchError::ObjectiveFailed { message, .. }) => {
-                                        return Err(BfgsError::ObjectiveFailed { message });
-                                    }
-                                    Ok(_) => unreachable!(
-                                        "entered fallback failure branch with Ok line-search result"
-                                    ),
-                                };
-                                // Full trust-region dogleg fallback
-                                if let Some((x_new, f_new, g_new)) = self.try_trust_region_step(
-                                    obj_fn,
-                                    &mut oracle,
-                                    &mut b_inv,
-                                    &x_k,
-                                    f_k,
-                                    &g_k,
-                                    &mut func_evals,
-                                    &mut grad_evals,
-                                ) {
-                                    let g_proj_new = self.projected_gradient(&x_new, &g_new);
-                                    let rel_impr = (f_k - f_new).abs() / (1.0 + f_k.abs());
-                                    if self.update_no_improve_streak(rel_impr)
-                                        && self.stagnation_converged(&g_proj_new, effective_tol)
-                                    {
-                                        return Ok(Solution::gradient_based(
-                                            x_new,
-                                            f_new,
-                                            g_new,
-                                            g_proj_new.dot(&g_proj_new).sqrt(),
-                                            None,
-                                            k + 1,
-                                            func_evals,
-                                            grad_evals,
-                                            0,
-                                            TerminationReason::GradientTolerance {
-                                                grad_norm: g_proj_new.dot(&g_proj_new).sqrt(),
-                                                threshold: effective_tol,
-                                            },
-                                        ));
-                                    }
-                                    x_k = x_new;
-                                    f_k = f_new;
-                                    g_k = g_new;
-                                    g_proj_k = g_proj_new;
-                                    if let Some(bounds) = &self.bounds {
-                                        active_mask = bounds.active_mask(&x_k, &g_k);
-                                    }
-                                    self.ls_failures_in_row = 0;
-                                    continue;
-                                }
-                                if let Some(b) = self.global_best.clone() {
-                                    let epsF = eps_f(f_k, self.tau_f);
-                                    let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
-                                    let gb_proj = self.projected_gradient(&b.x, &b.g);
-                                    let gb_norm = gb_proj.dot(&gb_proj).sqrt();
-                                    let drop_factor = self.grad_drop_factor;
-                                    if (b.f <= f_k + epsF && gb_norm <= drop_factor * gk_norm)
-                                        || (b.f < f_k - epsF)
-                                    {
-                                        let rel_impr = (f_k - b.f).abs() / (1.0 + f_k.abs());
-                                        if self.update_no_improve_streak(rel_impr)
-                                            && self.stagnation_converged(&gb_proj, effective_tol)
-                                        {
-                                            return Ok(Solution::gradient_based(
-                                                b.x.clone(),
-                                                b.f,
-                                                b.g.clone(),
-                                                gb_norm,
-                                                None,
-                                                k,
-                                                func_evals,
-                                                grad_evals,
-                                                0,
-                                                TerminationReason::GradientTolerance {
-                                                    grad_norm: gb_norm,
-                                                    threshold: effective_tol,
-                                                },
-                                            ));
-                                        }
-                                        x_k = self.project_point(&b.x);
-                                        f_k = b.f;
-                                        g_k = b.g.clone();
-                                        g_proj_k = gb_proj;
-                                        if let Some(bounds) = &self.bounds {
-                                            active_mask = bounds.active_mask(&x_k, &g_k);
-                                        }
-                                        for i in 0..n {
-                                            b_inv[[i, i]] *= 1.0 + 1e-3;
-                                        }
-                                        continue;
-                                    }
-                                }
-                                self.trust_radius = (self.trust_radius * 0.7).max(1e-12);
-                                if self.nonfinite_seen {
-                                    let mut ls = Solution::gradient_based(
-                                        x_k.clone(),
-                                        f_k,
-                                        g_k.clone(),
-                                        g_norm,
-                                        None,
-                                        k,
-                                        func_evals,
-                                        grad_evals,
-                                        0,
-                                        TerminationReason::LineSearchFailed { grad_norm: g_norm },
-                                    );
-                                    if let Some(b) = self.global_best.as_ref()
-                                        && b.f < f_k - eps_f(f_k, self.tau_f)
-                                    {
-                                        let b_proj = self.projected_gradient(&b.x, &b.g);
-                                        ls = Solution::gradient_based(
-                                            b.x.clone(),
-                                            b.f,
-                                            b.g.clone(),
-                                            b_proj.dot(&b_proj).sqrt(),
-                                            None,
-                                            k,
-                                            func_evals,
-                                            grad_evals,
-                                            0,
-                                            TerminationReason::LineSearchFailed {
-                                                grad_norm: b_proj.dot(&b_proj).sqrt(),
-                                            },
-                                        );
-                                    }
-                                    log::warn!(
-                                        "[BFGS] Line search failed at iter {} (nonfinite seen), fe={}, ge={}, Δ={:.3e}",
-                                        k,
-                                        func_evals,
-                                        grad_evals,
-                                        self.trust_radius
-                                    );
-                                    return Err(BfgsError::LineSearchFailed {
-                                        last_solution: Box::new(ls),
-                                        max_attempts,
-                                        failure_reason,
-                                    });
-                                }
-                                if self.ls_failures_in_row >= 2 {
-                                    let ls = Solution::gradient_based(
-                                        x_k.clone(),
-                                        f_k,
-                                        g_k.clone(),
-                                        g_norm,
-                                        None,
-                                        k,
-                                        func_evals,
-                                        grad_evals,
-                                        0,
-                                        TerminationReason::LineSearchFailed { grad_norm: g_norm },
-                                    );
-                                    return Err(BfgsError::LineSearchFailed {
-                                        last_solution: Box::new(ls),
-                                        max_attempts,
-                                        failure_reason,
-                                    });
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-            };
-
-            // Optional coordinate rescue after consecutive flat accepts
-            let mut s_override: Option<Array1<f64>> = None;
-            let mut rescued = false;
-            if self.rescue_enabled() {
-                let epsF_iter = eps_f(f_k, self.tau_f);
-                let flat_now = (f_next - f_k).abs() <= epsF_iter;
-                if flat_now && self.flat_accept_streak >= 2 {
-                    let x_base = self.project_point(&(&x_k + &(alpha_k * &present_d_k)));
-                    let g_proj_base = self.projected_gradient(&x_base, &g_next);
-                    let gnext_norm0 = g_proj_base.iter().map(|v| v * v).sum::<f64>().sqrt();
-                    let delta = self.trust_radius;
-                    let eta = (0.2 * delta).min(1.0 / (1.0 + gnext_norm0));
-                    if eta.is_finite() && eta > 0.0 {
-                        let n = x_k.len();
-                        let mut best_x = None;
-                        let mut best_f = f_next;
-                        let mut best_g = g_next.clone();
-                        // Budgeted coordinate subset selection
-                        let k = n.min(8);
-                        let mut idx: Vec<usize> = (0..n).collect();
-                        idx.sort_by(|&i, &j| {
-                            g_next[i]
-                                .abs()
-                                .partial_cmp(&g_next[j].abs())
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .reverse()
-                        });
-                        let (use_hybrid, pool_mult, rescue_heads) = match self.rescue_policy {
-                            RescuePolicy::Off => (false, 1.0, 0),
-                            RescuePolicy::CoordinateHybrid { pool_mult, heads } => {
-                                (true, pool_mult, heads)
-                            }
-                        };
-                        let m = (pool_mult * (k as f64)).round() as usize;
-                        let m = m.min(n).max(k);
-                        let heads = rescue_heads.min(k).min(m);
-                        let mut chosen: Vec<usize> = Vec::new();
-                        // Always include top heads
-                        for &i in idx.iter().take(heads) {
-                            chosen.push(i);
-                        }
-                        if use_hybrid {
-                            // Sample remaining from next (heads..m)
-                            let mut pool: Vec<usize> =
-                                idx.iter().cloned().skip(heads).take(m - heads).collect();
-                            while chosen.len() < k && !pool.is_empty() {
-                                // xorshift-based index
-                                let r = (self.rng_state >> 1) as usize;
-                                let t = r % pool.len();
-                                let pick = pool.swap_remove(t);
-                                chosen.push(pick);
-                                // advance rng
-                                let _ = self.next_rand_sym();
-                            }
-                        } else {
-                            for &i in idx.iter().skip(heads).take(k - heads) {
+                            };
+                            let m = (pool_mult * (k as f64)).round() as usize;
+                            let m = m.min(n).max(k);
+                            let heads = rescue_heads.min(k).min(m);
+                            let mut chosen: Vec<usize> = Vec::new();
+                            // Always include top heads
+                            for &i in idx.iter().take(heads) {
                                 chosen.push(i);
                             }
-                        }
-                        for &i in &chosen {
-                            for &sgn in &[-1.0, 1.0] {
-                                let mut x_try = x_base.clone();
-                                x_try[i] += sgn * eta; // coordinate poke from x_next
-                                x_try = self.project_point(&x_try);
-                                let (f_try, g_try) = match bfgs_eval_cost_grad(
-                                    &mut oracle,
-                                    obj_fn,
-                                    &x_try,
-                                    &mut func_evals,
-                                    &mut grad_evals,
-                                ) {
-                                    Ok(sample) => sample,
-                                    Err(err) if err.is_recoverable() => continue,
-                                    Err(err) => {
-                                        let message = err.into_message();
-                                        return Err(BfgsError::ObjectiveFailed { message });
-                                    }
-                                };
-                                if !f_try.is_finite() || g_try.iter().any(|v| !v.is_finite()) {
-                                    continue;
+                            if use_hybrid {
+                                // Sample remaining from next (heads..m)
+                                let mut pool: Vec<usize> =
+                                    idx.iter().cloned().skip(heads).take(m - heads).collect();
+                                while chosen.len() < k && !pool.is_empty() {
+                                    // xorshift-based index
+                                    let r = (self.rng_state >> 1) as usize;
+                                    let t = r % pool.len();
+                                    let pick = pool.swap_remove(t);
+                                    chosen.push(pick);
+                                    // advance rng
+                                    let _ = self.next_rand_sym();
                                 }
-                                let g_proj_try = self.projected_gradient(&x_try, &g_try);
-                                let g_try_norm = g_proj_try.dot(&g_proj_try).sqrt();
-                                let f_thresh = f_k.min(f_next) + epsF_iter;
-                                let s_trial = &x_try - &x_k;
-                                let descent_ok = g_proj_k.dot(&s_trial)
-                                    <= -eps_g(&g_proj_k, &s_trial, self.tau_g);
-                                let f_ok = f_try <= f_thresh;
-                                let g_ok = g_try_norm <= self.grad_drop_factor * gnext_norm0;
-                                if (f_ok || g_ok) && descent_ok && f_try <= best_f {
-                                    best_f = f_try;
-                                    best_x = Some(x_try.clone());
-                                    best_g = g_try.clone();
+                            } else {
+                                for &i in idx.iter().skip(heads).take(k - heads) {
+                                    chosen.push(i);
                                 }
                             }
-                        }
-                        if let Some(xb) = best_x {
-                            // Enforce trust radius on the rescue step
-                            let mut s_tmp = &xb - &x_k;
-                            let s_norm = s_tmp.dot(&s_tmp).sqrt();
-                            let delta = self.trust_radius;
-                            if s_norm.is_finite()
-                                && s_norm > delta
-                                && delta.is_finite()
-                                && delta > 0.0
-                            {
-                                let scale = delta / s_norm;
-                                let x_scaled = &x_k + &(s_tmp.mapv(|v| v * scale));
-                                let x_scaled = self.project_point(&x_scaled);
-                                let (f_s, g_s) = match bfgs_eval_cost_grad(
-                                    &mut oracle,
-                                    obj_fn,
-                                    &x_scaled,
-                                    &mut func_evals,
-                                    &mut grad_evals,
-                                ) {
-                                    Ok(sample) => sample,
-                                    Err(err) if err.is_recoverable() => {
-                                        (f64::NAN, Array1::zeros(x_scaled.len()))
+                            for &i in &chosen {
+                                for &sgn in &[-1.0, 1.0] {
+                                    let mut x_try = x_base.clone();
+                                    x_try[i] += sgn * eta; // coordinate poke from x_next
+                                    x_try = self.project_point(&x_try);
+                                    let (f_try, g_try) = match bfgs_eval_cost_grad(
+                                        &mut oracle,
+                                        obj_fn,
+                                        &x_try,
+                                        &mut func_evals,
+                                        &mut grad_evals,
+                                    ) {
+                                        Ok(sample) => sample,
+                                        Err(err) if err.is_recoverable() => continue,
+                                        Err(err) => {
+                                            let message = err.into_message();
+                                            return Err(BfgsError::ObjectiveFailed { message });
+                                        }
+                                    };
+                                    if !f_try.is_finite() || g_try.iter().any(|v| !v.is_finite()) {
+                                        continue;
                                     }
-                                    Err(err) => {
-                                        let message = err.into_message();
-                                        return Err(BfgsError::ObjectiveFailed { message });
+                                    let g_proj_try = self.projected_gradient(&x_try, &g_try);
+                                    let g_try_norm = g_proj_try.dot(&g_proj_try).sqrt();
+                                    let f_thresh = f_k.min(f_next) + epsF_iter;
+                                    let s_trial = &x_try - &x_k;
+                                    let descent_ok = g_proj_k.dot(&s_trial)
+                                        <= -eps_g(&g_proj_k, &s_trial, self.tau_g);
+                                    let f_ok = f_try <= f_thresh;
+                                    let g_ok = g_try_norm <= self.grad_drop_factor * gnext_norm0;
+                                    if (f_ok || g_ok) && descent_ok && f_try <= best_f {
+                                        best_f = f_try;
+                                        best_x = Some(x_try.clone());
+                                        best_g = g_try.clone();
                                     }
-                                };
-                                if f_s.is_finite() && g_s.iter().all(|v| v.is_finite()) {
-                                    s_tmp = &x_scaled - &x_k;
-                                    f_next = f_s;
-                                    g_next = g_s;
+                                }
+                            }
+                            if let Some(xb) = best_x {
+                                // Enforce trust radius on the rescue step
+                                let mut s_tmp = &xb - &x_k;
+                                let s_norm = s_tmp.dot(&s_tmp).sqrt();
+                                let delta = self.trust_radius;
+                                if s_norm.is_finite()
+                                    && s_norm > delta
+                                    && delta.is_finite()
+                                    && delta > 0.0
+                                {
+                                    let scale = delta / s_norm;
+                                    let x_scaled = &x_k + &(s_tmp.mapv(|v| v * scale));
+                                    let x_scaled = self.project_point(&x_scaled);
+                                    let (f_s, g_s) = match bfgs_eval_cost_grad(
+                                        &mut oracle,
+                                        obj_fn,
+                                        &x_scaled,
+                                        &mut func_evals,
+                                        &mut grad_evals,
+                                    ) {
+                                        Ok(sample) => sample,
+                                        Err(err) if err.is_recoverable() => {
+                                            (f64::NAN, Array1::zeros(x_scaled.len()))
+                                        }
+                                        Err(err) => {
+                                            let message = err.into_message();
+                                            return Err(BfgsError::ObjectiveFailed { message });
+                                        }
+                                    };
+                                    if f_s.is_finite() && g_s.iter().all(|v| v.is_finite()) {
+                                        s_tmp = &x_scaled - &x_k;
+                                        f_next = f_s;
+                                        g_next = g_s;
+                                    } else {
+                                        // fall back to original xb
+                                        f_next = best_f;
+                                        g_next = best_g.clone();
+                                    }
                                 } else {
-                                    // fall back to original xb
                                     f_next = best_f;
                                     g_next = best_g.clone();
                                 }
-                            } else {
-                                f_next = best_f;
-                                g_next = best_g.clone();
+                                s_override = Some(s_tmp);
+                                rescued = true;
+                                accept_kind = AcceptKind::Rescue;
+                                self.flat_accept_streak = 0;
                             }
-                            s_override = Some(s_tmp);
-                            rescued = true;
-                            accept_kind = AcceptKind::Rescue;
-                            self.flat_accept_streak = 0;
                         }
                     }
                 }
-            }
 
-            // The "Learner" part: promote Backtracking if Wolfe keeps failing.
-            if self.wolfe_fail_streak >= Self::FALLBACK_THRESHOLD {
-                log::warn!(
-                    "[BFGS Adaptive] Fallback streak ({}) reached. Switching primary to Backtracking.",
-                    self.wolfe_fail_streak
-                );
-                self.primary_strategy = LineSearchStrategy::Backtracking;
-                self.wolfe_fail_streak = 0;
-            }
-            // Switch back to StrongWolfe after a run of clean backtracking successes
-            if matches!(self.primary_strategy, LineSearchStrategy::Backtracking)
-                && self.bt_clean_successes >= 3
-                && self.wolfe_fail_streak == 0
-            {
-                log::info!(
-                    "[BFGS Adaptive] Backtracking succeeded cleanly ({} iters); switching back to StrongWolfe.",
-                    self.bt_clean_successes
-                );
-                self.primary_strategy = LineSearchStrategy::StrongWolfe;
-                self.bt_clean_successes = 0;
-                self.gll.set_cap(8);
-            }
-
-            func_evals += f_evals;
-            grad_evals += g_evals;
-
-            let mut s_k = if let Some(ref s) = s_override {
-                s.clone()
-            } else {
-                alpha_k * &present_d_k
-            };
-            let x_next = self.project_point(&(x_k.clone() + &s_k));
-            s_k = &x_next - &x_k;
-            let g_proj_next = self.projected_gradient(&x_next, &g_next);
-            let active_after = if let Some(bounds) = &self.bounds {
-                bounds.active_mask(&x_next, &g_next)
-            } else {
-                vec![false; n]
-            };
-            let step_len = s_k.dot(&s_k).sqrt();
-            if step_len.is_finite() && step_len > 0.0 {
-                if step_len >= 0.9 * self.trust_radius {
-                    self.trust_radius = (self.trust_radius * 1.5).min(1e6);
-                } else {
-                    self.trust_radius = (self.trust_radius * 1.1).min(1e6);
+                // The "Learner" part: promote Backtracking if Wolfe keeps failing.
+                if self.wolfe_fail_streak >= Self::FALLBACK_THRESHOLD {
+                    log::warn!(
+                        "[BFGS Adaptive] Fallback streak ({}) reached. Switching primary to Backtracking.",
+                        self.wolfe_fail_streak
+                    );
+                    self.primary_strategy = LineSearchStrategy::Backtracking;
+                    self.wolfe_fail_streak = 0;
                 }
-            }
+                // Switch back to StrongWolfe after a run of clean backtracking successes
+                if matches!(self.primary_strategy, LineSearchStrategy::Backtracking)
+                    && self.bt_clean_successes >= 3
+                    && self.wolfe_fail_streak == 0
+                {
+                    log::info!(
+                        "[BFGS Adaptive] Backtracking succeeded cleanly ({} iters); switching back to StrongWolfe.",
+                        self.bt_clean_successes
+                    );
+                    self.primary_strategy = LineSearchStrategy::StrongWolfe;
+                    self.bt_clean_successes = 0;
+                    self.gll.set_cap(8);
+                }
 
-            let rel_impr = (f_last_accepted - f_next).abs() / (1.0 + f_last_accepted.abs());
-            if self.update_no_improve_streak(rel_impr)
-                && self.stagnation_converged(&g_proj_next, effective_tol)
-            {
-                return Ok(Solution::gradient_based(
-                    x_next.clone(),
-                    f_next,
-                    g_next.clone(),
-                    g_proj_next.dot(&g_proj_next).sqrt(),
-                    None,
-                    k + 1,
-                    func_evals,
-                    grad_evals,
-                    0,
-                    TerminationReason::GradientTolerance {
-                        grad_norm: g_proj_next.dot(&g_proj_next).sqrt(),
-                        threshold: effective_tol,
-                    },
-                ));
-            }
+                func_evals += f_evals;
+                grad_evals += g_evals;
 
-            // Gradient-independent cost-stall exit.
-            // Fold this accepted iterate into the guard, using the
-            // bound-PROJECTED gradient norm (the KKT residual) so a
-            // bound-pinned near-separable optimum whose raw gradient never
-            // vanishes can still certify. When the guard reports a stall it
-            // returns the best-so-far iterate; the stationarity verdict
-            // decides `CostStallConverged` (success) vs `CostStallFloor`.
-            if let Some(cost_stall) = self.cost_stall.as_mut() {
-                let g_proj_norm = g_proj_next.dot(&g_proj_next).sqrt();
-                // Move the resolver out for the call: holding `&mut
-                // self.stall_resolver` across the rest of this loop body would
-                // borrow `*self` for longer than the call needs.
-                let mut resolver_slot = self.stall_resolver.take();
-                let halt = cost_stall.observe(
-                    &x_next,
-                    f_next,
-                    &g_next,
-                    g_proj_norm,
-                    resolver_slot.as_deref_mut(),
-                );
-                self.stall_resolver = resolver_slot;
-                if let Some(halt) = halt {
-                    let stall_cfg = &cost_stall.config;
-                    let reason = if halt.converged {
-                        TerminationReason::CostStallStationary {
-                            grad_norm: halt.grad_norm,
-                            threshold: stall_cfg.projected_grad_tol,
-                            window: stall_cfg.window,
-                        }
+                let mut s_k = if let Some(ref s) = s_override {
+                    s.clone()
+                } else {
+                    alpha_k * &present_d_k
+                };
+                let x_next = self.project_point(&(x_k.clone() + &s_k));
+                s_k = &x_next - &x_k;
+                let g_proj_next = self.projected_gradient(&x_next, &g_next);
+                let active_after = if let Some(bounds) = &self.bounds {
+                    bounds.active_mask(&x_next, &g_next)
+                } else {
+                    vec![false; n]
+                };
+                let step_len = s_k.dot(&s_k).sqrt();
+                if step_len.is_finite() && step_len > 0.0 {
+                    if step_len >= 0.9 * self.trust_radius {
+                        self.trust_radius = (self.trust_radius * 1.5).min(1e6);
                     } else {
-                        TerminationReason::CostStallFloor {
-                            grad_norm: halt.grad_norm,
-                            threshold: stall_cfg.projected_grad_tol,
-                            window: stall_cfg.window,
-                        }
-                    };
-                    let sol = Solution::gradient_based(
-                        halt.point,
-                        halt.value,
-                        halt.grad,
-                        halt.grad_norm,
+                        self.trust_radius = (self.trust_radius * 1.1).min(1e6);
+                    }
+                }
+
+                let rel_impr = (f_last_accepted - f_next).abs() / (1.0 + f_last_accepted.abs());
+                if self.update_no_improve_streak(rel_impr)
+                    && self.stagnation_converged(&g_proj_next, effective_tol)
+                {
+                    return Ok(Solution::gradient_based(
+                        x_next.clone(),
+                        f_next,
+                        g_next.clone(),
+                        g_proj_next.dot(&g_proj_next).sqrt(),
                         None,
                         k + 1,
                         func_evals,
                         grad_evals,
                         0,
-                        reason,
+                        TerminationReason::GradientTolerance {
+                            grad_norm: g_proj_next.dot(&g_proj_next).sqrt(),
+                            threshold: effective_tol,
+                        },
+                    ));
+                }
+
+                // Gradient-independent cost-stall exit.
+                // Fold this accepted iterate into the guard, using the
+                // bound-PROJECTED gradient norm (the KKT residual) so a
+                // bound-pinned near-separable optimum whose raw gradient never
+                // vanishes can still certify. When the guard reports a stall it
+                // returns the best-so-far iterate; the stationarity verdict
+                // decides `CostStallConverged` (success) vs `CostStallFloor`.
+                if let Some(cost_stall) = self.cost_stall.as_mut() {
+                    let g_proj_norm = g_proj_next.dot(&g_proj_next).sqrt();
+                    // Move the resolver out for the call: holding `&mut
+                    // self.stall_resolver` across the rest of this loop body would
+                    // borrow `*self` for longer than the call needs.
+                    let mut resolver_slot = self.stall_resolver.take();
+                    let halt = cost_stall.observe(
+                        &x_next,
+                        f_next,
+                        &g_next,
+                        g_proj_norm,
+                        resolver_slot.as_deref_mut(),
+                    );
+                    self.stall_resolver = resolver_slot;
+                    if let Some(halt) = halt {
+                        let stall_cfg = &cost_stall.config;
+                        let reason = if halt.converged {
+                            TerminationReason::CostStallStationary {
+                                grad_norm: halt.grad_norm,
+                                threshold: stall_cfg.projected_grad_tol,
+                                window: stall_cfg.window,
+                            }
+                        } else {
+                            TerminationReason::CostStallFloor {
+                                grad_norm: halt.grad_norm,
+                                threshold: stall_cfg.projected_grad_tol,
+                                window: stall_cfg.window,
+                            }
+                        };
+                        let sol = Solution::gradient_based(
+                            halt.point,
+                            halt.value,
+                            halt.grad,
+                            halt.grad_norm,
+                            None,
+                            k + 1,
+                            func_evals,
+                            grad_evals,
+                            0,
+                            reason,
+                        );
+                        log::info!(
+                            "[BFGS] Cost-stall exit ({}): iters={}, f={:.6e}, ||g_proj||={:.3e}",
+                            if halt.converged {
+                                "converged at flat-valley floor"
+                            } else {
+                                "flat-valley floor, non-stationary"
+                            },
+                            sol.iterations,
+                            sol.final_value,
+                            sol.final_gradient_norm
+                                .expect("gradient-based solution must report gradient norm"),
+                        );
+                        return Ok(sol);
+                    }
+                }
+
+                // Update adaptive curvature slack scale and gradient drop factor based on flats
+                let f_ok_flat = (f_next - f_k).abs() <= eps_f(f_k, self.tau_f)
+                    || (f_next - f_k).abs() <= self.tol_f_rel * (1.0 + f_k.abs());
+                if f_ok_flat {
+                    self.flat_accept_streak += 1;
+                } else {
+                    self.flat_accept_streak = 0;
+                }
+                if self.flat_accept_streak >= 2 {
+                    self.curv_slack_scale = (self.curv_slack_scale * 0.5).max(0.1);
+                    self.grad_drop_factor = 0.95;
+                } else {
+                    self.curv_slack_scale = 1.0;
+                    self.grad_drop_factor = 0.9;
+                }
+
+                let mut y_k = &g_next - &g_k;
+
+                if self.bounds.is_some() {
+                    for i in 0..n {
+                        let tiny_step = s_k[i].abs() <= 1e-14 * (1.0 + x_k[i].abs());
+                        if (active_before[i] && active_after[i]) || tiny_step {
+                            s_k[i] = 0.0;
+                            y_k[i] = 0.0;
+                        }
+                    }
+                }
+
+                // --- Cautious Hessian Update ---
+                let sy = s_k.dot(&y_k);
+                let mut update_status = "applied";
+
+                if k == 0 && self.initial_b_inv.is_none() {
+                    // First-step Barzilai-Borwein scaling: γ = sᵀy / yᵀy, which
+                    // is the optimal step in the steepest-descent metric and a
+                    // standard L-BFGS warm-start. We OVERWRITE the inverse-Hessian
+                    // approximation with γI here only when no user-supplied
+                    // initial metric is in effect. If the caller provided one
+                    // via `with_initial_metric` / `with_initial_inverse_hessian`,
+                    // discarding it would silently defeat the whole point of the
+                    // builder method — the caller has more information than the
+                    // single-step Barzilai-Borwein estimate.
+                    let yy = y_k.dot(&y_k);
+                    let mut scale = if sy > 1e-12 && yy > 0.0 { sy / yy } else { 1.0 };
+                    if !scale.is_finite() {
+                        scale = 1.0;
+                    }
+                    scale = scale.clamp(1e-3, 1e3);
+                    b_inv = Array2::eye(n) * scale;
+                }
+
+                // Powell-damped inverse BFGS update (keep SPD).
+                let s_norm = s_k.dot(&s_k).sqrt();
+                if s_norm > 1e-14 {
+                    if !rescued {
+                        // Compute B s via CG on H (since H = B^{-1}) for Powell damping.
+                        let mean_diag =
+                            (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
+                        let ridge = (1e-10 * mean_diag).max(1e-16);
+                        if let Some(h_s) = cg_solve_adaptive(&b_inv, &s_k, 25, 1e-10, ridge) {
+                            let s_h_s = s_k.dot(&h_s);
+                            let denom_raw = s_h_s - sy;
+                            let denom = if denom_raw <= 0.0 { 1e-16 } else { denom_raw };
+                            // Powell damping: blend y and B s so that s^T y_tilde is sufficiently positive.
+                            let theta_raw = if sy < 0.2 * s_h_s {
+                                (0.8 * s_h_s) / denom
+                            } else {
+                                1.0
+                            };
+                            let theta = theta_raw.clamp(0.0, 1.0);
+                            let mut y_tilde = &y_k * theta + &h_s * (1.0 - theta);
+                            let mut sty = s_k.dot(&y_tilde);
+                            let mut y_norm = y_tilde.dot(&y_tilde).sqrt();
+                            let s_norm2 = s_norm * s_norm;
+                            let kappa = 1e-4;
+                            let min_curv = kappa * s_norm * y_norm;
+                            if sty < min_curv {
+                                let beta = (min_curv - sty) / s_norm2;
+                                y_tilde = &y_tilde + &s_k * beta;
+                                sty = s_k.dot(&y_tilde);
+                                y_norm = y_tilde.dot(&y_tilde).sqrt();
+                            }
+                            let rel = if s_norm > 0.0 && y_norm > 0.0 {
+                                sty / (s_norm * y_norm)
+                            } else {
+                                0.0
+                            };
+                            if !sty.is_finite() || rel < 1e-8 {
+                                log::warn!(
+                                    "[BFGS] s^T y_tilde non-positive/tiny; skipping update and inflating diag."
+                                );
+                                update_status = "skipped";
+                                self.chol_fail_iters += 1;
+                                for i in 0..n {
+                                    b_inv[[i, i]] *= 1.0 + 1e-3;
+                                }
+                            } else if !apply_inverse_bfgs_update_in_place(
+                                &mut b_inv,
+                                &s_k,
+                                &y_tilde,
+                                &mut b_inv_backup,
+                            ) {
+                                b_inv.assign(&b_inv_backup);
+                                for i in 0..n {
+                                    b_inv[[i, i]] += 1e-6;
+                                }
+                                update_status = "reverted";
+                            }
+                        } else {
+                            self.chol_fail_iters += 1;
+                            self.spd_fail_seen = true;
+                            log::warn!(
+                                "[BFGS] B_inv not SPD after ridge; skipping update this iter."
+                            );
+                            update_status = "skipped";
+                        }
+                    } else {
+                        log::info!(
+                            "[BFGS] Coordinate rescue used; skipping inverse update this iter."
+                        );
+                        update_status = "skipped";
+                    }
+
+                    // Enforce symmetry and gentle regularization
+                    for i in 0..n {
+                        for j in (i + 1)..n {
+                            let a = b_inv[[i, j]];
+                            let b = b_inv[[j, i]];
+                            let v = 0.5 * (a + b);
+                            b_inv[[i, j]] = v;
+                            b_inv[[j, i]] = v;
+                        }
+                    }
+                    let mut diag_min = f64::INFINITY;
+                    for i in 0..n {
+                        diag_min = diag_min.min(b_inv[[i, i]]);
+                    }
+                    if !diag_min.is_finite() || diag_min <= 0.0 {
+                        let mut trace = 0.0;
+                        for i in 0..n {
+                            trace += b_inv[[i, i]].abs();
+                        }
+                        let delta = 1e-12 * trace.max(1.0);
+                        for i in 0..n {
+                            b_inv[[i, i]] += delta;
+                        }
+                    }
+
+                    if self.spd_fail_seen && self.chol_fail_iters >= 2 {
+                        let sy = s_k.dot(&y_k);
+                        let yy = y_k.dot(&y_k);
+                        let mut lambda = if yy > 0.0 { (sy / yy).abs() } else { 1.0 };
+                        lambda = lambda.clamp(1e-6, 1e6);
+                        b_inv = scaled_identity(n, lambda);
+                        self.chol_fail_iters = 0;
+                        update_status = "reverted";
+                    }
+                } else {
+                    update_status = "skipped";
+                }
+
+                log::info!(
+                    "[BFGS] step accepted via {:?}; inverse update {}",
+                    accept_kind,
+                    update_status
+                );
+
+                // Stopping tests: small step and flat f
+                let step_ok = self.feasible_step_small(&x_k, &x_next);
+                let f_ok = (f_next - f_k).abs() <= eps_f(f_k, self.tau_f);
+                let gnext_finite = f_next.is_finite() && g_next.iter().all(|v| v.is_finite());
+                let gnext_norm = g_proj_next.dot(&g_proj_next).sqrt();
+                if step_ok && f_ok && gnext_finite && gnext_norm < effective_tol {
+                    let sol = Solution::gradient_based(
+                        x_next.clone(),
+                        f_next,
+                        g_next.clone(),
+                        gnext_norm,
+                        None,
+                        k + 1,
+                        func_evals,
+                        grad_evals,
+                        0,
+                        TerminationReason::SmallStepFlatObjective {
+                            step_norm: step_len,
+                            objective_change: f_next - f_k,
+                            grad_norm: gnext_norm,
+                            threshold: effective_tol,
+                        },
                     );
                     log::info!(
-                        "[BFGS] Cost-stall exit ({}): iters={}, f={:.6e}, ||g_proj||={:.3e}",
-                        if halt.converged {
-                            "converged at flat-valley floor"
-                        } else {
-                            "flat-valley floor, non-stationary"
-                        },
+                        "[BFGS] Converged by small step/flat f: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
                         sol.iterations,
                         sol.final_value,
                         sol.final_gradient_norm
                             .expect("gradient-based solution must report gradient norm"),
+                        sol.func_evals,
+                        sol.grad_evals,
+                        self.trust_radius
                     );
                     return Ok(sol);
                 }
-            }
 
-            // Update adaptive curvature slack scale and gradient drop factor based on flats
-            let f_ok_flat = (f_next - f_k).abs() <= eps_f(f_k, self.tau_f)
-                || (f_next - f_k).abs() <= self.tol_f_rel * (1.0 + f_k.abs());
-            if f_ok_flat {
-                self.flat_accept_streak += 1;
-            } else {
-                self.flat_accept_streak = 0;
-            }
-            if self.flat_accept_streak >= 2 {
-                self.curv_slack_scale = (self.curv_slack_scale * 0.5).max(0.1);
-                self.grad_drop_factor = 0.95;
-            } else {
-                self.curv_slack_scale = 1.0;
-                self.grad_drop_factor = 0.9;
-            }
-
-            let mut y_k = &g_next - &g_k;
-
-            if self.bounds.is_some() {
-                for i in 0..n {
-                    let tiny_step = s_k[i].abs() <= 1e-14 * (1.0 + x_k[i].abs());
-                    if (active_before[i] && active_after[i]) || tiny_step {
-                        s_k[i] = 0.0;
-                        y_k[i] = 0.0;
-                    }
-                }
-            }
-
-            // --- Cautious Hessian Update ---
-            let sy = s_k.dot(&y_k);
-            let mut update_status = "applied";
-
-            if k == 0 && self.initial_b_inv.is_none() {
-                // First-step Barzilai-Borwein scaling: γ = sᵀy / yᵀy, which
-                // is the optimal step in the steepest-descent metric and a
-                // standard L-BFGS warm-start. We OVERWRITE the inverse-Hessian
-                // approximation with γI here only when no user-supplied
-                // initial metric is in effect. If the caller provided one
-                // via `with_initial_metric` / `with_initial_inverse_hessian`,
-                // discarding it would silently defeat the whole point of the
-                // builder method — the caller has more information than the
-                // single-step Barzilai-Borwein estimate.
-                let yy = y_k.dot(&y_k);
-                let mut scale = if sy > 1e-12 && yy > 0.0 { sy / yy } else { 1.0 };
-                if !scale.is_finite() {
-                    scale = 1.0;
-                }
-                scale = scale.clamp(1e-3, 1e3);
-                b_inv = Array2::eye(n) * scale;
-            }
-
-            // Powell-damped inverse BFGS update (keep SPD).
-            let s_norm = s_k.dot(&s_k).sqrt();
-            if s_norm > 1e-14 {
-                if !rescued {
-                    // Compute B s via CG on H (since H = B^{-1}) for Powell damping.
-                    let mean_diag = (0..n).map(|i| b_inv[[i, i]].abs()).sum::<f64>() / (n as f64);
-                    let ridge = (1e-10 * mean_diag).max(1e-16);
-                    if let Some(h_s) = cg_solve_adaptive(&b_inv, &s_k, 25, 1e-10, ridge) {
-                        let s_h_s = s_k.dot(&h_s);
-                        let denom_raw = s_h_s - sy;
-                        let denom = if denom_raw <= 0.0 { 1e-16 } else { denom_raw };
-                        // Powell damping: blend y and B s so that s^T y_tilde is sufficiently positive.
-                        let theta_raw = if sy < 0.2 * s_h_s {
-                            (0.8 * s_h_s) / denom
-                        } else {
-                            1.0
-                        };
-                        let theta = theta_raw.clamp(0.0, 1.0);
-                        let mut y_tilde = &y_k * theta + &h_s * (1.0 - theta);
-                        let mut sty = s_k.dot(&y_tilde);
-                        let mut y_norm = y_tilde.dot(&y_tilde).sqrt();
-                        let s_norm2 = s_norm * s_norm;
-                        let kappa = 1e-4;
-                        let min_curv = kappa * s_norm * y_norm;
-                        if sty < min_curv {
-                            let beta = (min_curv - sty) / s_norm2;
-                            y_tilde = &y_tilde + &s_k * beta;
-                            sty = s_k.dot(&y_tilde);
-                            y_norm = y_tilde.dot(&y_tilde).sqrt();
-                        }
-                        let rel = if s_norm > 0.0 && y_norm > 0.0 {
-                            sty / (s_norm * y_norm)
-                        } else {
-                            0.0
-                        };
-                        if !sty.is_finite() || rel < 1e-8 {
-                            log::warn!(
-                                "[BFGS] s^T y_tilde non-positive/tiny; skipping update and inflating diag."
-                            );
-                            update_status = "skipped";
-                            self.chol_fail_iters += 1;
-                            for i in 0..n {
-                                b_inv[[i, i]] *= 1.0 + 1e-3;
-                            }
-                        } else if !apply_inverse_bfgs_update_in_place(
-                            &mut b_inv,
-                            &s_k,
-                            &y_tilde,
-                            &mut b_inv_backup,
-                        ) {
-                            b_inv.assign(&b_inv_backup);
-                            for i in 0..n {
-                                b_inv[[i, i]] += 1e-6;
-                            }
-                            update_status = "reverted";
-                        }
+                // Optional stall/flat exit (relative stationarity)
+                if let StallPolicy::On { window } = self.stall_policy {
+                    let g_inf = g_proj_k.iter().fold(0.0, |acc, &v| f64::max(acc, v.abs()));
+                    let x_inf = x_k.iter().fold(0.0, |acc, &v| f64::max(acc, v.abs()));
+                    let rel_g_ok = g_inf <= effective_tol * (1.0 + x_inf);
+                    let rel_f_ok =
+                        (f_k - f_last_accepted).abs() <= eps_f(f_last_accepted, self.tau_f);
+                    if rel_g_ok && rel_f_ok {
+                        self.stall_noimprove_streak += 1;
                     } else {
-                        self.chol_fail_iters += 1;
-                        self.spd_fail_seen = true;
-                        log::warn!("[BFGS] B_inv not SPD after ridge; skipping update this iter.");
-                        update_status = "skipped";
+                        self.stall_noimprove_streak = 0;
                     }
-                } else {
-                    log::info!("[BFGS] Coordinate rescue used; skipping inverse update this iter.");
-                    update_status = "skipped";
-                }
-
-                // Enforce symmetry and gentle regularization
-                for i in 0..n {
-                    for j in (i + 1)..n {
-                        let a = b_inv[[i, j]];
-                        let b = b_inv[[j, i]];
-                        let v = 0.5 * (a + b);
-                        b_inv[[i, j]] = v;
-                        b_inv[[j, i]] = v;
-                    }
-                }
-                let mut diag_min = f64::INFINITY;
-                for i in 0..n {
-                    diag_min = diag_min.min(b_inv[[i, i]]);
-                }
-                if !diag_min.is_finite() || diag_min <= 0.0 {
-                    let mut trace = 0.0;
-                    for i in 0..n {
-                        trace += b_inv[[i, i]].abs();
-                    }
-                    let delta = 1e-12 * trace.max(1.0);
-                    for i in 0..n {
-                        b_inv[[i, i]] += delta;
+                    if self.stall_noimprove_streak >= window {
+                        let sol = Solution::gradient_based(
+                            x_k.clone(),
+                            f_k,
+                            g_k.clone(),
+                            g_inf,
+                            None,
+                            k + 1,
+                            func_evals,
+                            grad_evals,
+                            0,
+                            TerminationReason::RelativeStationarityWindow {
+                                grad_inf: g_inf,
+                                threshold: effective_tol * (1.0 + x_inf),
+                                window,
+                            },
+                        );
+                        log::info!(
+                            "[BFGS] Converged (flat/stalled): iters={}, f={:.6e}, ||g||={:.3e}",
+                            sol.iterations,
+                            sol.final_value,
+                            sol.final_gradient_norm
+                                .expect("gradient-based solution must report gradient norm")
+                        );
+                        return Ok(sol);
                     }
                 }
 
-                if self.spd_fail_seen && self.chol_fail_iters >= 2 {
-                    let sy = s_k.dot(&y_k);
-                    let yy = y_k.dot(&y_k);
-                    let mut lambda = if yy > 0.0 { (sy / yy).abs() } else { 1.0 };
-                    lambda = lambda.clamp(1e-6, 1e6);
-                    b_inv = scaled_identity(n, lambda);
-                    self.chol_fail_iters = 0;
-                    update_status = "reverted";
+                // Observer hook: BFGS accepts whenever the line search
+                // produces a usable step. Predicted decrease is N/A in
+                // BFGS (no quadratic model in the same sense as TR), so
+                // we report `f64::NAN`. `trust_radius` is `None` because
+                // BFGS doesn't expose one to the public API.
+                //
+                // `step_len` (computed above from `s_k = &x_next - &x_k`,
+                // before the bound-active zeroing of `s_k`) is already the
+                // Euclidean norm of `x_next - x_k` — `x_k`/`x_next` are
+                // untouched since — so reuse it instead of re-subtracting into
+                // two fresh arrays every accepted iteration.
+                let bfgs_step_norm = step_len;
+                if let Some(obs) = self.observer.as_mut() {
+                    obs.on_step_accepted(&StepInfo {
+                        iter: k,
+                        step_norm: bfgs_step_norm,
+                        predicted_decrease: f64::NAN,
+                        actual_decrease: f_k - f_next,
+                        trust_radius: None,
+                    });
                 }
-            } else {
-                update_status = "skipped";
+                x_k = x_next;
+                f_k = f_next;
+                g_k = g_next;
+                g_proj_k = g_proj_next;
+                active_mask = active_after;
+                // The iterate has moved: line-search probes taken at the old
+                // iterate cannot recur, so drop the value-probe memo (no-op
+                // when the memo is disabled).
+                oracle.clear_probe_memo();
+                // Update GLL window and global best
+                self.gll.push(f_k);
+                f_last_accepted = f_k;
+                let maybe_f = self.global_best.as_ref().map(|b| b.f);
+                match maybe_f {
+                    Some(bf) => {
+                        if f_k < bf - eps_f(bf, self.tau_f) {
+                            self.global_best = Some(ProbeBest {
+                                f: f_k,
+                                x: x_k.clone(),
+                                g: g_k.clone(),
+                            });
+                        }
+                    }
+                    None => {
+                        self.global_best = Some(ProbeBest::new(&x_k, f_k, &g_k));
+                    }
+                }
+
+                // Nonmonotone stickiness countdown
+                // We return to StrongWolfe only after a run of clean backtracking
+                // successes (handled above via `bt_clean_successes`).
             }
 
-            log::info!(
-                "[BFGS] step accepted via {:?}; inverse update {}",
-                accept_kind,
-                update_status
+            // The loop finished. Construct a solution from the final state.
+            let final_g_norm = g_proj_k.dot(&g_proj_k).sqrt();
+            let last_solution = Box::new(Solution::gradient_based(
+                x_k,
+                f_k,
+                g_k,
+                final_g_norm,
+                None,
+                self.max_iterations,
+                func_evals,
+                grad_evals,
+                0,
+                TerminationReason::IterationBudget {
+                    iterations: self.max_iterations,
+                    grad_norm: final_g_norm,
+                    threshold: effective_tol,
+                },
+            ));
+            log::warn!(
+                "[BFGS] Max iterations reached: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
+                self.max_iterations,
+                last_solution.final_value,
+                last_solution
+                    .final_gradient_norm
+                    .expect("gradient-based solution must report gradient norm"),
+                last_solution.func_evals,
+                last_solution.grad_evals,
+                self.trust_radius
             );
-
-            // Stopping tests: small step and flat f
-            let step_ok = self.feasible_step_small(&x_k, &x_next);
-            let f_ok = (f_next - f_k).abs() <= eps_f(f_k, self.tau_f);
-            let gnext_finite = f_next.is_finite() && g_next.iter().all(|v| v.is_finite());
-            let gnext_norm = g_proj_next.dot(&g_proj_next).sqrt();
-            if step_ok && f_ok && gnext_finite && gnext_norm < effective_tol {
-                let sol = Solution::gradient_based(
-                    x_next.clone(),
-                    f_next,
-                    g_next.clone(),
-                    gnext_norm,
-                    None,
-                    k + 1,
-                    func_evals,
-                    grad_evals,
-                    0,
-                    TerminationReason::SmallStepFlatObjective {
-                        step_norm: step_len,
-                        objective_change: f_next - f_k,
-                        grad_norm: gnext_norm,
-                        threshold: effective_tol,
-                    },
-                );
-                log::info!(
-                    "[BFGS] Converged by small step/flat f: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
-                    sol.iterations,
-                    sol.final_value,
-                    sol.final_gradient_norm
-                        .expect("gradient-based solution must report gradient norm"),
-                    sol.func_evals,
-                    sol.grad_evals,
-                    self.trust_radius
-                );
-                return Ok(sol);
-            }
-
-            // Optional stall/flat exit (relative stationarity)
-            if let StallPolicy::On { window } = self.stall_policy {
-                let g_inf = g_proj_k.iter().fold(0.0, |acc, &v| f64::max(acc, v.abs()));
-                let x_inf = x_k.iter().fold(0.0, |acc, &v| f64::max(acc, v.abs()));
-                let rel_g_ok = g_inf <= effective_tol * (1.0 + x_inf);
-                let rel_f_ok = (f_k - f_last_accepted).abs() <= eps_f(f_last_accepted, self.tau_f);
-                if rel_g_ok && rel_f_ok {
-                    self.stall_noimprove_streak += 1;
-                } else {
-                    self.stall_noimprove_streak = 0;
-                }
-                if self.stall_noimprove_streak >= window {
-                    let sol = Solution::gradient_based(
-                        x_k.clone(),
-                        f_k,
-                        g_k.clone(),
-                        g_inf,
-                        None,
-                        k + 1,
-                        func_evals,
-                        grad_evals,
-                        0,
-                        TerminationReason::RelativeStationarityWindow {
-                            grad_inf: g_inf,
-                            threshold: effective_tol * (1.0 + x_inf),
-                            window,
-                        },
-                    );
-                    log::info!(
-                        "[BFGS] Converged (flat/stalled): iters={}, f={:.6e}, ||g||={:.3e}",
-                        sol.iterations,
-                        sol.final_value,
-                        sol.final_gradient_norm
-                            .expect("gradient-based solution must report gradient norm")
-                    );
-                    return Ok(sol);
-                }
-            }
-
-            // Observer hook: BFGS accepts whenever the line search
-            // produces a usable step. Predicted decrease is N/A in
-            // BFGS (no quadratic model in the same sense as TR), so
-            // we report `f64::NAN`. `trust_radius` is `None` because
-            // BFGS doesn't expose one to the public API.
-            //
-            // `step_len` (computed above from `s_k = &x_next - &x_k`,
-            // before the bound-active zeroing of `s_k`) is already the
-            // Euclidean norm of `x_next - x_k` — `x_k`/`x_next` are
-            // untouched since — so reuse it instead of re-subtracting into
-            // two fresh arrays every accepted iteration.
-            let bfgs_step_norm = step_len;
-            if let Some(obs) = self.observer.as_mut() {
-                obs.on_step_accepted(&StepInfo {
-                    iter: k,
-                    step_norm: bfgs_step_norm,
-                    predicted_decrease: f64::NAN,
-                    actual_decrease: f_k - f_next,
-                    trust_radius: None,
-                });
-            }
-            x_k = x_next;
-            f_k = f_next;
-            g_k = g_next;
-            g_proj_k = g_proj_next;
-            active_mask = active_after;
-            // The iterate has moved: line-search probes taken at the old
-            // iterate cannot recur, so drop the value-probe memo (no-op
-            // when the memo is disabled).
-            oracle.clear_probe_memo();
-            // Update GLL window and global best
-            self.gll.push(f_k);
-            f_last_accepted = f_k;
-            let maybe_f = self.global_best.as_ref().map(|b| b.f);
-            match maybe_f {
-                Some(bf) => {
-                    if f_k < bf - eps_f(bf, self.tau_f) {
-                        self.global_best = Some(ProbeBest {
-                            f: f_k,
-                            x: x_k.clone(),
-                            g: g_k.clone(),
-                        });
-                    }
-                }
-                None => {
-                    self.global_best = Some(ProbeBest::new(&x_k, f_k, &g_k));
-                }
-            }
-
-            // Nonmonotone stickiness countdown
-            // We return to StrongWolfe only after a run of clean backtracking
-            // successes (handled above via `bt_clean_successes`).
+            Err(BfgsError::MaxIterationsReached { last_solution })
+        })();
+        if result.is_ok()
+            && let Some(output) = metric_output
+        {
+            *output = Some(b_inv);
         }
-
-        // The loop finished. Construct a solution from the final state.
-        let final_g_norm = g_proj_k.dot(&g_proj_k).sqrt();
-        let last_solution = Box::new(Solution::gradient_based(
-            x_k,
-            f_k,
-            g_k,
-            final_g_norm,
-            None,
-            self.max_iterations,
-            func_evals,
-            grad_evals,
-            0,
-            TerminationReason::IterationBudget {
-                iterations: self.max_iterations,
-                grad_norm: final_g_norm,
-                threshold: effective_tol,
-            },
-        ));
-        log::warn!(
-            "[BFGS] Max iterations reached: iters={}, f={:.6e}, ||g||={:.3e}, fe={}, ge={}, Δ={:.3e}",
-            self.max_iterations,
-            last_solution.final_value,
-            last_solution
-                .final_gradient_norm
-                .expect("gradient-based solution must report gradient norm"),
-            last_solution.func_evals,
-            last_solution.grad_evals,
-            self.trust_radius
-        );
-        Err(BfgsError::MaxIterationsReached { last_solution })
+        result
     }
 }
 
@@ -9988,7 +10024,20 @@ where
     /// Executes the BFGS algorithm with the adaptive hybrid line search.
     /// Requires `&mut self` to support stateful `FnMut` objectives.
     pub fn run(&mut self) -> Result<Solution, BfgsError> {
-        self.core.run(&mut self.obj_fn)
+        self.core.run(&mut self.obj_fn, None)
+    }
+
+    /// Run BFGS and retain its last inverse search metric without copying
+    /// the matrix or reevaluating the objective. The metric is a quasi-Newton
+    /// approximation, not an observed Hessian or a posterior covariance.
+    /// A stationary initial point retains the configured initial metric.
+    pub fn run_with_metric(&mut self) -> Result<(Solution, Array2<f64>), BfgsError> {
+        let mut metric = None;
+        let solution = self.core.run(&mut self.obj_fn, Some(&mut metric))?;
+        let metric = metric.ok_or_else(|| BfgsError::InternalInvariant {
+            message: "successful BFGS run did not retain its search metric".to_string(),
+        })?;
+        Ok((solution, metric))
     }
 
     /// Run the solver and return a structured report instead of a
@@ -10001,7 +10050,7 @@ where
     /// `solution` is the best point seen during the run (or, on early
     /// numerical failure, a placeholder built from the initial point).
     pub fn run_report(&mut self) -> OptimizationReport {
-        let outcome = self.core.run(&mut self.obj_fn);
+        let outcome = self.core.run(&mut self.obj_fn, None);
         outcome_into_report(&self.core.x0, outcome)
     }
 
@@ -11566,8 +11615,7 @@ where
     /// the curvature set the step, so the decrease there is not the
     /// decrement. Non-finite or non-positive `tol` disables the rung.
     pub fn with_model_decrement_tolerance(mut self, tol: f64) -> Self {
-        self.core.model_decrement_tolerance =
-            (tol.is_finite() && tol > 0.0).then_some(tol);
+        self.core.model_decrement_tolerance = (tol.is_finite() && tol > 0.0).then_some(tol);
         self
     }
 
@@ -13101,7 +13149,6 @@ mod tests {
         backtracking_line_search, escalate_ridge, optimize,
     };
     use ndarray::{Array1, Array2, array};
-    use spectral::prelude::*;
 
     // --- Test Harness: Python scipy.optimize Comparison Setup ---
     use std::path::PathBuf;
@@ -14858,17 +14905,16 @@ mod tests {
         // condition: its directional derivative is -1 everywhere. Classical
         // Armijo backtracking must accept alpha=1 immediately instead of
         // halving a strictly improving step toward the incumbent.
-        let (alpha, f_new, _, func_evals, grad_evals, kind) =
-            super::bfgs_backtracking_line_search(
-                &mut core,
-                &mut bfgs_oracle(|x: &Array1<f64>| (-x[0], array![-1.0])),
-                &mut oracle,
-                &x_k,
-                &d_k,
-                f_k,
-                &g_k,
-            )
-            .expect("Armijo recovery must accept a finite sufficient-decrease step");
+        let (alpha, f_new, _, func_evals, grad_evals, kind) = super::bfgs_backtracking_line_search(
+            &mut core,
+            &mut bfgs_oracle(|x: &Array1<f64>| (-x[0], array![-1.0])),
+            &mut oracle,
+            &x_k,
+            &d_k,
+            f_k,
+            &g_k,
+        )
+        .expect("Armijo recovery must accept a finite sufficient-decrease step");
 
         assert_eq!(alpha, 1.0);
         assert_eq!(f_new, -1.0);
@@ -15524,8 +15570,8 @@ mod tests {
     fn test_quadratic_bowl_converges() {
         let x0 = array![10.0, -5.0];
         let Solution { final_point, .. } = Bfgs::new(x0, bfgs_oracle(quadratic)).run().unwrap();
-        assert_that!(&final_point[0]).is_close_to(0.0, 1e-5);
-        assert_that!(&final_point[1]).is_close_to(0.0, 1e-5);
+        assert!(final_point[0].abs() <= 1e-5);
+        assert!(final_point[1].abs() <= 1e-5);
     }
 
     #[test]
@@ -15534,8 +15580,8 @@ mod tests {
         let Solution { final_point, .. } = optimize(Problem::new(x0, bfgs_oracle(quadratic)))
             .run()
             .unwrap();
-        assert_that!(&final_point[0]).is_close_to(0.0, 1e-5);
-        assert_that!(&final_point[1]).is_close_to(0.0, 1e-5);
+        assert!(final_point[0].abs() <= 1e-5);
+        assert!(final_point[1].abs() <= 1e-5);
     }
 
     #[test]
@@ -15547,8 +15593,8 @@ mod tests {
         ))
         .run()
         .unwrap();
-        assert_that!(&final_point[0]).is_close_to(1.0, 1e-5);
-        assert_that!(&final_point[1]).is_close_to(1.0, 1e-5);
+        assert!((final_point[0] - 1.0).abs() <= 1e-5);
+        assert!((final_point[1] - 1.0).abs() <= 1e-5);
     }
 
     #[test]
@@ -15573,16 +15619,16 @@ mod tests {
             .with_max_iterations(iters(1000))
             .run()
             .unwrap();
-        assert_that!(&sol.final_point[0]).is_close_to(0.0, 1e-6);
-        assert_that!(&sol.final_point[1]).is_close_to(0.0, 1e-6);
+        assert!(sol.final_point[0].abs() <= 1e-6);
+        assert!(sol.final_point[1].abs() <= 1e-6);
     }
 
     #[test]
     fn test_rosenbrock_converges() {
         let x0 = array![-1.2, 1.0];
         let Solution { final_point, .. } = Bfgs::new(x0, bfgs_oracle(rosenbrock)).run().unwrap();
-        assert_that!(&final_point[0]).is_close_to(1.0, 1e-5);
-        assert_that!(&final_point[1]).is_close_to(1.0, 1e-5);
+        assert!((final_point[0] - 1.0).abs() <= 1e-5);
+        assert!((final_point[1] - 1.0).abs() <= 1e-5);
     }
 
     // --- 2. Failure and Edge Case Tests ---
@@ -15594,7 +15640,7 @@ mod tests {
             .with_tolerance(tol(1e-5))
             .run()
             .unwrap();
-        assert_that(&iterations).is_less_than_or_equal_to(1);
+        assert!(iterations <= 1);
     }
 
     #[test]
@@ -15609,8 +15655,7 @@ mod tests {
             Err(BfgsError::MaxIterationsReached { last_solution }) => {
                 assert_eq!(last_solution.iterations, max_iterations);
                 // Also check that the point is not the origin, i.e., that some work was done.
-                assert_that!(&last_solution.final_point.dot(&last_solution.final_point))
-                    .is_greater_than(0.0);
+                assert!(last_solution.final_point.dot(&last_solution.final_point) > 0.0);
             }
             _ => panic!("Expected MaxIterationsReached error, but got {:?}", result),
         }
@@ -15940,12 +15985,12 @@ mod tests {
         let distance = ((our_res.final_point[0] - scipy_point[0]).powi(2)
             + (our_res.final_point[1] - scipy_point[1]).powi(2))
         .sqrt();
-        assert_that!(&distance).is_less_than(1e-5);
+        assert!(distance < 1e-5);
 
         // Assert that the number of iterations is very similar. A small difference
         // is acceptable due to minor, valid variations in line search implementations.
         let iter_diff = (our_res.iterations as i64 - scipy_res.iterations.unwrap() as i64).abs();
-        assert_that(&iter_diff).is_less_than_or_equal_to(10);
+        assert!(iter_diff <= 10);
 
         let PythonOptResult {
             final_value,
@@ -16052,8 +16097,8 @@ mod tests {
         match result {
             Ok(soln) => {
                 // If it did converge, verify it's on the correct line of minima.
-                assert_that!(&soln.final_point[0]).is_close_to(-soln.final_point[1], 1e-5);
-                assert_that!(&gradient_norm(&soln)).is_less_than(1e-8);
+                assert!((soln.final_point[0] + soln.final_point[1]).abs() <= 1e-5);
+                assert!(gradient_norm(&soln) < 1e-8);
             }
             Err(BfgsError::MaxIterationsReached { .. }) => {
                 // Hitting the iteration limit is an acceptable and expected outcome. Pass.
@@ -16223,7 +16268,7 @@ mod tests {
             sum += solver.next_rand_sym();
         }
         let mean = sum / (n as f64);
-        assert_that!(&mean.abs()).is_less_than(5e-3);
+        assert!(mean.abs() < 5e-3);
     }
 
     // -----------------------------------------------------------------
@@ -16618,7 +16663,11 @@ mod tests {
             .final_point
             .iter()
             .any(|v| (v - 1.0).abs() > 1.0);
-        assert!(far, "one 1e-3 step cannot reach the minimum: {:?}", report.solution.final_point);
+        assert!(
+            far,
+            "one 1e-3 step cannot reach the minimum: {:?}",
+            report.solution.final_point
+        );
     }
 
     /// The interior-decrement rung stops where the caller's declared
@@ -17153,6 +17202,43 @@ mod tests {
                 super::StallPolicy::Off
             ),
             "a consumer with its own guard and certificate must have one termination authority"
+        );
+    }
+
+    #[test]
+    fn bfgs_retained_metric_preserves_the_search_and_repeated_run_state() {
+        let objective = || {
+            FusedObjective::new(|x: &Array1<f64>| {
+                Ok(FirstOrderSample {
+                    value: 2.0 * (x[0] - 1.0).powi(2),
+                    gradient: array![4.0 * (x[0] - 1.0)],
+                })
+            })
+        };
+        let mut ordinary = Bfgs::new(array![3.0], objective()).without_relative_stall();
+        let plain = ordinary.run().unwrap();
+        let mut retained = Bfgs::new(array![3.0], objective()).without_relative_stall();
+        let (solution, metric) = retained.run_with_metric().unwrap();
+        assert_eq!(solution.final_point, plain.final_point);
+        assert_eq!(solution.func_evals, plain.func_evals);
+        assert_eq!(solution.grad_evals, plain.grad_evals);
+        assert!((metric[[0, 0]] - 0.25).abs() < 1e-12);
+        let (again, next_metric) = retained.run_with_metric().unwrap();
+        assert_eq!(again.final_point, solution.final_point);
+        assert_eq!(again.func_evals, solution.func_evals);
+        assert_eq!(next_metric, metric);
+        let (stationary, initial_metric) = Bfgs::new(array![1.0], objective())
+            .with_initial_metric(InitialMetric::Scalar(0.7))
+            .run_with_metric()
+            .unwrap();
+        assert_eq!(stationary.iterations, 0);
+        assert_eq!(initial_metric[[0, 0]], 0.7);
+        assert!(
+            Bfgs::new(array![3.0], objective())
+                .with_max_iterations(MaxIterations::new(1).unwrap())
+                .with_initial_metric(InitialMetric::Scalar(f64::NAN))
+                .run_with_metric()
+                .is_err()
         );
     }
 
