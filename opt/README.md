@@ -94,8 +94,6 @@ assert!(grad_norm < 1e-5);
 assert!(iterations > 0);
 ```
 
-For cost-only objectives, wrap a `ZerothOrderObjective` with `FiniteDiffGradient`.
-
 ### Example: Second-Order Optimization
 
 Use `SecondOrderProblem` with `optimize` for automatic solver selection, or construct `NewtonTrustRegion` and `Arc` directly when you want explicit control over the algorithm choice.

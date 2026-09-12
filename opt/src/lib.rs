@@ -2775,48 +2775,6 @@ impl Bounds {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum FiniteDiffStencil {
-    Central { h: f64 },
-    Forward { h: f64 },
-    Backward { h: f64 },
-    Fixed,
-}
-
-fn finite_difference_stencil(
-    bounds: Option<&BoxSpec>,
-    x: &Array1<f64>,
-    i: usize,
-    base_h: f64,
-) -> FiniteDiffStencil {
-    if !base_h.is_finite() || base_h <= 0.0 {
-        return FiniteDiffStencil::Fixed;
-    }
-    if let Some(bounds) = bounds {
-        let room_lo = (x[i] - bounds.lower[i]).max(0.0);
-        let room_hi = (bounds.upper[i] - x[i]).max(0.0);
-        if room_lo >= base_h && room_hi >= base_h {
-            FiniteDiffStencil::Central { h: base_h }
-        } else if room_hi >= room_lo && room_hi > 0.0 {
-            FiniteDiffStencil::Forward {
-                h: base_h.min(room_hi),
-            }
-        } else if room_lo > 0.0 {
-            FiniteDiffStencil::Backward {
-                h: base_h.min(room_lo),
-            }
-        } else if room_hi > 0.0 {
-            FiniteDiffStencil::Forward {
-                h: base_h.min(room_hi),
-            }
-        } else {
-            FiniteDiffStencil::Fixed
-        }
-    } else {
-        FiniteDiffStencil::Central { h: base_h }
-    }
-}
-
 // An enum to manage the adaptive strategy.
 #[derive(Debug, Clone, Copy)]
 enum LineSearchStrategy {
@@ -2827,13 +2785,6 @@ enum LineSearchStrategy {
 /// Policy controlling whether `NewtonTrustRegion` / `Arc` may demote to a
 /// first-order BFGS fallback when the second-order step fails to make
 /// progress (line-search failure, persistent trust-region rejection).
-///
-/// This is independent of `HessianFallbackPolicy`, which controls what
-/// happens when the *Hessian itself* is missing from a sample. The two
-/// can be combined: a caller can require an exact dense Hessian on every
-/// evaluation (`HessianFallbackPolicy::Error`) while still allowing the
-/// trust-region solver to retreat to BFGS if the Hessian-driven step
-/// repeatedly fails (`FallbackPolicy::AutoBfgs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackPolicy {
     /// Never demote. On step failure the solver returns its best-seen
@@ -2842,30 +2793,6 @@ pub enum FallbackPolicy {
     /// On step failure, switch to a BFGS run from the current best
     /// point. Used by `Profile::Robust` and `Profile::Aggressive`.
     AutoBfgs,
-}
-
-/// What `NewtonTrustRegion` / `Arc` should do when an objective returns
-/// `SecondOrderSample { hessian: None }` (i.e. no analytic Hessian was
-/// supplied for this evaluation).
-///
-/// The default is `FiniteDifference`. Callers with exact analytic Hessians should set
-/// `Error`: a single `None` then surfaces as a fatal evaluation error
-/// instead of silently triggering O(n) extra gradient probes per
-/// iteration. This matters most when each gradient probe is itself
-/// expensive (nested solves, biobank-scale outer iterations).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum HessianFallbackPolicy {
-    /// Treat a missing Hessian as a fatal evaluation error. Use this
-    /// when the caller guarantees the objective always supplies an
-    /// analytic Hessian — a `None` then indicates a routing/contract
-    /// mismatch and should fail loudly rather than be papered over by
-    /// finite differences.
-    Error,
-    /// Estimate the Hessian by finite-differencing the gradient when
-    /// it is missing. This is the historical default. Step size comes
-    /// from `with_fd_hessian_step`.
-    #[default]
-    FiniteDifference,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3442,9 +3369,8 @@ pub enum HessianValue {
     /// the operator cheap to clone and share between callers (e.g. a
     /// caller-side cache and the solver).
     Operator(StdArc<dyn HessianOperator>),
-    /// No analytic Hessian for this evaluation. Whether this is fatal
-    /// or triggers finite-difference estimation depends on the
-    /// solver's `HessianFallbackPolicy`.
+    /// No analytic Hessian for this evaluation. Second-order solvers
+    /// surface this as a fatal evaluation error.
     Unavailable,
 }
 
@@ -4810,8 +4736,6 @@ pub trait ZerothOrderObjective {
 
 pub trait FirstOrderObjective: ZerothOrderObjective {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError>;
-
-    fn set_finite_difference_bounds(&mut self, _bounds: Option<&Bounds>) {}
 }
 
 /// Adapts an objective that naturally computes value and gradient together to
@@ -5086,92 +5010,6 @@ pub trait SecondOrderObjectiveInto: SecondOrderObjective {
 
 impl<T: SecondOrderObjective + ?Sized> SecondOrderObjectiveInto for T {}
 
-pub struct FiniteDiffGradient<ObjFn> {
-    inner: ObjFn,
-    step: f64,
-    bounds: Option<Bounds>,
-}
-
-impl<ObjFn> FiniteDiffGradient<ObjFn> {
-    pub fn new(inner: ObjFn) -> Self {
-        Self {
-            inner,
-            step: 1e-4,
-            bounds: None,
-        }
-    }
-
-    pub fn with_step(mut self, step: f64) -> Self {
-        self.step = step;
-        self
-    }
-
-    pub fn with_bounds(mut self, bounds: Bounds) -> Self {
-        self.bounds = Some(bounds);
-        self
-    }
-}
-
-impl<ObjFn> ZerothOrderObjective for FiniteDiffGradient<ObjFn>
-where
-    ObjFn: ZerothOrderObjective,
-{
-    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        self.inner.eval_cost(x)
-    }
-}
-
-impl<ObjFn> FirstOrderObjective for FiniteDiffGradient<ObjFn>
-where
-    ObjFn: ZerothOrderObjective,
-{
-    fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
-        if !self.step.is_finite() || self.step <= 0.0 {
-            return Err(ObjectiveEvalError::fatal(
-                "finite-difference gradient step must be positive and finite",
-            ));
-        }
-        let value = recover_on_nonfinite_cost(self.inner.eval_cost(x)?)?;
-        let mut gradient = Array1::<f64>::zeros(x.len());
-        for i in 0..x.len() {
-            let h = self.step * (1.0 + x[i].abs());
-            match finite_difference_stencil(self.bounds.as_ref().map(|b| &b.spec), x, i, h) {
-                FiniteDiffStencil::Central { h } => {
-                    let mut xp = x.clone();
-                    xp[i] += h;
-                    let fp = recover_on_nonfinite_cost(self.inner.eval_cost(&xp)?)?;
-                    let mut xm = x.clone();
-                    xm[i] -= h;
-                    let fm = recover_on_nonfinite_cost(self.inner.eval_cost(&xm)?)?;
-                    gradient[i] = (fp - fm) / (2.0 * h);
-                }
-                FiniteDiffStencil::Forward { h } => {
-                    let mut xp = x.clone();
-                    xp[i] += h;
-                    let fp = recover_on_nonfinite_cost(self.inner.eval_cost(&xp)?)?;
-                    gradient[i] = (fp - value) / h;
-                }
-                FiniteDiffStencil::Backward { h } => {
-                    let mut xm = x.clone();
-                    xm[i] -= h;
-                    let fm = recover_on_nonfinite_cost(self.inner.eval_cost(&xm)?)?;
-                    gradient[i] = (value - fm) / h;
-                }
-                FiniteDiffStencil::Fixed => {
-                    gradient[i] = 0.0;
-                }
-            }
-        }
-        Ok(FirstOrderSample { value, gradient })
-    }
-
-    fn set_finite_difference_bounds(&mut self, bounds: Option<&Bounds>) {
-        self.bounds = bounds.map(|bounds| Bounds {
-            spec: bounds.spec.clone(),
-        });
-    }
-}
-
 pub struct Problem<ObjFn> {
     x0: Array1<f64>,
     objective: ObjFn,
@@ -5197,7 +5035,6 @@ where
     }
 
     pub fn with_bounds(mut self, bounds: Bounds) -> Self {
-        self.objective.set_finite_difference_bounds(Some(&bounds));
         self.bounds = Some(bounds);
         self
     }
@@ -5225,7 +5062,6 @@ pub struct SecondOrderProblem<ObjFn> {
     tolerance: Tolerance,
     max_iterations: MaxIterations,
     profile: Profile,
-    fd_hessian_step: f64,
 }
 
 impl<ObjFn> SecondOrderProblem<ObjFn>
@@ -5240,12 +5076,10 @@ where
             tolerance: Tolerance::DEFAULT,
             max_iterations: MaxIterations::DEFAULT,
             profile: Profile::Robust,
-            fd_hessian_step: 1e-4,
         }
     }
 
     pub fn with_bounds(mut self, bounds: Bounds) -> Self {
-        self.objective.set_finite_difference_bounds(Some(&bounds));
         self.bounds = Some(bounds);
         self
     }
@@ -5262,11 +5096,6 @@ where
 
     pub fn with_profile(mut self, profile: Profile) -> Self {
         self.profile = profile;
-        self
-    }
-
-    pub fn with_fd_hessian_step(mut self, fd_hessian_step: f64) -> Self {
-        self.fd_hessian_step = fd_hessian_step;
         self
     }
 }
@@ -5337,15 +5166,13 @@ where
             tolerance,
             max_iterations,
             profile,
-            fd_hessian_step,
         } = self;
         let use_arc = matches!(profile, Profile::Aggressive);
         if use_arc {
             let mut solver = Arc::new(x0, objective)
                 .with_tolerance(tolerance)
                 .with_max_iterations(max_iterations)
-                .with_profile(profile)
-                .with_fd_hessian_step(fd_hessian_step);
+                .with_profile(profile);
             if let Some(bounds) = bounds {
                 solver = solver.with_bounds(bounds);
             }
@@ -5354,8 +5181,7 @@ where
             let mut solver = NewtonTrustRegion::new(x0, objective)
                 .with_tolerance(tolerance)
                 .with_max_iterations(max_iterations)
-                .with_profile(profile)
-                .with_fd_hessian_step(fd_hessian_step);
+                .with_profile(profile);
             if let Some(bounds) = bounds {
                 solver = solver.with_bounds(bounds);
             }
@@ -5494,10 +5320,6 @@ where
 {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.inner.eval_grad(x)
-    }
-
-    fn set_finite_difference_bounds(&mut self, bounds: Option<&Bounds>) {
-        self.inner.set_finite_difference_bounds(bounds);
     }
 }
 
@@ -5681,24 +5503,16 @@ struct SecondOrderCache {
     last_grad: Array1<f64>,
     last_hessian: SymmetricMatrix,
     have_last_sample: bool,
-    fd_hessian_step: f64,
-    /// Decides what `eval_cost_grad_hessian` does when the objective
-    /// returns `SecondOrderSample { hessian: None }`: estimate by
-    /// finite-differencing the gradient (legacy behavior) or surface a
-    /// fatal evaluation error.
-    hessian_fallback_policy: HessianFallbackPolicy,
 }
 
 impl SecondOrderCache {
-    fn new(n: usize, fd_hessian_step: f64, hessian_fallback_policy: HessianFallbackPolicy) -> Self {
+    fn new(n: usize) -> Self {
         Self {
             last_x: None,
             last_cost: None,
             last_grad: Array1::zeros(n),
             last_hessian: SymmetricMatrix::from_verified(Array2::zeros((n, n))),
             have_last_sample: false,
-            fd_hessian_step,
-            hessian_fallback_policy,
         }
     }
 
@@ -5757,8 +5571,7 @@ impl SecondOrderCache {
         } else {
             // Cache only the (cost, grad) component when the sample
             // omits the Hessian. The first eval_cost_grad_hessian call
-            // will recompute the Hessian (or honor the
-            // HessianFallbackPolicy::Error policy).
+            // re-evaluates the objective for it.
             self.have_last_sample = false;
         }
         self.last_x = Some(x.clone());
@@ -5767,71 +5580,10 @@ impl SecondOrderCache {
         Ok(())
     }
 
-    fn finite_difference_hessian<ObjFn>(
-        &mut self,
-        obj_fn: &mut ObjFn,
-        x: &Array1<f64>,
-        center_gradient: &Array1<f64>,
-        bounds: Option<&BoxSpec>,
-        func_evals: &mut usize,
-        grad_evals: &mut usize,
-    ) -> Result<Array2<f64>, ObjectiveEvalError>
-    where
-        ObjFn: SecondOrderObjective,
-    {
-        if !self.fd_hessian_step.is_finite() || self.fd_hessian_step <= 0.0 {
-            return Err(ObjectiveEvalError::fatal(
-                "finite-difference Hessian step must be positive and finite",
-            ));
-        }
-        let n = x.len();
-        let mut hessian = Array2::<f64>::zeros((n, n));
-        for j in 0..n {
-            let h = self.fd_hessian_step * (1.0 + x[j].abs());
-            let column = match finite_difference_stencil(bounds, x, j, h) {
-                FiniteDiffStencil::Central { h } => {
-                    let mut xp = x.clone();
-                    xp[j] += h;
-                    let gp = sanitize_first_order_sample(obj_fn.eval_grad(&xp)?)?;
-                    *func_evals += 1;
-                    *grad_evals += 1;
-
-                    let mut xm = x.clone();
-                    xm[j] -= h;
-                    let gm = sanitize_first_order_sample(obj_fn.eval_grad(&xm)?)?;
-                    *func_evals += 1;
-                    *grad_evals += 1;
-
-                    (&gp.gradient - &gm.gradient) / (2.0 * h)
-                }
-                FiniteDiffStencil::Forward { h } => {
-                    let mut xp = x.clone();
-                    xp[j] += h;
-                    let gp = sanitize_first_order_sample(obj_fn.eval_grad(&xp)?)?;
-                    *func_evals += 1;
-                    *grad_evals += 1;
-                    (&gp.gradient - center_gradient) / h
-                }
-                FiniteDiffStencil::Backward { h } => {
-                    let mut xm = x.clone();
-                    xm[j] -= h;
-                    let gm = sanitize_first_order_sample(obj_fn.eval_grad(&xm)?)?;
-                    *func_evals += 1;
-                    *grad_evals += 1;
-                    (center_gradient - &gm.gradient) / h
-                }
-                FiniteDiffStencil::Fixed => Array1::zeros(n),
-            };
-            hessian.column_mut(j).assign(&column);
-        }
-        Ok(0.5 * (&hessian + &hessian.t().to_owned()))
-    }
-
     fn eval_cost_grad_hessian<ObjFn>(
         &mut self,
         obj_fn: &mut ObjFn,
         x: &Array1<f64>,
-        bounds: Option<&BoxSpec>,
         func_evals: &mut usize,
         grad_evals: &mut usize,
         hess_evals: &mut usize,
@@ -5852,29 +5604,15 @@ impl SecondOrderCache {
         let sample = sanitize_second_order_sample(obj_fn.eval_hessian(x)?)?;
         *func_evals += 1;
         *grad_evals += 1;
-        let hessian = match sample.hessian {
-            Some(hessian) => {
-                *hess_evals += 1;
-                hessian
-            }
-            None => match self.hessian_fallback_policy {
-                HessianFallbackPolicy::FiniteDifference => self.finite_difference_hessian(
-                    obj_fn,
-                    x,
-                    &sample.gradient,
-                    bounds,
-                    func_evals,
-                    grad_evals,
-                )?,
-                HessianFallbackPolicy::Error => {
-                    return Err(ObjectiveEvalError::fatal(
-                        "objective returned SecondOrderSample { hessian: None } but the solver \
-                         is configured with HessianFallbackPolicy::Error; finite-difference \
-                         Hessian estimation is not permitted on this route",
-                    ));
-                }
-            },
+        // `sanitize_second_order_sample` has already turned a non-finite
+        // Hessian into `None`, so this covers missing and non-finite curvature.
+        let Some(hessian) = sample.hessian else {
+            return Err(ObjectiveEvalError::fatal(
+                "objective returned no finite Hessian (SecondOrderSample { hessian: None } or \
+                 non-finite entries); second-order solvers require an analytic Hessian",
+            ));
         };
+        *hess_evals += 1;
         self.last_x = Some(x.clone());
         self.last_cost = Some(sample.value);
         self.last_grad.assign(&sample.gradient);
@@ -5915,14 +5653,12 @@ struct NewtonTrustRegionCore {
     x0: Array1<f64>,
     tolerance: f64,
     max_iterations: usize,
-    fd_hessian_step: f64,
     bounds: Option<BoxSpec>,
     trust_radius: f64,
     trust_radius_max: f64,
     eta_accept: f64,
     fallback_policy: FallbackPolicy,
     history_cap: usize,
-    hessian_fallback_policy: HessianFallbackPolicy,
     initial_sample: Option<(Array1<f64>, SecondOrderSample)>,
     /// Final trust radius observed during the most recent `run`. Populated
     /// at every exit path so callers (e.g. retry-warm-start) can pick up
@@ -5969,7 +5705,6 @@ struct ArcCore {
     x0: Array1<f64>,
     tolerance: f64,
     max_iterations: usize,
-    fd_hessian_step: f64,
     bounds: Option<BoxSpec>,
     theta: f64,
     sigma: f64,
@@ -5983,7 +5718,6 @@ struct ArcCore {
     fallback_policy: FallbackPolicy,
     history_cap: usize,
     subproblem_max_iterations: usize,
-    hessian_fallback_policy: HessianFallbackPolicy,
     initial_sample: Option<(Array1<f64>, SecondOrderSample)>,
     gradient_tolerance: Option<GradientTolerance>,
     observer: Option<Box<dyn OptimizerObserver>>,
@@ -6008,14 +5742,12 @@ impl NewtonTrustRegionCore {
             x0,
             tolerance: 1e-5,
             max_iterations: 100,
-            fd_hessian_step: 1e-4,
             bounds: None,
             trust_radius: 1.0,
             trust_radius_max: 1e6,
             eta_accept: 0.1,
             fallback_policy: FallbackPolicy::AutoBfgs,
             history_cap: 12,
-            hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
             initial_sample: None,
             last_trust_radius: None,
             gradient_tolerance: None,
@@ -6308,8 +6040,7 @@ impl NewtonTrustRegionCore {
         let mut func_evals = 0usize;
         let mut grad_evals = 0usize;
         let mut hess_evals = 0usize;
-        let mut oracle =
-            SecondOrderCache::new(n, self.fd_hessian_step, self.hessian_fallback_policy);
+        let mut oracle = SecondOrderCache::new(n);
         // Seed the cache from a precomputed sample when the caller
         // supplied one via `with_initial_sample`. The first call below
         // serves cost/grad/hess from cache instead of re-running the
@@ -6328,7 +6059,6 @@ impl NewtonTrustRegionCore {
         let initial = oracle.eval_cost_grad_hessian(
             obj_fn,
             &x_k,
-            self.bounds.as_ref(),
             &mut func_evals,
             &mut grad_evals,
             &mut hess_evals,
@@ -6491,7 +6221,6 @@ impl NewtonTrustRegionCore {
             let (f_trial, g_trial, h_trial) = match oracle.eval_cost_grad_hessian(
                 obj_fn,
                 &x_trial,
-                self.bounds.as_ref(),
                 &mut func_evals,
                 &mut grad_evals,
                 &mut hess_evals,
@@ -6613,7 +6342,6 @@ impl ArcCore {
             x0,
             tolerance: 1e-5,
             max_iterations: 100,
-            fd_hessian_step: 1e-4,
             bounds: None,
             theta: 1.0,
             sigma: 1.0,
@@ -6629,7 +6357,6 @@ impl ArcCore {
             fallback_policy: FallbackPolicy::AutoBfgs,
             history_cap: 12,
             subproblem_max_iterations: 80,
-            hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
             initial_sample: None,
             gradient_tolerance: None,
             observer: None,
@@ -7264,8 +6991,7 @@ impl ArcCore {
         let mut func_evals = 0usize;
         let mut grad_evals = 0usize;
         let mut hess_evals = 0usize;
-        let mut oracle =
-            SecondOrderCache::new(n, self.fd_hessian_step, self.hessian_fallback_policy);
+        let mut oracle = SecondOrderCache::new(n);
         // Seed the cache from a precomputed sample when the caller
         // supplied one via `with_initial_sample`. See the parallel
         // logic in `NewtonTrustRegionCore::run` for the full rationale.
@@ -7280,7 +7006,6 @@ impl ArcCore {
         let initial = oracle.eval_cost_grad_hessian(
             obj_fn,
             &x_k,
-            self.bounds.as_ref(),
             &mut func_evals,
             &mut grad_evals,
             &mut hess_evals,
@@ -9871,7 +9596,6 @@ where
     /// Points are projected by coordinate clamping, and the gradient is projected
     /// by zeroing active constraints during direction updates.
     pub fn with_bounds(mut self, bounds: Bounds) -> Self {
-        self.obj_fn.set_finite_difference_bounds(Some(&bounds));
         self.core.bounds = Some(bounds.spec);
         self
     }
@@ -10088,32 +9812,14 @@ where
         self
     }
 
-    pub fn with_fd_hessian_step(mut self, fd_hessian_step: f64) -> Self {
-        self.core.fd_hessian_step = fd_hessian_step;
-        self
-    }
-
     /// Provides simple box bounds for each coordinate (lower <= x <= upper).
     pub fn with_bounds(mut self, bounds: Bounds) -> Self {
-        self.obj_fn.set_finite_difference_bounds(Some(&bounds));
         self.core.bounds = Some(bounds.spec);
         self
     }
 
     pub fn with_profile(mut self, profile: Profile) -> Self {
         self.core.apply_profile(profile);
-        self
-    }
-
-    /// Choose what to do when the objective returns
-    /// `SecondOrderSample { hessian: None }`: estimate the Hessian by
-    /// finite-differencing the gradient (default; legacy behavior) or
-    /// surface a fatal evaluation error. Set to `Error` when the
-    /// caller guarantees an analytic Hessian on every call — a single
-    /// `None` then signals a routing/contract mismatch instead of
-    /// silently triggering O(n) extra gradient probes per iteration.
-    pub fn with_hessian_fallback_policy(mut self, policy: HessianFallbackPolicy) -> Self {
-        self.core.hessian_fallback_policy = policy;
         self
     }
 
@@ -10132,8 +9838,7 @@ where
     /// evaluation (cost + gradient + Hessian) is served from cache
     /// instead of re-running the objective. The sample's
     /// `hessian: Option<Array2<f64>>` is honored: if `None` the
-    /// Hessian is recomputed (or finite-differenced, depending on
-    /// `with_hessian_fallback_policy`).
+    /// first evaluation re-runs the objective for the Hessian.
     ///
     /// Validation of shape and finiteness is deferred to `run()`;
     /// calling `with_initial_sample` itself never fails.
@@ -10221,26 +9926,14 @@ where
         self
     }
 
-    pub fn with_fd_hessian_step(mut self, fd_hessian_step: f64) -> Self {
-        self.core.fd_hessian_step = fd_hessian_step;
-        self
-    }
-
     /// Provides simple box bounds for each coordinate (lower <= x <= upper).
     pub fn with_bounds(mut self, bounds: Bounds) -> Self {
-        self.obj_fn.set_finite_difference_bounds(Some(&bounds));
         self.core.bounds = Some(bounds.spec);
         self
     }
 
     pub fn with_profile(mut self, profile: Profile) -> Self {
         self.core.apply_profile(profile);
-        self
-    }
-
-    /// See `NewtonTrustRegion::with_hessian_fallback_policy`.
-    pub fn with_hessian_fallback_policy(mut self, policy: HessianFallbackPolicy) -> Self {
-        self.core.hessian_fallback_policy = policy;
         self
     }
 
@@ -10428,7 +10121,6 @@ struct MatrixFreeTrustRegionCore {
     /// `None` leaves only the round-off rung (`ModelNoiseFloor`).
     model_decrement_tolerance: Option<f64>,
     initial_sample: Option<(Array1<f64>, OperatorSample)>,
-    hessian_fallback_policy: HessianFallbackPolicy,
     /// Final trust radius observed during the most recent `run`.
     /// Populated at every loop exit so callers can warm-start a
     /// follow-up solve with the geometry the previous attempt
@@ -10475,7 +10167,6 @@ impl MatrixFreeTrustRegionCore {
             cg_max_iter_factor: 1.0,
             model_decrement_tolerance: None,
             initial_sample: None,
-            hessian_fallback_policy: HessianFallbackPolicy::FiniteDifference,
             last_trust_radius: None,
             materialize_when_cheap: true,
             gradient_tolerance: None,
@@ -10737,23 +10428,13 @@ impl MatrixFreeTrustRegionCore {
                     }
                     OperatorHandle::DenseAdapter(h.clone())
                 }
-                HessianValue::Unavailable => match self.hessian_fallback_policy {
-                    HessianFallbackPolicy::Error => {
-                        return Err(MatrixFreeTrustRegionError::ObjectiveFailed {
-                            message: "objective returned HessianValue::Unavailable but the \
-                                          solver is configured with HessianFallbackPolicy::Error"
-                                .to_string(),
-                        });
-                    }
-                    HessianFallbackPolicy::FiniteDifference => {
-                        return Err(MatrixFreeTrustRegionError::ObjectiveFailed {
-                                message: "MatrixFreeTrustRegion does not yet support \
-                                          finite-difference fallback for HessianValue::Unavailable; \
-                                          use HessianFallbackPolicy::Error or supply Dense/Operator"
-                                    .to_string(),
-                            });
-                    }
-                },
+                HessianValue::Unavailable => {
+                    return Err(MatrixFreeTrustRegionError::ObjectiveFailed {
+                        message: "objective returned HessianValue::Unavailable; \
+                                  MatrixFreeTrustRegion requires a Dense or Operator Hessian"
+                            .to_string(),
+                    });
+                }
             };
 
             // Compute a step via Steihaug-Toint truncated CG.
@@ -11565,7 +11246,6 @@ where
 
     /// Provide simple box bounds for each coordinate (lower <= x <= upper).
     pub fn with_bounds(mut self, bounds: Bounds) -> Self {
-        self.obj_fn.set_finite_difference_bounds(Some(&bounds));
         self.core.bounds = Some(bounds.spec);
         self
     }
@@ -11650,12 +11330,6 @@ where
         O: OptimizerObserver + 'static,
     {
         self.core.observer = Some(Box::new(observer));
-        self
-    }
-
-    /// See `NewtonTrustRegion::with_hessian_fallback_policy`.
-    pub fn with_hessian_fallback_policy(mut self, policy: HessianFallbackPolicy) -> Self {
-        self.core.hessian_fallback_policy = policy;
         self
     }
 
@@ -13136,17 +12810,17 @@ mod tests {
     use super::{
         AcceptedStep, ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, BacktrackConfig,
         BatchZerothOrderObjective, Bfgs, BfgsError, Bounds, CostStallConfig, CostStallState,
-        CostStallSummary, FallbackPolicy, FiniteDiffGradient, FirstOrderCache, FirstOrderObjective,
+        CostStallSummary, FallbackPolicy, FirstOrderCache, FirstOrderObjective,
         FirstOrderObjectiveInto, FirstOrderSample, FirstOrderWorkspace, FixedPoint,
         FixedPointObjective, FixedPointSample, FixedPointStatus, FusedObjective, GradientTolerance,
-        HessianFallbackPolicy, HessianMaterialization, HessianOperator, HessianValue,
-        InitialMetric, IterationInfo, LineSearchFailureReason, MatrixFreeTrustRegion,
-        MatrixFreeTrustRegionError, MaxIterations, NewtonTrustRegion, ObjectiveEvalError,
-        OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver, Problem, Profile,
-        RidgeSchedule, SecondOrderObjective, SecondOrderObjectiveInto, SecondOrderProblem,
-        SecondOrderSample, SecondOrderWorkspace, Solution, StallResolution, StallResolver,
-        StationarityKind, StepInfo, TerminationReason, Tolerance, ZerothOrderObjective,
-        backtracking_line_search, escalate_ridge, optimize,
+        HessianMaterialization, HessianOperator, HessianValue, InitialMetric, IterationInfo,
+        LineSearchFailureReason, MatrixFreeTrustRegion, MatrixFreeTrustRegionError, MaxIterations,
+        NewtonTrustRegion, ObjectiveEvalError, OperatorObjective, OperatorSample,
+        OptimizationStatus, OptimizerObserver, Problem, Profile, RidgeSchedule,
+        SecondOrderObjective, SecondOrderObjectiveInto, SecondOrderProblem, SecondOrderSample,
+        SecondOrderWorkspace, Solution, StallResolution, StallResolver, StationarityKind, StepInfo,
+        TerminationReason, Tolerance, ZerothOrderObjective, backtracking_line_search,
+        escalate_ridge, optimize,
     };
     use ndarray::{Array1, Array2, array};
 
@@ -13576,11 +13250,7 @@ mod tests {
         let x = array![1.0, -2.0];
         let call_count = Arc::new(Mutex::new(0usize));
         let call_count_c = call_count.clone();
-        let mut oracle = super::SecondOrderCache::new(
-            x.len(),
-            1e-4,
-            super::HessianFallbackPolicy::FiniteDifference,
-        );
+        let mut oracle = super::SecondOrderCache::new(x.len());
         let mut func_evals = 0usize;
         let mut grad_evals = 0usize;
         let mut hess_evals = 0usize;
@@ -13596,7 +13266,6 @@ mod tests {
             .eval_cost_grad_hessian(
                 &mut obj,
                 &x,
-                None,
                 &mut func_evals,
                 &mut grad_evals,
                 &mut hess_evals,
@@ -13606,7 +13275,6 @@ mod tests {
             .eval_cost_grad_hessian(
                 &mut obj,
                 &x,
-                None,
                 &mut func_evals,
                 &mut grad_evals,
                 &mut hess_evals,
@@ -13654,7 +13322,7 @@ mod tests {
     }
 
     #[test]
-    fn second_order_cache_fd_fills_nonfinite_hessian() {
+    fn second_order_cache_rejects_a_nonfinite_hessian() {
         struct NonfiniteHessianObjective;
 
         impl ZerothOrderObjective for NonfiniteHessianObjective {
@@ -13689,479 +13357,25 @@ mod tests {
         }
 
         let x = array![2.0];
-        let mut oracle = super::SecondOrderCache::new(
-            x.len(),
-            1e-4,
-            super::HessianFallbackPolicy::FiniteDifference,
-        );
+        let mut oracle = super::SecondOrderCache::new(x.len());
         let mut func_evals = 0usize;
         let mut grad_evals = 0usize;
         let mut hess_evals = 0usize;
         let mut obj = NonfiniteHessianObjective;
-        let (value, gradient, hessian) = oracle
+        let err = oracle
             .eval_cost_grad_hessian(
                 &mut obj,
                 &x,
-                None,
                 &mut func_evals,
                 &mut grad_evals,
                 &mut hess_evals,
             )
-            .expect("non-finite Hessian should trigger internal finite differences");
+            .expect_err("a non-finite Hessian must be an error, never estimated");
 
-        assert_eq!(value, 1.0);
-        assert_eq!(gradient, array![2.0]);
-        assert!((hessian[[0, 0]] - 2.0).abs() < 1e-6);
-        assert_eq!(func_evals, 3);
-        assert_eq!(grad_evals, 3);
+        assert!(!err.is_recoverable());
+        assert_eq!(func_evals, 1);
+        assert_eq!(grad_evals, 1);
         assert_eq!(hess_evals, 0);
-    }
-
-    #[test]
-    fn finite_diff_gradient_returns_recoverable_on_nonfinite_probe() {
-        struct WallObjective;
-
-        impl ZerothOrderObjective for WallObjective {
-            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-                if x[0].abs() >= 0.5 {
-                    Ok(f64::INFINITY)
-                } else {
-                    Ok(x[0] * x[0])
-                }
-            }
-        }
-
-        let mut objective = FiniteDiffGradient::new(WallObjective).with_step(1.0);
-        let err = objective
-            .eval_grad(&array![0.0])
-            .expect_err("non-finite finite-difference probes should be recoverable");
-        assert!(err.is_recoverable());
-    }
-
-    #[test]
-    fn finite_diff_gradient_respects_bounds_with_one_sided_stencil() {
-        struct LinearObjective;
-
-        impl ZerothOrderObjective for LinearObjective {
-            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok(x[0])
-            }
-        }
-
-        let mut objective = FiniteDiffGradient::new(LinearObjective)
-            .with_step(1.0)
-            .with_bounds(bounds(array![0.0], array![1.0], 1e-8));
-        let sample = objective
-            .eval_grad(&array![0.0])
-            .expect("one-sided finite difference should stay feasible");
-        assert!((sample.gradient[0] - 1.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn finite_diff_gradient_prefers_one_sided_stencil_near_bounds() {
-        struct TrackingObjective {
-            seen: Arc<Mutex<Vec<f64>>>,
-        }
-
-        impl ZerothOrderObjective for TrackingObjective {
-            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-                self.seen.lock().expect("lock seen samples").push(x[0]);
-                Ok(x[0] * x[0])
-            }
-        }
-
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut objective = FiniteDiffGradient::new(TrackingObjective { seen: seen.clone() })
-            .with_step(0.1)
-            .with_bounds(bounds(array![0.0], array![1.0], 1e-8));
-        let x0 = 0.05f64;
-        let h = 0.1 * (1.0 + x0);
-        let sample = objective
-            .eval_grad(&array![x0])
-            .expect("near-bound gradient should use a feasible one-sided stencil");
-
-        let expected = ((x0 + h) * (x0 + h) - x0 * x0) / h;
-        assert!((sample.gradient[0] - expected).abs() < 1e-12);
-        let seen = seen.lock().expect("lock seen samples");
-        assert_eq!(seen.len(), 2);
-        assert!(seen.iter().any(|&x| (x - x0).abs() < 1e-12));
-        assert!(seen.iter().any(|&x| (x - (x0 + h)).abs() < 1e-12));
-        assert!(!seen.iter().any(|&x| x <= 1e-12));
-    }
-
-    #[test]
-    fn bfgs_with_bounds_wires_finite_diff_gradient_bounds_automatically() {
-        struct LinearObjective;
-
-        impl ZerothOrderObjective for LinearObjective {
-            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok(x[0])
-            }
-        }
-
-        let result = Bfgs::new(
-            array![0.0],
-            FiniteDiffGradient::new(LinearObjective).with_step(1.0),
-        )
-        .with_bounds(bounds(array![0.0], array![1.0], 1e-8))
-        .run();
-
-        let solution = result.expect("solver should wire bounds into finite differences");
-        assert!(solution.final_point[0].abs() < 1e-12);
-        assert!(gradient_norm(&solution) <= 1e-12);
-    }
-
-    #[test]
-    fn optimize_problem_with_bounds_wires_finite_diff_gradient_automatically() {
-        struct LinearObjective;
-
-        impl ZerothOrderObjective for LinearObjective {
-            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok(x[0])
-            }
-        }
-
-        let mut solver = optimize(
-            Problem::new(
-                array![0.0],
-                FiniteDiffGradient::new(LinearObjective).with_step(1.0),
-            )
-            .with_bounds(bounds(array![0.0], array![1.0], 1e-8)),
-        );
-
-        let solution = solver
-            .run()
-            .expect("problem wrapper should wire bounds into finite differences");
-        assert!(solution.final_point[0].abs() < 1e-12);
-        assert!(gradient_norm(&solution) <= 1e-12);
-    }
-
-    #[test]
-    fn second_order_cache_fd_hessian_respects_bounds() {
-        struct NoHessianObjective;
-
-        impl ZerothOrderObjective for NoHessianObjective {
-            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok((x[0] - 0.25).powi(2))
-            }
-        }
-
-        impl FirstOrderObjective for NoHessianObjective {
-            fn eval_grad(
-                &mut self,
-                x: &Array1<f64>,
-            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok(FirstOrderSample {
-                    value: (x[0] - 0.25).powi(2),
-                    gradient: array![2.0 * (x[0] - 0.25)],
-                })
-            }
-        }
-
-        impl SecondOrderObjective for NoHessianObjective {
-            fn eval_hessian(
-                &mut self,
-                x: &Array1<f64>,
-            ) -> Result<SecondOrderSample, ObjectiveEvalError> {
-                Ok(SecondOrderSample {
-                    value: (x[0] - 0.25).powi(2),
-                    gradient: array![2.0 * (x[0] - 0.25)],
-                    hessian: None,
-                })
-            }
-        }
-
-        let x = array![0.0];
-        let mut oracle = super::SecondOrderCache::new(
-            x.len(),
-            1e-4,
-            super::HessianFallbackPolicy::FiniteDifference,
-        );
-        let mut func_evals = 0usize;
-        let mut grad_evals = 0usize;
-        let mut hess_evals = 0usize;
-        let mut obj = NoHessianObjective;
-        let bounds = bounds(array![0.0], array![1.0], 1e-8);
-
-        let (value, gradient, hessian) = oracle
-            .eval_cost_grad_hessian(
-                &mut obj,
-                &x,
-                Some(&bounds.spec),
-                &mut func_evals,
-                &mut grad_evals,
-                &mut hess_evals,
-            )
-            .expect("finite-difference Hessian should stay feasible near bounds");
-
-        assert!((value - 0.0625).abs() < 1e-12);
-        assert!((gradient[0] + 0.5).abs() < 1e-12);
-        assert!((hessian[[0, 0]] - 2.0).abs() < 1e-6);
-        assert_eq!(hess_evals, 0);
-    }
-
-    #[test]
-    fn second_order_cache_fd_hessian_prefers_one_sided_stencil_near_bounds() {
-        struct NearWallObjective;
-
-        impl ZerothOrderObjective for NearWallObjective {
-            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-                if x[0] < 0.01 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the finite-difference band",
-                    ));
-                }
-                Ok(x[0] * x[0])
-            }
-        }
-
-        impl FirstOrderObjective for NearWallObjective {
-            fn eval_grad(
-                &mut self,
-                x: &Array1<f64>,
-            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
-                if x[0] < 0.01 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the finite-difference band",
-                    ));
-                }
-                Ok(FirstOrderSample {
-                    value: x[0] * x[0],
-                    gradient: array![2.0 * x[0]],
-                })
-            }
-        }
-
-        impl SecondOrderObjective for NearWallObjective {
-            fn eval_hessian(
-                &mut self,
-                x: &Array1<f64>,
-            ) -> Result<SecondOrderSample, ObjectiveEvalError> {
-                Ok(SecondOrderSample {
-                    value: x[0] * x[0],
-                    gradient: array![2.0 * x[0]],
-                    hessian: None,
-                })
-            }
-        }
-
-        let x = array![0.05];
-        let mut oracle = super::SecondOrderCache::new(
-            x.len(),
-            0.1,
-            super::HessianFallbackPolicy::FiniteDifference,
-        );
-        let mut func_evals = 0usize;
-        let mut grad_evals = 0usize;
-        let mut hess_evals = 0usize;
-        let mut obj = NearWallObjective;
-        let bounds = bounds(array![0.0], array![1.0], 1e-8);
-
-        let (_, _, hessian) = oracle
-            .eval_cost_grad_hessian(
-                &mut obj,
-                &x,
-                Some(&bounds.spec),
-                &mut func_evals,
-                &mut grad_evals,
-                &mut hess_evals,
-            )
-            .expect("near-bound Hessian should use a feasible one-sided stencil");
-
-        assert!((hessian[[0, 0]] - 2.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn newton_trust_region_wires_fd_hessian_bounds_automatically() {
-        struct NoHessianObjective;
-
-        impl ZerothOrderObjective for NoHessianObjective {
-            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok(x[0])
-            }
-        }
-
-        impl FirstOrderObjective for NoHessianObjective {
-            fn eval_grad(
-                &mut self,
-                x: &Array1<f64>,
-            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok(FirstOrderSample {
-                    value: x[0],
-                    gradient: array![1.0],
-                })
-            }
-        }
-
-        impl SecondOrderObjective for NoHessianObjective {
-            fn eval_hessian(
-                &mut self,
-                x: &Array1<f64>,
-            ) -> Result<SecondOrderSample, ObjectiveEvalError> {
-                Ok(SecondOrderSample {
-                    value: x[0],
-                    gradient: array![1.0],
-                    hessian: None,
-                })
-            }
-        }
-
-        let result = NewtonTrustRegion::new(array![0.0], NoHessianObjective)
-            .with_bounds(bounds(array![0.0], array![1.0], 1e-8))
-            .run();
-
-        let solution = result.expect("solver should wire bounds into Hessian finite differences");
-        assert!(solution.final_point[0].abs() < 1e-12);
-        assert!(gradient_norm(&solution) <= 1e-12);
-    }
-
-    #[test]
-    fn optimize_second_order_problem_with_bounds_wires_fd_hessian_automatically() {
-        struct NoHessianObjective;
-
-        impl ZerothOrderObjective for NoHessianObjective {
-            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok(x[0])
-            }
-        }
-
-        impl FirstOrderObjective for NoHessianObjective {
-            fn eval_grad(
-                &mut self,
-                x: &Array1<f64>,
-            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok(FirstOrderSample {
-                    value: x[0],
-                    gradient: array![1.0],
-                })
-            }
-        }
-
-        impl SecondOrderObjective for NoHessianObjective {
-            fn eval_hessian(
-                &mut self,
-                x: &Array1<f64>,
-            ) -> Result<SecondOrderSample, ObjectiveEvalError> {
-                Ok(SecondOrderSample {
-                    value: x[0],
-                    gradient: array![1.0],
-                    hessian: None,
-                })
-            }
-        }
-
-        let mut solver = optimize(
-            SecondOrderProblem::new(array![0.0], NoHessianObjective).with_bounds(bounds(
-                array![0.0],
-                array![1.0],
-                1e-8,
-            )),
-        );
-
-        let solution = solver.run().expect(
-            "second-order problem wrapper should wire bounds into Hessian finite differences",
-        );
-        assert!(solution.final_point[0].abs() < 1e-12);
-        assert!(gradient_norm(&solution) <= 1e-12);
-    }
-
-    #[test]
-    fn arc_wires_fd_hessian_bounds_automatically() {
-        struct NoHessianObjective;
-
-        impl ZerothOrderObjective for NoHessianObjective {
-            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok(x[0])
-            }
-        }
-
-        impl FirstOrderObjective for NoHessianObjective {
-            fn eval_grad(
-                &mut self,
-                x: &Array1<f64>,
-            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
-                if x[0] < 0.0 || x[0] > 1.0 {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "sample left the feasible interval",
-                    ));
-                }
-                Ok(FirstOrderSample {
-                    value: x[0],
-                    gradient: array![1.0],
-                })
-            }
-        }
-
-        impl SecondOrderObjective for NoHessianObjective {
-            fn eval_hessian(
-                &mut self,
-                x: &Array1<f64>,
-            ) -> Result<SecondOrderSample, ObjectiveEvalError> {
-                Ok(SecondOrderSample {
-                    value: x[0],
-                    gradient: array![1.0],
-                    hessian: None,
-                })
-            }
-        }
-
-        let result = super::Arc::new(array![0.0], NoHessianObjective)
-            .with_bounds(bounds(array![0.0], array![1.0], 1e-8))
-            .run();
-
-        let solution = result.expect("solver should wire bounds into Hessian finite differences");
-        assert!(solution.final_point[0].abs() < 1e-12);
-        assert!(gradient_norm(&solution) <= 1e-12);
     }
 
     /// gam#2748 — a fixed-point map whose dominant multiplier is `λ ≤ −1`
@@ -16284,8 +15498,8 @@ mod tests {
     // -----------------------------------------------------------------
     // opt 0.3 — public API surface tests
     //
-    // Cover the new builder methods (`with_hessian_fallback_policy`,
-    // `with_fallback_policy`, `with_initial_sample`) and the
+    // Cover the builder methods (`with_fallback_policy`,
+    // `with_initial_sample`) and the
     // `run_report` outcome-mapping. These exercise the lib API boundary,
     // not internal algorithmic correctness; the existing test suite
     // covers the latter and continues to pass under the v0.3 changes.
@@ -16295,7 +15509,7 @@ mod tests {
     /// records every call so a test can assert the objective was (or
     /// was not) invoked at the seed point. The Hessian is the identity;
     /// when `omit_hessian` is true the sample is returned with
-    /// `hessian: None` so we can drive the FD/Error fallback paths.
+    /// `hessian: None` so we can drive the missing-Hessian path.
     struct CountingQuadratic {
         omit_hessian: bool,
         n_cost: std::cell::Cell<usize>,
@@ -16363,52 +15577,32 @@ mod tests {
         }
     }
 
-    /// `HessianFallbackPolicy::Error` must surface a fatal evaluation
-    /// error on `SecondOrderSample { hessian: None }` instead of
-    /// silently triggering finite-difference Hessian estimation.
+    /// A second-order solver must surface a missing Hessian
+    /// (`SecondOrderSample { hessian: None }`) as a fatal evaluation error;
+    /// it is never estimated by finite differences.
     #[test]
-    fn hessian_fallback_policy_error_rejects_none_hessian() {
+    fn second_order_solvers_reject_a_missing_hessian() {
         let x0 = array![0.5, 0.5];
-        let mut solver = NewtonTrustRegion::new(x0, CountingQuadratic::new(true))
-            .with_hessian_fallback_policy(HessianFallbackPolicy::Error);
+        let mut solver = NewtonTrustRegion::new(x0, CountingQuadratic::new(true));
         let err = solver
             .run()
-            .expect_err("Error policy must reject None Hessian");
+            .expect_err("a missing Hessian must be rejected");
         match err {
             super::NewtonTrustRegionError::ObjectiveFailed { message } => {
                 assert!(
-                    message.contains("HessianFallbackPolicy::Error"),
-                    "message should explain the policy mismatch, got: {message}"
+                    message.contains("hessian: None"),
+                    "message should name the missing Hessian, got: {message}"
                 );
             }
-            other => panic!("expected ObjectiveFailed under Error policy, got {other:?}"),
+            other => panic!("expected ObjectiveFailed on a missing Hessian, got {other:?}"),
         }
         // ARC mirrors the same contract.
         let x0 = array![0.5, 0.5];
-        let mut solver = super::Arc::new(x0, CountingQuadratic::new(true))
-            .with_hessian_fallback_policy(HessianFallbackPolicy::Error);
+        let mut solver = super::Arc::new(x0, CountingQuadratic::new(true));
         let err = solver
             .run()
-            .expect_err("Error policy must reject None Hessian");
+            .expect_err("a missing Hessian must be rejected");
         assert!(matches!(err, ArcError::ObjectiveFailed { .. }));
-    }
-
-    /// `HessianFallbackPolicy::FiniteDifference` (the default)
-    /// preserves the v0.2 behavior: a `None` Hessian is silently
-    /// estimated. This guards against regressions in the default path.
-    #[test]
-    fn hessian_fallback_policy_finite_difference_estimates_missing_hessian() {
-        let x0 = array![0.5, 0.5];
-        let mut solver = NewtonTrustRegion::new(x0, CountingQuadratic::new(true))
-            .with_hessian_fallback_policy(HessianFallbackPolicy::FiniteDifference)
-            .with_max_iterations(MaxIterations::new(50).unwrap());
-        let solution = solver.run().expect("FD policy must complete");
-        for v in solution.final_point.iter() {
-            assert!(
-                (v - 1.0).abs() < 1e-3,
-                "Newton+FD should converge near (1,1); got {v}"
-            );
-        }
     }
 
     /// `with_initial_sample` must populate the cache so the solver's
@@ -16957,11 +16151,9 @@ mod tests {
         }
     }
 
-    /// `HessianValue::Unavailable` under the default
-    /// `HessianFallbackPolicy::FiniteDifference` is documented as not
-    /// yet supported by `MatrixFreeTrustRegion`; the solver must surface
-    /// that as a fatal evaluation error rather than silently producing
-    /// a wrong answer.
+    /// `HessianValue::Unavailable` is a contract violation for
+    /// `MatrixFreeTrustRegion`; the solver must surface it as a fatal
+    /// evaluation error rather than silently producing a wrong answer.
     #[test]
     fn matrix_free_trust_region_rejects_unavailable_hessian() {
         struct UnavailHessian;
@@ -16993,11 +16185,10 @@ mod tests {
                 })
             }
         }
-        let mut solver = MatrixFreeTrustRegion::new(array![1.0, 1.0], UnavailHessian)
-            .with_hessian_fallback_policy(HessianFallbackPolicy::Error);
+        let mut solver = MatrixFreeTrustRegion::new(array![1.0, 1.0], UnavailHessian);
         let err = solver
             .run()
-            .expect_err("matrix-free TR must reject Unavailable under Error policy");
+            .expect_err("matrix-free TR must reject an Unavailable Hessian");
         assert!(matches!(
             err,
             MatrixFreeTrustRegionError::ObjectiveFailed { .. }
