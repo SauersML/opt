@@ -7175,7 +7175,6 @@ impl ArcCore {
             let primary_sample = oracle.eval_cost_grad_hessian(
                 obj_fn,
                 &candidate.point,
-                self.bounds.as_ref(),
                 &mut func_evals,
                 &mut grad_evals,
                 &mut hess_evals,
@@ -7209,7 +7208,6 @@ impl ArcCore {
                     let antipodal_sample = oracle.eval_cost_grad_hessian(
                         obj_fn,
                         &antipodal_candidate.point,
-                        self.bounds.as_ref(),
                         &mut func_evals,
                         &mut grad_evals,
                         &mut hess_evals,
