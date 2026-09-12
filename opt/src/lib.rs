@@ -10108,10 +10108,6 @@ struct MatrixFreeTrustRegionCore {
     /// accepting a step, the run terminates with `TrustRegionRejectFloor`.
     trust_radius_min: f64,
     eta_accept: f64,
-    /// Forcing-sequence factor for the inner CG residual: the inner
-    /// loop terminates when `‖r‖ ≤ cg_tol * ‖g‖`. Eisenstat-Walker
-    /// type forcing.
-    cg_tol: f64,
     /// CG iteration cap as a multiplier on the parameter dimension.
     cg_max_iter_factor: f64,
     /// Caller-declared resolution of the objective, read as a stopping
@@ -10161,7 +10157,6 @@ impl MatrixFreeTrustRegionCore {
             trust_radius_max: 1e6,
             trust_radius_min: 1e-12,
             eta_accept: 0.1,
-            cg_tol: 0.1,
             cg_max_iter_factor: 1.0,
             model_decrement_tolerance: None,
             initial_sample: None,
@@ -10284,6 +10279,9 @@ impl MatrixFreeTrustRegionCore {
         // so a consumer can tell a region that collapsed after one bad
         // trial from one that ground through dozens.
         let mut consecutive_rejections = 0usize;
+        // The last accepted step's `(‖g‖, ‖g + H s‖)`: the gradient its linear
+        // model started from and the gradient that model predicted at the step.
+        let mut last_model_prediction: Option<(f64, f64)> = None;
         for k in 0..self.max_iterations {
             self.last_trust_radius = Some(trust_radius);
             // Per-iter observer notification. Mirrors NewtonTR / ARC.
@@ -10303,6 +10301,18 @@ impl MatrixFreeTrustRegionCore {
             let g_proj = self.projected_gradient(&x_k, &sample.gradient);
             let g_proj_norm = g_proj.dot(&g_proj).sqrt();
             let active = self.active_mask_vec(&x_k, &sample.gradient);
+            // Inexact-Newton forcing factor for the inner CG (Eisenstat-Walker
+            // choice 1): how far the last accepted step's linear model missed the
+            // gradient it arrived at, relative to the gradient it started from.
+            // Before a prediction exists (or when its gradient carries no scale),
+            // the miss is the whole gradient and the factor is 1: the subsolve only
+            // has to bring its residual below the gradient it started from.
+            let cg_forcing = match last_model_prediction {
+                Some((previous_norm, predicted_norm)) if previous_norm > 0.0 => {
+                    (g_proj_norm - predicted_norm).abs() / previous_norm
+                }
+                _ => 1.0,
+            };
             let mut negative_curvature_step = None;
             if g_proj_norm <= effective_tol {
                 let curvature_active = self.second_order_active_mask_vec(&x_k, &sample.gradient);
@@ -10459,7 +10469,7 @@ impl MatrixFreeTrustRegionCore {
                     } else {
                         None
                     },
-                    self.cg_tol,
+                    cg_forcing,
                     cg_max_iter,
                     &mut hvp_evals,
                     &mut cg_scratch,
@@ -10806,6 +10816,19 @@ impl MatrixFreeTrustRegionCore {
                 predicted
             };
 
+            // The linear model's gradient at the step about to be tried, masked the
+            // way the subsolve masks. `cg_scratch.hp` holds `H s` for that step on
+            // every path above: the subsolve's predicted-decrease product, the
+            // negative-curvature product, or the projected step's product.
+            let mut predicted_gradient_sq = 0.0;
+            for (i, (g, hs)) in g_proj.iter().zip(cg_scratch.hp.iter()).enumerate() {
+                if self.bounds.is_some() && active.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
+                let component = g + hs;
+                predicted_gradient_sq += component * component;
+            }
+            let predicted_gradient_norm = predicted_gradient_sq.sqrt();
             let trial_eval = obj_fn.eval_value_grad_op(&x_trial);
             let trial = match trial_eval {
                 Ok(t) => t,
@@ -10954,6 +10977,7 @@ impl MatrixFreeTrustRegionCore {
             }
             if accepted {
                 // Accept.
+                last_model_prediction = Some((g_proj_norm, predicted_gradient_norm));
                 x_k = x_trial;
                 sample = trial;
                 consecutive_rejections = 0;
@@ -11267,14 +11291,6 @@ where
     /// solution.
     pub fn with_min_trust_radius(mut self, radius: f64) -> Self {
         self.core.trust_radius_min = radius;
-        self
-    }
-
-    /// Inner-CG forcing sequence factor. The CG iteration terminates
-    /// when `‖r‖ ≤ cg_tol * ‖g‖`; default `0.1` is the classic
-    /// Eisenstat-Walker one-tenth value.
-    pub fn with_cg_tolerance(mut self, tol: f64) -> Self {
-        self.core.cg_tol = tol;
         self
     }
 
