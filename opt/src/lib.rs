@@ -14952,14 +14952,20 @@ mod tests {
     }
 
     #[test]
-    fn backtracking_rejects_armijo_without_curvature() {
+    fn backtracking_accepts_armijo_descent_past_a_maximum() {
         let x_k = array![1.0];
         let mut core = super::BfgsCore::new(x_k.clone());
         let mut oracle = super::FirstOrderCache::new(x_k.len());
         let (f_k, g_k) = non_convex_max(&x_k);
         let d_k = array![1.0];
 
-        let r = super::bfgs_backtracking_line_search(
+        // Along d = +1 from x = 1, f = -x^2 falls faster than its linear model,
+        // so Armijo holds at alpha = 1 (f: -1 -> -4). The directional derivative
+        // doubles (-2 -> -4), so the Strong-Wolfe curvature condition fails, and
+        // so do the approximate-Wolfe, nonmonotone and gradient-drop acceptors.
+        // The recovery search keeps the sufficient decrease instead of halving
+        // back toward the incumbent.
+        let (alpha, f_new, g_new, _, _, kind) = super::bfgs_backtracking_line_search(
             &mut core,
             &mut bfgs_oracle(non_convex_max),
             &mut oracle,
@@ -14967,9 +14973,13 @@ mod tests {
             &d_k,
             f_k,
             &g_k,
-        );
+        )
+        .expect("Armijo recovery must accept a sufficient decrease without curvature");
 
-        assert!(r.is_err());
+        assert_eq!(alpha, 1.0);
+        assert_eq!(f_new, -4.0);
+        assert_eq!(g_new[0], -4.0);
+        assert!(matches!(kind, super::AcceptKind::Armijo));
     }
 
     #[test]
