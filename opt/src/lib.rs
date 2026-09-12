@@ -11722,7 +11722,7 @@ fn fixed_point_relaxation(step: &Array1<f64>, previous_step: &Array1<f64>) -> f6
         return 1.0;
     }
     let denominator = previous_step.dot(previous_step);
-    if !(denominator > 0.0) || !denominator.is_finite() {
+    if !denominator.is_finite() || denominator <= 0.0 {
         return 1.0;
     }
     let numerator = step.dot(previous_step);
@@ -11730,7 +11730,7 @@ fn fixed_point_relaxation(step: &Array1<f64>, previous_step: &Array1<f64>) -> f6
         return 1.0;
     }
     let multiplier = numerator / denominator;
-    if !(multiplier < 0.0) {
+    if multiplier >= 0.0 || multiplier.is_nan() {
         // Monotone (or orthogonal) steps: plain Picard, untouched.
         return 1.0;
     }
@@ -19161,5 +19161,747 @@ mod trust_region_policy_noise_floor_tests {
         let inside = policy.update(1.0, 1.0, false, 5.0e-12, 1.0e-6, 1.0e3);
         assert!(!inside.within_noise_floor);
         assert!(!inside.accepted);
+    }
+}
+
+pub use riemannian::{
+    RiemannianGeometry, RiemannianObjective, RiemannianTrustRegion, RiemannianTrustRegionError,
+    RiemannianTrustRegionTermination,
+};
+
+/// A trust-region method on an embedded Riemannian manifold, solved in the
+/// tangent spaces under the manifold metric.
+mod riemannian {
+    use super::{TrustRegionPolicy, accumulation_growth};
+    use ndarray::{Array1, ArrayView1};
+
+    /// Linear factor of the Steihaug truncated-CG forcing sequence: the inner CG
+    /// solve stops once the residual reaches `min(η·‖r₀‖, ‖r₀‖²)`. The quadratic
+    /// term gives an inexact Newton step super-linear convergence near the
+    /// optimum, while `η·‖r₀‖` caps wasted inner work far from it (Nocedal &
+    /// Wright, *Numerical Optimization*, §7.1, eq. 7.3).
+    const STEIHAUG_CG_FORCING_FACTOR: f64 = 1.0e-2;
+
+    /// Fraction of the radius at which an interior truncated-CG step counts as
+    /// having reached the boundary for radius control.
+    const BOUNDARY_FRACTION: f64 = 0.9;
+
+    /// The geometry a [`RiemannianTrustRegion`] runs on: an embedded manifold in
+    /// its ambient coordinates.
+    ///
+    /// Every norm and inner product the solver takes is the manifold metric's,
+    /// supplied as the product `G(x)·v`, so the solver is metric-correct on a
+    /// curved manifold and the caller decides how the metric is applied.
+    pub trait RiemannianGeometry {
+        /// The error a geometry or objective callback reports.
+        type Error;
+
+        /// Length of a point, and of a tangent vector, in ambient coordinates.
+        fn ambient_dim(&self) -> usize;
+
+        /// The Riemannian gradient at `point`: the ambient differential raised
+        /// through the metric onto the tangent space. A tangent projection alone
+        /// is the Riemannian gradient only for an induced (identity) metric.
+        fn riemannian_gradient(
+            &self,
+            point: ArrayView1<'_, f64>,
+            differential: ArrayView1<'_, f64>,
+        ) -> Result<Array1<f64>, Self::Error>;
+
+        /// The metric product `G(x)·v` for a tangent vector `v` at `point`.
+        fn metric_product(
+            &self,
+            point: ArrayView1<'_, f64>,
+            tangent: ArrayView1<'_, f64>,
+        ) -> Result<Array1<f64>, Self::Error>;
+
+        /// The point reached from `point` along `tangent`.
+        fn retract(
+            &self,
+            point: ArrayView1<'_, f64>,
+            tangent: ArrayView1<'_, f64>,
+        ) -> Result<Array1<f64>, Self::Error>;
+
+        /// Whether [`Self::retract`] is at least second-order, i.e.
+        /// `D²(f∘R_x)(0)` is the Riemannian Hessian for every `f`. Only then is the
+        /// Hessian quadratic model a valid second-order model along the retraction;
+        /// otherwise the solver uses the first-order-correct Cauchy model.
+        fn retraction_is_second_order(&self) -> bool;
+    }
+
+    /// A smooth objective for a [`RiemannianTrustRegion`] whose callbacks report
+    /// `E`, the geometry's error type.
+    pub trait RiemannianObjective<E> {
+        /// Value and ambient differential at `point`.
+        fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> Result<(f64, Array1<f64>), E>;
+
+        /// Riemannian Hessian–vector product at `point` along a tangent, or `None`
+        /// when the objective exposes no curvature. The solver never fabricates a
+        /// Hessian: without one it takes the Cauchy point.
+        fn hessian_vector_product(
+            &mut self,
+            point: ArrayView1<'_, f64>,
+            tangent: ArrayView1<'_, f64>,
+        ) -> Result<Option<Array1<f64>>, E>;
+    }
+
+    /// Why a [`RiemannianTrustRegion`] returned no terminal state.
+    #[derive(Debug, thiserror::Error)]
+    pub enum RiemannianTrustRegionError<E> {
+        /// A geometry or objective callback failed.
+        #[error("{0}")]
+        Callback(E),
+        #[error("trust-region initial point expected length {expected}, got {got}")]
+        InitialPointLength { expected: usize, got: usize },
+        #[error("trust-region radius must be finite and positive")]
+        InvalidRadius,
+        #[error("trust-region maximum radius must be finite and positive")]
+        InvalidMaxRadius,
+        #[error("trust-region gradient tolerance must be finite and non-negative")]
+        InvalidGradientTolerance,
+        #[error("trust-region objective returned a non-finite value")]
+        NonFiniteValue,
+        #[error("trust-region objective returned a non-finite terminal value")]
+        NonFiniteTerminalValue,
+        /// The absolute sum behind a metric norm's backward-error band overflowed,
+        /// so no finite band can separate roundoff from an indefinite metric.
+        #[error("Riemannian metric norm error bound overflowed")]
+        MetricBoundOverflow,
+        /// A metric norm came out materially negative: the metric is not a
+        /// Riemannian (positive-definite) one.
+        #[error("Riemannian metric produced a negative squared norm")]
+        IndefiniteMetric,
+        #[error("metric product expected length {expected}, got {got}")]
+        MetricProductLength { expected: usize, got: usize },
+        #[error("Hessian–vector product became unavailable mid-subproblem")]
+        CurvatureWithdrawnMidSubproblem,
+        #[error("Hessian–vector product unavailable while scoring the model")]
+        CurvatureWithdrawnWhileScoring,
+    }
+
+    /// Terminal state of a [`RiemannianTrustRegion`] run: the iterate reached and
+    /// the numbers its first-order certificate was decided against.
+    #[derive(Clone, Debug)]
+    pub struct RiemannianTrustRegionTermination {
+        /// The last iterate, whether or not the certificate holds: the work a
+        /// budget-exhausted run hands back.
+        pub point: Array1<f64>,
+        /// Iterations executed (zero when the budget was zero).
+        pub iterations: usize,
+        /// Relative stationarity `‖grad_final‖_g / max(‖grad_0‖_g, 1)` at `point`.
+        pub residual: f64,
+        /// The bound `residual` was compared against.
+        pub tolerance: f64,
+    }
+
+    impl RiemannianTrustRegionTermination {
+        /// Whether `point` satisfies the first-order certificate that controls
+        /// the loop.
+        #[must_use]
+        pub fn certifies(&self) -> bool {
+            self.residual <= self.tolerance
+        }
+    }
+
+    /// A Riemannian trust-region method.
+    ///
+    /// At each iterate `x` the solver builds the quadratic model in `T_xM`
+    ///
+    /// ```text
+    ///   m(η) = f(x) + g_x(grad, η) + ½ g_x(η, Hη),
+    /// ```
+    ///
+    /// with `g_x` the metric and `H` the Riemannian Hessian (through
+    /// Hessian–vector products only), and approximately solves
+    /// `min_{η ∈ T_xM, ‖η‖_g ≤ Δ} m(η)`. With curvature and a second-order
+    /// retraction the step is Steihaug truncated CG in the metric (stopping at
+    /// negative curvature or the boundary); otherwise it is the Cauchy point, the
+    /// exact minimizer along steepest descent inside the region, whose linear
+    /// model is first-order correct along any retraction. The ratio
+    /// `ρ = (f(x) − f(x⁺)) / (m(0) − m(η))` drives acceptance and the radius
+    /// through [`TrustRegionPolicy::classic`], and only accepted steps are
+    /// retracted onto the manifold.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct RiemannianTrustRegion {
+        /// Initial trust-region radius Δ₀.
+        pub radius: f64,
+        /// Hard cap Δmax on the radius across all iterations.
+        pub max_radius: f64,
+        /// Iteration budget.
+        pub max_iter: usize,
+        /// Bound on the relative stationarity certificate.
+        pub grad_tol: f64,
+    }
+
+    impl RiemannianTrustRegion {
+        /// Run the method from `initial` and report the terminal iterate with its
+        /// first-order verdict.
+        ///
+        /// A point that fails the certificate is still reported, so a caller can
+        /// resume from it; genuine failures (an invalid configuration, a
+        /// non-finite value, an indefinite metric, a callback error) are errors.
+        ///
+        /// # Errors
+        ///
+        /// Returns a [`RiemannianTrustRegionError`] for an invalid configuration,
+        /// a non-finite objective value, a metric that is not positive definite,
+        /// or a failed callback.
+        pub fn minimize<G, O>(
+            &self,
+            geometry: &G,
+            objective: &mut O,
+            initial: ArrayView1<'_, f64>,
+        ) -> Result<RiemannianTrustRegionTermination, RiemannianTrustRegionError<G::Error>>
+        where
+            G: RiemannianGeometry + ?Sized,
+            O: RiemannianObjective<G::Error> + ?Sized,
+        {
+            let policy = TrustRegionPolicy::classic(self.max_radius);
+            let mut x = initial.to_owned();
+            let ambient = geometry.ambient_dim();
+            if x.len() != ambient {
+                return Err(RiemannianTrustRegionError::InitialPointLength {
+                    expected: ambient,
+                    got: x.len(),
+                });
+            }
+            if !self.radius.is_finite() || self.radius <= 0.0 {
+                return Err(RiemannianTrustRegionError::InvalidRadius);
+            }
+            if !self.max_radius.is_finite() || self.max_radius <= 0.0 {
+                return Err(RiemannianTrustRegionError::InvalidMaxRadius);
+            }
+            if !self.grad_tol.is_finite() || self.grad_tol < 0.0 {
+                return Err(RiemannianTrustRegionError::InvalidGradientTolerance);
+            }
+
+            // Establish `0 < Δ_k ≤ Δmax` before the first step. Expansion caps at
+            // `max_radius` and contraction only shrinks, so the invariant then
+            // holds for every iterate and `max_radius` caps every step.
+            let mut delta = self.radius.min(self.max_radius);
+            // The initial gradient norm: the shift-invariant scale of the relative
+            // stationarity test.
+            let mut grad0_norm: Option<f64> = None;
+            let mut iterations = 0usize;
+
+            for _ in 0..self.max_iter {
+                let (f_curr, grad_e) = objective
+                    .value_gradient(x.view())
+                    .map_err(RiemannianTrustRegionError::Callback)?;
+                if !f_curr.is_finite() {
+                    return Err(RiemannianTrustRegionError::NonFiniteValue);
+                }
+                iterations += 1;
+                let grad = geometry
+                    .riemannian_gradient(x.view(), grad_e.view())
+                    .map_err(RiemannianTrustRegionError::Callback)?;
+                let grad_norm = metric_norm(geometry, x.view(), grad.view())?;
+                let grad0 = *grad0_norm.get_or_insert(grad_norm);
+                if relative_stationarity(grad_norm, grad0) <= self.grad_tol {
+                    break;
+                }
+
+                let (step, predicted_reduction, hit_boundary) =
+                    self.solve_subproblem(geometry, objective, x.view(), grad.view(), delta)?;
+
+                // A model offering no descent (e.g. a vanishing step): shrink and
+                // retry from the same point rather than dividing by ~0 in ρ.
+                if predicted_reduction.is_nan() || predicted_reduction <= 0.0 {
+                    delta *= policy.shrink_factor;
+                    if delta <= self.grad_tol * self.grad_tol {
+                        break;
+                    }
+                    continue;
+                }
+
+                let trial_x = geometry
+                    .retract(x.view(), step.view())
+                    .map_err(RiemannianTrustRegionError::Callback)?;
+                let f_trial = objective
+                    .value_gradient(trial_x.view())
+                    .map_err(RiemannianTrustRegionError::Callback)?
+                    .0;
+                let actual_reduction = f_curr - f_trial;
+                // The step's length in the metric the boundary test used. A
+                // non-finite trial value reaches the policy as a non-finite
+                // reduction, which cannot clear its acceptance ratio.
+                let step_norm = metric_inner(geometry, x.view(), step.view(), step.view())?
+                    .max(0.0)
+                    .sqrt();
+                let update = policy.update(
+                    delta,
+                    step_norm,
+                    hit_boundary,
+                    actual_reduction,
+                    predicted_reduction,
+                    f_curr,
+                );
+                delta = update.new_radius;
+                if update.accepted {
+                    x = trial_x;
+                }
+            }
+
+            // Budget exhaustion or a collapsed radius is not success merely because
+            // the last iterate is finite: decide the certificate at the terminal
+            // point.
+            let (f_final, grad_e_final) = objective
+                .value_gradient(x.view())
+                .map_err(RiemannianTrustRegionError::Callback)?;
+            if !f_final.is_finite() {
+                return Err(RiemannianTrustRegionError::NonFiniteTerminalValue);
+            }
+            let grad_final = geometry
+                .riemannian_gradient(x.view(), grad_e_final.view())
+                .map_err(RiemannianTrustRegionError::Callback)?;
+            let grad_final_norm = metric_norm(geometry, x.view(), grad_final.view())?;
+            let grad0 = grad0_norm.unwrap_or(grad_final_norm);
+            Ok(RiemannianTrustRegionTermination {
+                point: x,
+                iterations,
+                residual: relative_stationarity(grad_final_norm, grad0),
+                tolerance: self.grad_tol,
+            })
+        }
+
+        /// Solve `min_{‖η‖_g ≤ Δ} m(η)`, returning `(η, m(0) − m(η), hit_boundary)`.
+        fn solve_subproblem<G, O>(
+            &self,
+            geometry: &G,
+            objective: &mut O,
+            x: ArrayView1<'_, f64>,
+            grad: ArrayView1<'_, f64>,
+            delta: f64,
+        ) -> Result<(Array1<f64>, f64, bool), RiemannianTrustRegionError<G::Error>>
+        where
+            G: RiemannianGeometry + ?Sized,
+            O: RiemannianObjective<G::Error> + ?Sized,
+        {
+            // Probe once for curvature.
+            let has_hessian = objective
+                .hessian_vector_product(x, grad)
+                .map_err(RiemannianTrustRegionError::Callback)?
+                .is_some();
+            // The curved model is the second-order model of `f` along the trial path
+            // only for a second-order retraction; the linear term is
+            // retraction-independent, so the Cauchy model stays first-order correct
+            // along any retraction.
+            if !has_hessian || !geometry.retraction_is_second_order() {
+                return cauchy_point(geometry, x, grad, delta);
+            }
+
+            // Steihaug truncated CG in the metric inner product:
+            // min m(η) = g_x(grad, η) + ½ g_x(η, Hη) within ‖η‖_g ≤ Δ.
+            let n = grad.len();
+            let mut z = Array1::<f64>::zeros(n);
+            let mut r = grad.to_owned();
+            let mut p = -&r;
+            let r0_norm = metric_norm(geometry, x, r.view())?;
+            let tol = (STEIHAUG_CG_FORCING_FACTOR * r0_norm).min(r0_norm * r0_norm);
+            let max_cg = 2 * n + 1;
+            for _ in 0..max_cg {
+                let hp = objective
+                    .hessian_vector_product(x, p.view())
+                    .map_err(RiemannianTrustRegionError::Callback)?
+                    .ok_or(RiemannianTrustRegionError::CurvatureWithdrawnMidSubproblem)?;
+                let php = metric_inner(geometry, x, p.view(), hp.view())?;
+                if php <= 0.0 {
+                    // Negative curvature: go to the boundary along p.
+                    let tau = boundary_tau(geometry, x, z.view(), p.view(), delta)?;
+                    let eta = &z + &(&p * tau);
+                    let reduction = model_reduction(geometry, objective, x, grad, eta.view())?;
+                    return Ok((eta, reduction, true));
+                }
+                let rr = metric_inner(geometry, x, r.view(), r.view())?;
+                let alpha = rr / php;
+                let z_next = &z + &(&p * alpha);
+                if metric_norm(geometry, x, z_next.view())? >= delta {
+                    // The step crossed the boundary: stop on it.
+                    let tau = boundary_tau(geometry, x, z.view(), p.view(), delta)?;
+                    let eta = &z + &(&p * tau);
+                    let reduction = model_reduction(geometry, objective, x, grad, eta.view())?;
+                    return Ok((eta, reduction, true));
+                }
+                z = z_next;
+                let r_next = &r + &(&hp * alpha);
+                let r_next_norm = metric_norm(geometry, x, r_next.view())?;
+                if r_next_norm <= tol {
+                    let reduction = model_reduction(geometry, objective, x, grad, z.view())?;
+                    let hit = metric_norm(geometry, x, z.view())? >= BOUNDARY_FRACTION * delta;
+                    return Ok((z, reduction, hit));
+                }
+                let rr_next = metric_inner(geometry, x, r_next.view(), r_next.view())?;
+                let beta = rr_next / rr;
+                p = &(-&r_next) + &(&p * beta);
+                r = r_next;
+            }
+            let reduction = model_reduction(geometry, objective, x, grad, z.view())?;
+            let hit = metric_norm(geometry, x, z.view())? >= BOUNDARY_FRACTION * delta;
+            Ok((z, reduction, hit))
+        }
+    }
+
+    /// Cauchy point: the exact minimizer of the model along `−grad` inside the
+    /// region. Without curvature the model is the decreasing linear
+    /// `m(τ·(−grad)) = −τ‖grad‖²_g`, minimized on the boundary `τ = Δ / ‖grad‖_g`
+    /// with predicted reduction `Δ·‖grad‖_g`.
+    fn cauchy_point<G: RiemannianGeometry + ?Sized>(
+        geometry: &G,
+        x: ArrayView1<'_, f64>,
+        grad: ArrayView1<'_, f64>,
+        delta: f64,
+    ) -> Result<(Array1<f64>, f64, bool), RiemannianTrustRegionError<G::Error>> {
+        let grad_norm = metric_norm(geometry, x, grad)?;
+        if grad_norm <= 0.0 {
+            return Ok((Array1::<f64>::zeros(grad.len()), 0.0, false));
+        }
+        let tau = delta / grad_norm;
+        let step = &grad.to_owned() * (-tau);
+        let predicted = tau * grad_norm * grad_norm;
+        Ok((step, predicted, true))
+    }
+
+    /// Largest `τ ≥ 0` with `‖z + τ p‖_g = Δ`, from
+    /// `‖p‖²_g τ² + 2 g(z,p) τ + (‖z‖²_g − Δ²) = 0`.
+    fn boundary_tau<G: RiemannianGeometry + ?Sized>(
+        geometry: &G,
+        x: ArrayView1<'_, f64>,
+        z: ArrayView1<'_, f64>,
+        p: ArrayView1<'_, f64>,
+        delta: f64,
+    ) -> Result<f64, RiemannianTrustRegionError<G::Error>> {
+        let pp = metric_inner(geometry, x, p, p)?;
+        let zp = metric_inner(geometry, x, z, p)?;
+        let zz = metric_inner(geometry, x, z, z)?;
+        if pp <= 0.0 {
+            return Ok(0.0);
+        }
+        let c = zz - delta * delta;
+        let disc = (zp * zp - pp * c).max(0.0);
+        Ok(((-zp + disc.sqrt()) / pp).max(0.0))
+    }
+
+    /// Model reduction `m(0) − m(η) = −g(grad, η) − ½ g(η, Hη)`.
+    fn model_reduction<G, O>(
+        geometry: &G,
+        objective: &mut O,
+        x: ArrayView1<'_, f64>,
+        grad: ArrayView1<'_, f64>,
+        eta: ArrayView1<'_, f64>,
+    ) -> Result<f64, RiemannianTrustRegionError<G::Error>>
+    where
+        G: RiemannianGeometry + ?Sized,
+        O: RiemannianObjective<G::Error> + ?Sized,
+    {
+        let lin = metric_inner(geometry, x, grad, eta)?;
+        let heta = objective
+            .hessian_vector_product(x, eta)
+            .map_err(RiemannianTrustRegionError::Callback)?
+            .ok_or(RiemannianTrustRegionError::CurvatureWithdrawnWhileScoring)?;
+        let quad = metric_inner(geometry, x, eta, heta.view())?;
+        Ok(-lin - 0.5 * quad)
+    }
+
+    /// Metric inner product `aᵀ G(x) b`.
+    fn metric_inner<G: RiemannianGeometry + ?Sized>(
+        geometry: &G,
+        point: ArrayView1<'_, f64>,
+        a: ArrayView1<'_, f64>,
+        b: ArrayView1<'_, f64>,
+    ) -> Result<f64, RiemannianTrustRegionError<G::Error>> {
+        let product = geometry
+            .metric_product(point, b)
+            .map_err(RiemannianTrustRegionError::Callback)?;
+        if product.len() != a.len() {
+            return Err(RiemannianTrustRegionError::MetricProductLength {
+                expected: a.len(),
+                got: product.len(),
+            });
+        }
+        Ok(a.iter()
+            .zip(product.iter())
+            .fold(0.0, |sum, (left, right)| sum + left * right))
+    }
+
+    /// Metric norm `sqrt(aᵀ G(x) a)`, certified by [`certified_metric_norm`].
+    fn metric_norm<G: RiemannianGeometry + ?Sized>(
+        geometry: &G,
+        point: ArrayView1<'_, f64>,
+        a: ArrayView1<'_, f64>,
+    ) -> Result<f64, RiemannianTrustRegionError<G::Error>> {
+        let product = geometry
+            .metric_product(point, a)
+            .map_err(RiemannianTrustRegionError::Callback)?;
+        certified_metric_norm(a, product.view())
+    }
+
+    /// Certify `sqrt(aᵀ G a)` once the metric product `G a` is available.
+    ///
+    /// A Riemannian metric is positive definite, so a negative squared norm is
+    /// admitted only inside the backward-error band of this very accumulation —
+    /// Wilkinson's `γ_n · Σ|aᵢ (Ga)ᵢ|`, computed from the loop's own term count
+    /// and absolute sum rather than guessed. Clamping a materially negative
+    /// quadratic to zero would turn an indefinite metric into false stationarity.
+    /// The band must itself be finite: an infinite band would make every finite
+    /// negative quadratic look like roundoff and could certify a non-zero vector
+    /// as having zero norm.
+    fn certified_metric_norm<E>(
+        a: ArrayView1<'_, f64>,
+        metric_times_a: ArrayView1<'_, f64>,
+    ) -> Result<f64, RiemannianTrustRegionError<E>> {
+        if metric_times_a.len() != a.len() {
+            return Err(RiemannianTrustRegionError::MetricProductLength {
+                expected: a.len(),
+                got: metric_times_a.len(),
+            });
+        }
+        let mut squared_norm = 0.0_f64;
+        let mut absolute_sum = 0.0_f64;
+        for (&left, &right) in a.iter().zip(metric_times_a.iter()) {
+            let term = left * right;
+            squared_norm += term;
+            absolute_sum += term.abs();
+        }
+        if !squared_norm.is_finite() {
+            return Ok(f64::INFINITY);
+        }
+        if !absolute_sum.is_finite() {
+            return Err(RiemannianTrustRegionError::MetricBoundOverflow);
+        }
+        let negative_roundoff = accumulation_growth(a.len()) * absolute_sum;
+        if squared_norm < -negative_roundoff {
+            return Err(RiemannianTrustRegionError::IndefiniteMetric);
+        }
+        Ok(squared_norm.max(0.0).sqrt())
+    }
+
+    /// Shift-invariant relative stationarity `‖grad_k‖_g / max(‖grad_0‖_g, 1)`.
+    ///
+    /// The initial gradient norm carries the multiplicative scale the objective
+    /// and gradient share, so `grad_tol` reads as a relative tolerance, yet unlike
+    /// `max(|f|, 1)` it is invariant under `f → f + C`, which leaves the minimizers
+    /// and the accepted path unchanged. A non-finite gradient maps to `+∞`, so a
+    /// blown-up iterate is never stationary.
+    fn relative_stationarity(grad_norm: f64, grad0_norm: f64) -> f64 {
+        if !grad_norm.is_finite() || !grad0_norm.is_finite() {
+            return f64::INFINITY;
+        }
+        grad_norm / grad0_norm.max(1.0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use ndarray::{Array2, array};
+
+        /// Ambient coordinates with a constant diagonal metric and the identity
+        /// retraction.
+        struct DiagonalMetric {
+            diagonal: Array1<f64>,
+            second_order: bool,
+        }
+
+        impl RiemannianGeometry for DiagonalMetric {
+            type Error = String;
+
+            fn ambient_dim(&self) -> usize {
+                self.diagonal.len()
+            }
+
+            fn riemannian_gradient(
+                &self,
+                point: ArrayView1<'_, f64>,
+                differential: ArrayView1<'_, f64>,
+            ) -> Result<Array1<f64>, String> {
+                assert_eq!(point.len(), self.diagonal.len());
+                Ok(&differential / &self.diagonal)
+            }
+
+            fn metric_product(
+                &self,
+                point: ArrayView1<'_, f64>,
+                tangent: ArrayView1<'_, f64>,
+            ) -> Result<Array1<f64>, String> {
+                assert_eq!(point.len(), self.diagonal.len());
+                Ok(&tangent * &self.diagonal)
+            }
+
+            fn retract(
+                &self,
+                point: ArrayView1<'_, f64>,
+                tangent: ArrayView1<'_, f64>,
+            ) -> Result<Array1<f64>, String> {
+                Ok(&point + &tangent)
+            }
+
+            fn retraction_is_second_order(&self) -> bool {
+                self.second_order
+            }
+        }
+
+        fn euclidean(dimension: usize) -> DiagonalMetric {
+            DiagonalMetric {
+                diagonal: Array1::ones(dimension),
+                second_order: true,
+            }
+        }
+
+        /// `f(x) = ½ xᵀ A x − bᵀ x`, with an exact Hessian–vector product when
+        /// `curvature` is set. Counts the Hessian–vector products it is asked for.
+        struct Quadratic {
+            a: Array2<f64>,
+            b: Array1<f64>,
+            curvature: bool,
+            hessian_calls: usize,
+        }
+
+        impl RiemannianObjective<String> for Quadratic {
+            fn value_gradient(
+                &mut self,
+                point: ArrayView1<'_, f64>,
+            ) -> Result<(f64, Array1<f64>), String> {
+                let ax = self.a.dot(&point);
+                Ok((0.5 * point.dot(&ax) - self.b.dot(&point), &ax - &self.b))
+            }
+
+            fn hessian_vector_product(
+                &mut self,
+                point: ArrayView1<'_, f64>,
+                tangent: ArrayView1<'_, f64>,
+            ) -> Result<Option<Array1<f64>>, String> {
+                assert!(point.iter().all(|value| value.is_finite()));
+                self.hessian_calls += 1;
+                Ok(self.curvature.then(|| self.a.dot(&tangent)))
+            }
+        }
+
+        fn square(curvature: bool) -> Quadratic {
+            Quadratic {
+                a: array![[2.0]],
+                b: array![0.0],
+                curvature,
+                hessian_calls: 0,
+            }
+        }
+
+        fn solver(max_iter: usize) -> RiemannianTrustRegion {
+            RiemannianTrustRegion {
+                radius: 1.0,
+                max_radius: 1.0e6,
+                max_iter,
+                grad_tol: 1.0e-12,
+            }
+        }
+
+        #[test]
+        fn steihaug_steps_reach_the_minimizer_of_an_spd_quadratic() {
+            let mut objective = Quadratic {
+                a: array![[4.0, 1.0, 0.0], [1.0, 3.0, 1.0], [0.0, 1.0, 2.0]],
+                b: array![1.0, 2.0, -1.0],
+                curvature: true,
+                hessian_calls: 0,
+            };
+            let termination = solver(200)
+                .minimize(&euclidean(3), &mut objective, array![0.0, 0.0, 0.0].view())
+                .expect("the trust region runs");
+            assert!(termination.certifies(), "{termination:?}");
+            // A x = b at x = (0, 1, −1).
+            for (got, want) in termination.point.iter().zip([0.0, 1.0, -1.0]) {
+                assert!((got - want).abs() < 1.0e-6, "got {got}, want {want}");
+            }
+        }
+
+        #[test]
+        fn cauchy_points_converge_without_curvature() {
+            let mut objective = square(false);
+            let termination = solver(500)
+                .minimize(&euclidean(1), &mut objective, array![0.1].view())
+                .expect("the trust region runs");
+            assert!(termination.certifies(), "{termination:?}");
+            assert!(termination.point[0].abs() < 1.0e-6);
+        }
+
+        #[test]
+        fn a_first_order_retraction_takes_the_cauchy_point() {
+            let geometry = DiagonalMetric {
+                diagonal: array![1.0],
+                second_order: false,
+            };
+            let mut objective = square(true);
+            let termination = solver(500)
+                .minimize(&geometry, &mut objective, array![0.1].view())
+                .expect("the trust region runs");
+            assert!(termination.certifies(), "{termination:?}");
+            // Only the one curvature probe per subproblem: the Hessian model is
+            // never scored along a first-order retraction.
+            assert!(objective.hessian_calls <= termination.iterations);
+        }
+
+        #[test]
+        fn a_non_finite_gradient_never_certifies() {
+            struct NanGradient;
+            impl RiemannianObjective<String> for NanGradient {
+                fn value_gradient(
+                    &mut self,
+                    point: ArrayView1<'_, f64>,
+                ) -> Result<(f64, Array1<f64>), String> {
+                    assert_eq!(point.len(), 1);
+                    Ok((0.0, array![f64::NAN]))
+                }
+
+                fn hessian_vector_product(
+                    &mut self,
+                    point: ArrayView1<'_, f64>,
+                    tangent: ArrayView1<'_, f64>,
+                ) -> Result<Option<Array1<f64>>, String> {
+                    assert_eq!(point.len(), tangent.len());
+                    Ok(None)
+                }
+            }
+            let termination = solver(64)
+                .minimize(&euclidean(1), &mut NanGradient, array![0.0].view())
+                .expect("a NaN gradient is a verdict, not a refusal");
+            assert!(!termination.certifies());
+            assert!(termination.residual.is_infinite());
+        }
+
+        #[test]
+        fn an_overflowed_norm_bound_is_refused() {
+            // The signed quadratic cancels to zero in this order while the sum of
+            // absolute terms overflows.
+            let vector = array![1.0, 1.0, 1.0, 1.0];
+            let metric_product = array![9.0e307, -9.0e307, 9.0e307, -9.0e307];
+            let error = certified_metric_norm::<String>(vector.view(), metric_product.view())
+                .expect_err("an overflowed error bound must be refused");
+            assert!(matches!(
+                error,
+                RiemannianTrustRegionError::MetricBoundOverflow
+            ));
+        }
+
+        #[test]
+        fn an_indefinite_metric_is_refused() {
+            let geometry = DiagonalMetric {
+                diagonal: array![-1.0],
+                second_order: true,
+            };
+            let error = solver(64)
+                .minimize(&geometry, &mut square(true), array![1.0].view())
+                .expect_err("an indefinite metric is not a Riemannian norm");
+            assert!(matches!(
+                error,
+                RiemannianTrustRegionError::IndefiniteMetric
+            ));
+        }
+
+        #[test]
+        fn an_invalid_radius_is_refused() {
+            let mut configured = solver(64);
+            configured.radius = 0.0;
+            let error = configured
+                .minimize(&euclidean(1), &mut square(true), array![1.0].view())
+                .expect_err("a zero radius admits no step");
+            assert!(matches!(error, RiemannianTrustRegionError::InvalidRadius));
+        }
     }
 }
