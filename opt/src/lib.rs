@@ -2670,6 +2670,48 @@ fn apply_inverse_bfgs_update_in_place(
     has_finite_positive_diagonal(h_inv)
 }
 
+/// Clamps `x` into the box `[lower, upper]`, coordinate by coordinate.
+///
+/// A coordinate inside the box is returned unchanged.
+pub fn project_to_box(x: &Array1<f64>, lower: &Array1<f64>, upper: &Array1<f64>) -> Array1<f64> {
+    let mut z = x.clone();
+    for i in 0..z.len() {
+        let lo = lower[i];
+        let hi = upper[i];
+        if z[i] < lo {
+            z[i] = lo;
+        } else if z[i] > hi {
+            z[i] = hi;
+        }
+    }
+    z
+}
+
+/// The KKT-projected gradient of `g` at `x` in the box `[lower, upper]`.
+///
+/// A coordinate within `tol` of a bound whose component points out of the box
+/// (`g_i >= 0` at a lower bound, `g_i <= 0` at an upper bound) carries a bound
+/// multiplier rather than a feasible descent direction, and is zeroed. Every
+/// other component is kept, so the norm of the result is the first-order
+/// stationarity residual of the box-constrained problem.
+pub fn kkt_projected_gradient(
+    x: &Array1<f64>,
+    g: &Array1<f64>,
+    lower: &Array1<f64>,
+    upper: &Array1<f64>,
+    tol: f64,
+) -> Array1<f64> {
+    let mut gp = g.clone();
+    for i in 0..x.len() {
+        let at_lower = x[i] <= lower[i] + tol;
+        let at_upper = x[i] >= upper[i] - tol;
+        if (at_lower && g[i] >= 0.0) || (at_upper && g[i] <= 0.0) {
+            gp[i] = 0.0;
+        }
+    }
+    gp
+}
+
 // Box constraints with projection and active-set tolerance.
 #[derive(Clone)]
 struct BoxSpec {
@@ -2684,17 +2726,7 @@ impl BoxSpec {
     }
 
     fn project(&self, x: &Array1<f64>) -> Array1<f64> {
-        let mut z = x.clone();
-        for i in 0..z.len() {
-            let lo = self.lower[i];
-            let hi = self.upper[i];
-            if z[i] < lo {
-                z[i] = lo;
-            } else if z[i] > hi {
-                z[i] = hi;
-            }
-        }
-        z
+        project_to_box(x, &self.lower, &self.upper)
     }
 
     fn active_mask(&self, x: &Array1<f64>, g: &Array1<f64>) -> Vec<bool> {
@@ -2726,18 +2758,7 @@ impl BoxSpec {
     }
 
     fn projected_gradient(&self, x: &Array1<f64>, g: &Array1<f64>) -> Array1<f64> {
-        let mut gp = g.clone();
-        for i in 0..x.len() {
-            let lo = self.lower[i];
-            let hi = self.upper[i];
-            let tol = self.tol;
-            let at_lower = x[i] <= lo + tol;
-            let at_upper = x[i] >= hi - tol;
-            if (at_lower && g[i] >= 0.0) || (at_upper && g[i] <= 0.0) {
-                gp[i] = 0.0;
-            }
-        }
-        gp
+        kkt_projected_gradient(x, g, &self.lower, &self.upper, self.tol)
     }
 }
 
@@ -17546,6 +17567,48 @@ mod tests {
 #[cfg(test)]
 mod added_primitive_tests {
     use super::*;
+    use ndarray::array;
+
+    // --- Box projection ---------------------------------------------------
+
+    #[test]
+    fn project_to_box_clamps_each_coordinate_and_keeps_interior_points() {
+        let lower = array![-1.0, -1.0, -1.0];
+        let upper = array![1.0, 1.0, 1.0];
+        let x = array![-3.0, 0.25, 8.0];
+        assert_eq!(project_to_box(&x, &lower, &upper), array![-1.0, 0.25, 1.0]);
+    }
+
+    #[test]
+    fn kkt_projected_gradient_zeros_only_bound_multipliers() {
+        let lower = array![0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let upper = array![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let x = array![0.0, 0.0, 1.0, 1.0, 1.0, 0.5];
+        let g = array![2.0, -3.0, -5.0, 7.0, 11.0, -13.0];
+        // At a lower bound a positive component is a multiplier and a negative
+        // one a feasible descent; at an upper bound the signs swap. A fixed
+        // coordinate has no feasible move, and an interior one keeps its pull.
+        assert_eq!(
+            kkt_projected_gradient(&x, &g, &lower, &upper, 0.0),
+            array![0.0, -3.0, 0.0, 7.0, 0.0, -13.0]
+        );
+    }
+
+    #[test]
+    fn kkt_projected_gradient_treats_a_coordinate_within_tol_as_active() {
+        let lower = array![0.0];
+        let upper = array![1.0];
+        let x = array![1e-9];
+        let g = array![4.0];
+        assert_eq!(
+            kkt_projected_gradient(&x, &g, &lower, &upper, 1e-6),
+            array![0.0]
+        );
+        assert_eq!(
+            kkt_projected_gradient(&x, &g, &lower, &upper, 0.0),
+            array![4.0]
+        );
+    }
 
     // --- TrustRegionPolicy ------------------------------------------------
 
