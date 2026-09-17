@@ -2462,11 +2462,408 @@ impl ReducedSymmetricSpectrum {
         }
         full_step
     }
+
+    /// Newton-decrement stationarity verdict for `gradient` on this reduced
+    /// spectrum; see [`newton_decrement_verdict`].
+    fn decrement_verdict(
+        &self,
+        gradient: &Array1<f64>,
+        bands: &DecrementBands,
+    ) -> DecrementVerdict {
+        let q = self.free.len();
+        let curvature_resolution = self.numerical_floor + bands.hessian;
+        if let Some(&minimum) = self.eigenvalues.first()
+            && minimum < -curvature_resolution
+        {
+            return DecrementVerdict::NotPositiveDefinite {
+                min_curvature: minimum,
+                curvature_resolution,
+            };
+        }
+        let coordinates = self.gradient_coordinates(gradient);
+        // `c_i = Σ_j W_ji g_j` is a q-term accumulation.
+        let projection_growth = accumulation_growth(q);
+        let mut lambda_sq = 0.0_f64;
+        let mut band_lambda_sq = 0.0_f64;
+        let mut retained = 0usize;
+        let mut flat = 0usize;
+        let mut valley = 0usize;
+        for direction in 0..q {
+            let column = self.eigenvectors.column(direction);
+            let mut propagated = 0.0_f64;
+            let mut magnitude = 0.0_f64;
+            for (reduced_index, &full_index) in self.free.iter().enumerate() {
+                let weight = column[reduced_index].abs();
+                propagated += weight * bands.gradient[full_index];
+                magnitude += weight * gradient[full_index].abs();
+            }
+            let coordinate = coordinates[direction];
+            let coordinate_band = propagated + projection_growth * magnitude;
+            let curvature = self.eigenvalues[direction];
+            if curvature <= curvature_resolution {
+                flat += 1;
+                if coordinate.abs() > coordinate_band {
+                    valley += 1;
+                }
+                continue;
+            }
+            retained += 1;
+            lambda_sq += coordinate * coordinate / curvature;
+            band_lambda_sq += 2.0 * coordinate.abs() * coordinate_band / curvature
+                + coordinate * coordinate * curvature_resolution / (curvature * curvature);
+        }
+        // The quotients and their sum.
+        band_lambda_sq += accumulation_growth(2 * q) * lambda_sq;
+        let evidence = DecrementEvidence {
+            lambda_sq,
+            band_lambda_sq,
+            band_f: bands.objective,
+            retained,
+            flat,
+            curvature_resolution,
+        };
+        if !(lambda_sq.is_finite() && band_lambda_sq.is_finite() && bands.objective.is_finite()) {
+            return DecrementVerdict::DecrementUnresolved(evidence);
+        }
+        if valley > 0 {
+            return DecrementVerdict::WeaklyIdentifiedValley {
+                directions: valley,
+                evidence,
+            };
+        }
+        if 0.5 * lambda_sq + band_lambda_sq <= bands.objective {
+            DecrementVerdict::Certified(evidence)
+        } else if band_lambda_sq >= bands.objective {
+            DecrementVerdict::DecrementUnresolved(evidence)
+        } else {
+            DecrementVerdict::DecrementAboveTolerance(evidence)
+        }
+    }
 }
 
 fn reduced_hessian_is_positive_semidefinite(h: &Array2<f64>, active: Option<&[bool]>) -> bool {
     ReducedSymmetricSpectrum::decompose(h, active)
         .is_some_and(|spectrum| !spectrum.has_resolvable_negative_curvature())
+}
+
+/// The rounding bands a Newton-decrement stationarity certificate is decided
+/// against.
+///
+/// Every band is absolute, in the units of the objective, its gradient and its
+/// Hessian respectively, so rescaling the objective together with its bands
+/// leaves the verdict unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecrementBands {
+    /// Rounding band of the objective value at the point being certified.
+    pub objective: f64,
+    /// Rounding band of each gradient component, over the full dimension.
+    pub gradient: Array1<f64>,
+    /// Spectral-norm rounding band of the Hessian's own formation. The
+    /// eigensolver's backward error is added to it.
+    pub hessian: f64,
+}
+
+/// The quantities a [`DecrementVerdict`] was decided against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecrementEvidence {
+    /// `λ̂² = Σ c_i²/μ_i` over the retained directions, with `c = Wᵀg`.
+    pub lambda_sq: f64,
+    /// Propagated rounding band of `lambda_sq`.
+    pub band_lambda_sq: f64,
+    /// The objective's rounding band.
+    pub band_f: f64,
+    /// Free directions with curvature above `curvature_resolution`.
+    pub retained: usize,
+    /// Free directions with curvature within `curvature_resolution` of zero.
+    pub flat: usize,
+    /// The Hessian formation band plus the eigensolver's backward error.
+    pub curvature_resolution: f64,
+}
+
+/// Why a Newton-decrement stationarity certificate passed or did not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum DecrementVerdict {
+    /// `½·λ̂² + band_λ² ≤ band_f`: the objective decrease a Newton step would
+    /// still buy is within the objective's rounding band.
+    Certified(DecrementEvidence),
+    /// A Newton step still buys a decrease the arithmetic resolves.
+    DecrementAboveTolerance(DecrementEvidence),
+    /// The decrement's own rounding is as large as the objective band, or a
+    /// decided quantity is not finite, so the arithmetic cannot decide.
+    DecrementUnresolved(DecrementEvidence),
+    /// A free direction has curvature below `−curvature_resolution`: a genuine
+    /// saddle. Curvature refuses only here.
+    NotPositiveDefinite {
+        min_curvature: f64,
+        curvature_resolution: f64,
+    },
+    /// A flat free direction carries a gradient component above its rounding
+    /// band: a weakly identified valley.
+    WeaklyIdentifiedValley {
+        directions: usize,
+        evidence: DecrementEvidence,
+    },
+    /// The gradient or its bands do not match the Hessian's dimension.
+    DimensionMismatch {
+        hessian: usize,
+        gradient: usize,
+        gradient_bands: usize,
+    },
+    /// The reduced Hessian was not square or not finite, or did not decompose.
+    DecompositionFailed,
+}
+
+impl DecrementVerdict {
+    /// Whether the point is certified stationary.
+    #[must_use]
+    pub fn is_certified(&self) -> bool {
+        matches!(self, Self::Certified(_))
+    }
+}
+
+/// Newton-decrement stationarity verdict for `gradient` and `hessian` on the
+/// coordinates `active` leaves free.
+///
+/// ```text
+/// certify iff ½·λ̂² + band_λ² ≤ band_f,   λ̂² = Σ_{μ_i > r} c_i²/μ_i,   c = Wᵀ·g_F
+/// ```
+///
+/// `W·diag(μ)·Wᵀ` is the spectrum of the symmetrized Hessian on the free
+/// coordinates, and `r` its curvature resolution: the Hessian formation band
+/// plus the eigensolver's backward error. The decrement is the objective
+/// decrease a Newton step would still buy, read off the spectrum rather than
+/// off a step, so the verdict is affine-invariant and independent of the
+/// problem's size. The bar holds rounding bands only: any decrease the
+/// arithmetic resolves refuses.
+///
+/// Coordinates railed at a bound belong in `active`. Their optimality is the
+/// sign of the projected gradient at the bound, which
+/// [`kkt_projected_gradient`] decides, not the decrement.
+#[must_use]
+pub fn newton_decrement_verdict(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+    active: Option<&[bool]>,
+    bands: &DecrementBands,
+) -> DecrementVerdict {
+    let n = hessian.nrows();
+    if gradient.len() != n || bands.gradient.len() != n {
+        return DecrementVerdict::DimensionMismatch {
+            hessian: n,
+            gradient: gradient.len(),
+            gradient_bands: bands.gradient.len(),
+        };
+    }
+    match ReducedSymmetricSpectrum::decompose(hessian, active) {
+        Some(spectrum) => spectrum.decrement_verdict(gradient, bands),
+        None => DecrementVerdict::DecompositionFailed,
+    }
+}
+
+#[cfg(test)]
+mod newton_decrement_tests {
+    use super::{DecrementBands, DecrementVerdict, newton_decrement_verdict};
+    use ndarray::{Array1, Array2, array};
+
+    /// A fixed rotation, so `Q·diag(μ)·Qᵀ` has a known spectrum and inverse.
+    fn rotation() -> Array2<f64> {
+        let first = array![[0.8, -0.6, 0.0], [0.6, 0.8, 0.0], [0.0, 0.0, 1.0]];
+        let second = array![[1.0, 0.0, 0.0], [0.0, 0.6, 0.8], [0.0, -0.8, 0.6]];
+        first.dot(&second)
+    }
+
+    fn spectral(rotation: &Array2<f64>, eigenvalues: [f64; 3]) -> Array2<f64> {
+        let diagonal = Array2::from_diag(&Array1::from(eigenvalues.to_vec()));
+        rotation.dot(&diagonal).dot(&rotation.t())
+    }
+
+    fn bands(objective: f64, gradient: f64, hessian: f64) -> DecrementBands {
+        DecrementBands {
+            objective,
+            gradient: Array1::from_elem(3, gradient),
+            hessian,
+        }
+    }
+
+    #[test]
+    fn a_resolved_minimum_certifies_and_a_resolvable_decrease_refuses() {
+        let q = rotation();
+        let eigenvalues = [1.0, 3.0, 10.0];
+        let hessian = spectral(&q, eigenvalues);
+        let inverse = spectral(&q, eigenvalues.map(|value| 1.0 / value));
+        let tight = bands(1e-12, 1e-15, 1e-15);
+
+        let stationary = Array1::<f64>::zeros(3);
+        let verdict = newton_decrement_verdict(&hessian, &stationary, None, &tight);
+        assert!(
+            verdict.is_certified(),
+            "a zero gradient must certify: {verdict:?}"
+        );
+
+        let gradient = array![1e-3, -2e-3, 5e-4];
+        let expected = gradient.dot(&inverse.dot(&gradient));
+        match newton_decrement_verdict(&hessian, &gradient, None, &tight) {
+            DecrementVerdict::DecrementAboveTolerance(evidence) => {
+                assert!(
+                    (evidence.lambda_sq - expected).abs() <= 1e-12 * expected,
+                    "λ̂² = {:.17e}, gᵀH⁻¹g = {expected:.17e}",
+                    evidence.lambda_sq
+                );
+                assert_eq!(evidence.retained, 3);
+                assert_eq!(evidence.flat, 0);
+            }
+            other => panic!("a resolvable decrease must refuse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rescaling_the_objective_with_its_bands_leaves_the_verdict_unchanged() {
+        let q = rotation();
+        let hessian = spectral(&q, [1.0, 3.0, 10.0]);
+        let resolved = array![1e-8, 0.0, -2e-8];
+        let resolvable = array![1e-3, -2e-3, 5e-4];
+        let reference_resolved =
+            newton_decrement_verdict(&hessian, &resolved, None, &bands(1e-12, 1e-15, 1e-15));
+        let reference_resolvable =
+            newton_decrement_verdict(&hessian, &resolvable, None, &bands(1e-12, 1e-15, 1e-15));
+        assert!(reference_resolved.is_certified(), "{reference_resolved:?}");
+        assert!(
+            matches!(
+                reference_resolvable,
+                DecrementVerdict::DecrementAboveTolerance(_)
+            ),
+            "{reference_resolvable:?}"
+        );
+        for scale in [1e-6, 1e6] {
+            let scaled_hessian = hessian.mapv(|value| value * scale);
+            let scaled_bands = bands(1e-12 * scale, 1e-15 * scale, 1e-15 * scale);
+            let certified = newton_decrement_verdict(
+                &scaled_hessian,
+                &resolved.mapv(|value| value * scale),
+                None,
+                &scaled_bands,
+            );
+            assert!(certified.is_certified(), "scale {scale}: {certified:?}");
+            match newton_decrement_verdict(
+                &scaled_hessian,
+                &resolvable.mapv(|value| value * scale),
+                None,
+                &scaled_bands,
+            ) {
+                DecrementVerdict::DecrementAboveTolerance(evidence) => {
+                    let DecrementVerdict::DecrementAboveTolerance(reference) = reference_resolvable
+                    else {
+                        unreachable!("checked above")
+                    };
+                    let ratio = evidence.lambda_sq / (reference.lambda_sq * scale);
+                    assert!(
+                        (ratio - 1.0).abs() <= 1e-10,
+                        "scale {scale}: λ̂² ratio {ratio}"
+                    );
+                }
+                other => panic!("scale {scale}: a resolvable decrease must refuse: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolvable_negative_curvature_refuses_as_a_saddle() {
+        let hessian = spectral(&rotation(), [-1.0, 2.0, 3.0]);
+        match newton_decrement_verdict(
+            &hessian,
+            &Array1::zeros(3),
+            None,
+            &bands(1e-12, 1e-15, 1e-15),
+        ) {
+            DecrementVerdict::NotPositiveDefinite { min_curvature, .. } => {
+                assert!(
+                    (min_curvature + 1.0).abs() <= 1e-12,
+                    "min curvature {min_curvature}"
+                );
+            }
+            other => panic!("a saddle must refuse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_gradient_along_a_flat_direction_is_a_weakly_identified_valley() {
+        let q = rotation();
+        let hessian = spectral(&q, [0.0, 2.0, 3.0]);
+        let tight = bands(1e-12, 1e-15, 1e-15);
+        let along_flat = q.column(0).mapv(|value| value * 1e-3);
+        match newton_decrement_verdict(&hessian, &along_flat, None, &tight) {
+            DecrementVerdict::WeaklyIdentifiedValley {
+                directions,
+                evidence,
+            } => {
+                assert_eq!(directions, 1);
+                assert_eq!(evidence.flat, 1);
+                assert_eq!(evidence.retained, 2);
+            }
+            other => panic!("a gradient along a flat direction must name the valley: {other:?}"),
+        }
+        let along_retained = q.column(2).mapv(|value| value * 1e-3);
+        match newton_decrement_verdict(&hessian, &along_retained, None, &tight) {
+            DecrementVerdict::DecrementAboveTolerance(evidence) => {
+                assert!(
+                    (evidence.lambda_sq - 1e-6 / 3.0).abs() <= 1e-12 * 1e-6,
+                    "λ̂² {}",
+                    evidence.lambda_sq
+                );
+            }
+            other => panic!("the decrement must be decided on the retained directions: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_decrement_rounding_band_above_the_objective_band_is_unresolved() {
+        let hessian = spectral(&rotation(), [1.0, 3.0, 10.0]);
+        let gradient = array![1e-3, -2e-3, 5e-4];
+        match newton_decrement_verdict(&hessian, &gradient, None, &bands(1e-12, 1.0, 1e-15)) {
+            DecrementVerdict::DecrementUnresolved(evidence) => {
+                assert!(evidence.band_lambda_sq >= evidence.band_f, "{evidence:?}");
+            }
+            other => panic!(
+                "a decrement whose rounding swamps the objective band must be unresolved: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn active_coordinates_are_excluded_from_the_decrement() {
+        let hessian = spectral(&rotation(), [1.0, 3.0, 10.0]);
+        let gradient = array![5.0, 0.0, 0.0];
+        let verdict = newton_decrement_verdict(
+            &hessian,
+            &gradient,
+            Some(&[true, false, false]),
+            &bands(1e-12, 1e-15, 1e-15),
+        );
+        assert!(
+            verdict.is_certified(),
+            "a railed coordinate's gradient must not enter the decrement: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn mismatched_dimensions_are_named() {
+        let hessian = spectral(&rotation(), [1.0, 3.0, 10.0]);
+        let verdict = newton_decrement_verdict(
+            &hessian,
+            &array![0.0, 0.0],
+            None,
+            &bands(1e-12, 1e-15, 1e-15),
+        );
+        assert_eq!(
+            verdict,
+            DecrementVerdict::DimensionMismatch {
+                hessian: 3,
+                gradient: 2,
+                gradient_bands: 3,
+            }
+        );
+    }
 }
 
 /// Materialize an exact Hessian operator only at a prospective stationary
