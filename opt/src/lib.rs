@@ -7518,6 +7518,64 @@ impl ArcCore {
         let mut consecutive_rejections = 0usize;
 
         for k in 0..self.max_iterations {
+            // The saturated-model verdict. Once `sigma` is pinned at `sigma_max`, an
+            // iteration that refuses its trial leaves the iterate, the gradient, the
+            // Hessian and `sigma` unchanged, so the next iteration re-solves the same
+            // model and refuses for the same reason. That holds whether the trial was
+            // rejected by the ratio test after an evaluation, or refused before one:
+            // every coordinate active, a failed subproblem, a trial
+            // `prepare_arc_trial` refuses, or a recoverable objective error. One
+            // predicate, `sigma >= sigma_max`, therefore owns every such path and
+            // reports the trust-region reject floor. Without it the refusal paths
+            // `continue` with no evaluation and no log line, and under an unbounded
+            // iteration budget they never return.
+            macro_rules! saturated_model_verdict {
+                ($refusal:expr, $consecutive:expr) => {{
+                    let g_proj_now = self.projected_gradient(&x_k, &g_k);
+                    let g_now = g_proj_now.dot(&g_proj_now).sqrt();
+                    log::warn!(
+                        "[ARC] regularization saturated at sigma_max={:.3e} with the iterate \
+                         unchanged after {} refused trial(s): {}; reporting the trust-region \
+                         reject floor",
+                        self.sigma_max,
+                        $consecutive,
+                        $refusal
+                    );
+                    ArcError::TrustRegionRejectFloor {
+                        last_solution: Box::new(Solution::gradient_based(
+                            x_k.clone(),
+                            f_k,
+                            g_k.clone(),
+                            g_now,
+                            Some(h_k.clone()),
+                            k + 1,
+                            func_evals,
+                            grad_evals,
+                            hess_evals,
+                            TerminationReason::TrustRegionRejectFloor {
+                                radius: 1.0 / self.sigma,
+                                floor: 1.0 / self.sigma_max,
+                                consecutive_rejections: $consecutive,
+                                grad_norm: g_now,
+                            },
+                        )),
+                    }
+                }};
+            }
+            // A trial refused before evaluation: report the floor if `sigma` cannot
+            // grow, otherwise escalate and retry.
+            macro_rules! refuse_or_escalate {
+                ($refusal:expr) => {{
+                    if self.sigma >= self.sigma_max {
+                        return Err(saturated_model_verdict!(
+                            $refusal,
+                            consecutive_rejections + model_failure_streak + 1
+                        ));
+                    }
+                    self.escalate_sigma_on_failure(&mut model_failure_streak);
+                    continue;
+                }};
+            }
             // Per-iter observer notification. Mirrors `NewtonTrustRegionCore::run`;
             // without this hook, callers driving outer-loop bookkeeping
             // off `on_iteration_start` see only the pre-loop call from
@@ -7567,8 +7625,10 @@ impl ArcCore {
             let step = if any_active {
                 if !any_free_variables(&active) {
                     // All coordinates are active at their bounds: increase sigma and retry.
-                    self.escalate_sigma_on_failure(&mut model_failure_streak);
-                    continue;
+                    // `kkt_projected_gradient` zeroes every coordinate this mask marks
+                    // active, so the stationarity test above already returns here; the
+                    // verdict keeps this path from spinning if the two ever disagree.
+                    refuse_or_escalate!("every coordinate is active at its bound");
                 }
                 match self.solve_arc_subproblem(h_model, &g_proj_k, self.sigma, Some(&active), &x_k)
                 {
@@ -7576,8 +7636,7 @@ impl ArcCore {
                     None => {
                         // Failed subproblem solve: moderate growth first, stronger only
                         // after repeated failures.
-                        self.escalate_sigma_on_failure(&mut model_failure_streak);
-                        continue;
+                        refuse_or_escalate!("the masked cubic subproblem produced no step");
                     }
                 }
             } else {
@@ -7586,8 +7645,7 @@ impl ArcCore {
                     None => {
                         // Failed subproblem solve: moderate growth first, stronger only
                         // after repeated failures.
-                        self.escalate_sigma_on_failure(&mut model_failure_streak);
-                        continue;
+                        refuse_or_escalate!("the cubic subproblem produced no step");
                     }
                 }
             };
@@ -7595,8 +7653,7 @@ impl ArcCore {
             let Some(mut candidate) =
                 self.prepare_arc_trial(&x_k, &step, &g_proj_k, h_model, &active)
             else {
-                self.escalate_sigma_on_failure(&mut model_failure_streak);
-                continue;
+                refuse_or_escalate!("prepare_arc_trial refused the trial");
             };
 
             // Numerical-convergence guard: when the predicted reduction
@@ -7651,14 +7708,16 @@ impl ArcCore {
                     let Some(opposing_step) = self.opposing_arc_hard_case_step(
                         h_model, &g_proj_k, self.sigma, &active, &step,
                     ) else {
-                        self.escalate_sigma_on_failure(&mut model_failure_streak);
-                        continue;
+                        refuse_or_escalate!(
+                            "the trial raised a recoverable objective error and no antipodal step exists"
+                        );
                     };
                     let Some(antipodal_candidate) =
                         self.prepare_arc_trial(&x_k, &opposing_step, &g_proj_k, h_model, &active)
                     else {
-                        self.escalate_sigma_on_failure(&mut model_failure_streak);
-                        continue;
+                        refuse_or_escalate!(
+                            "the trial raised a recoverable objective error and prepare_arc_trial refused the antipode"
+                        );
                     };
                     let antipodal_sample = oracle.eval_cost_grad_hessian(
                         obj_fn,
@@ -7671,8 +7730,9 @@ impl ArcCore {
                     match antipodal_sample {
                         Ok(sample) => sample,
                         Err(err) if err.is_recoverable() => {
-                            self.escalate_sigma_on_failure(&mut model_failure_streak);
-                            continue;
+                            refuse_or_escalate!(
+                                "both the trial and its antipode raised recoverable objective errors"
+                            );
                         }
                         Err(err) => {
                             let message = err.into_message();
@@ -7784,27 +7844,10 @@ impl ArcCore {
                 // radius is `1/sigma`, the trust-region length scale the
                 // cubic model is equivalent to.
                 if self.sigma >= self.sigma_max {
-                    let g_proj_now = self.projected_gradient(&x_k, &g_k);
-                    let g_now = g_proj_now.dot(&g_proj_now).sqrt();
-                    return Err(ArcError::TrustRegionRejectFloor {
-                        last_solution: Box::new(Solution::gradient_based(
-                            x_k,
-                            f_k,
-                            g_k,
-                            g_now,
-                            Some(h_k),
-                            k + 1,
-                            func_evals,
-                            grad_evals,
-                            hess_evals,
-                            TerminationReason::TrustRegionRejectFloor {
-                                radius: 1.0 / self.sigma,
-                                floor: 1.0 / self.sigma_max,
-                                consecutive_rejections,
-                                grad_norm: g_now,
-                            },
-                        )),
-                    });
+                    return Err(saturated_model_verdict!(
+                        "trial rejected by the ratio test",
+                        consecutive_rejections
+                    ));
                 }
             }
 
@@ -15219,6 +15262,228 @@ mod tests {
         core.escalate_sigma_on_failure(&mut streak);
         assert_eq!(streak, 3);
         assert!((core.sigma - 12.0).abs() < 1e-12);
+    }
+
+    /// An objective whose seed evaluation succeeds and every trial evaluation fails
+    /// recoverably.
+    struct EveryTrialErrors {
+        calls: usize,
+    }
+
+    impl ZerothOrderObjective for EveryTrialErrors {
+        fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+            Ok(0.5 * (x[0] - 1.0).powi(2))
+        }
+    }
+
+    impl FirstOrderObjective for EveryTrialErrors {
+        fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+            Ok(FirstOrderSample {
+                value: 0.5 * (x[0] - 1.0).powi(2),
+                gradient: array![x[0] - 1.0],
+            })
+        }
+    }
+
+    impl SecondOrderObjective for EveryTrialErrors {
+        fn eval_hessian(
+            &mut self,
+            x: &Array1<f64>,
+        ) -> Result<SecondOrderSample, ObjectiveEvalError> {
+            self.calls += 1;
+            if self.calls > 1 {
+                return Err(ObjectiveEvalError::recoverable("every trial refuses"));
+            }
+            Ok(SecondOrderSample {
+                value: 0.5 * (x[0] - 1.0).powi(2),
+                gradient: array![x[0] - 1.0],
+                hessian: Some(array![[1.0]]),
+            })
+        }
+    }
+
+    /// A run pinned at `sigma_max` whose trials keep being refused must report the
+    /// trust-region reject floor at the unchanged iterate instead of spinning. Every
+    /// caller of this runs with an unbounded iteration budget, so before the verdict
+    /// covered the refusal paths each of these runs never returned.
+    fn assert_reject_floor_at_unchanged_iterate(
+        outcome: Result<Solution, ArcError>,
+        x0: &Array1<f64>,
+        what: &str,
+    ) {
+        match outcome {
+            Err(ArcError::TrustRegionRejectFloor { last_solution }) => {
+                assert_eq!(
+                    &last_solution.final_point, x0,
+                    "{what}: the floor must report the unchanged iterate"
+                );
+                assert!(
+                    matches!(
+                        last_solution.termination,
+                        TerminationReason::TrustRegionRejectFloor {
+                            consecutive_rejections,
+                            ..
+                        } if consecutive_rejections >= 1
+                    ),
+                    "{what}: termination {:?}",
+                    last_solution.termination
+                );
+            }
+            other => panic!("{what}: expected the trust-region reject floor, got {other:?}"),
+        }
+    }
+
+    /// Refusal site: a recoverable objective error with no antipodal step (a positive
+    /// definite model has none).
+    #[test]
+    fn arc_reports_the_reject_floor_when_every_trial_errors_at_the_ceiling() {
+        let x0 = array![2.0];
+        let mut solver = super::Arc::new(x0.clone(), EveryTrialErrors { calls: 0 })
+            .with_profile(Profile::Deterministic)
+            .with_tolerance(tol(1e-8))
+            .with_max_iterations(iters(usize::MAX))
+            .with_max_regularization(1e3);
+        assert_reject_floor_at_unchanged_iterate(solver.run(), &x0, "every trial errors");
+    }
+
+    /// Refusal site: `prepare_arc_trial` refuses a step below its `1e-16` floor.
+    /// With `sigma = 1e40` the cubic step on `|g| = 1` is about `1e-20`, while the
+    /// gradient is far above tolerance, so the run can neither step nor stop.
+    #[test]
+    fn arc_reports_the_reject_floor_when_the_step_underflows_at_the_ceiling() {
+        let x0 = array![2.0];
+        let g0 = array![1.0];
+        let h0 = array![[1.0]];
+        let sigma = 1e40;
+        let mut core = super::ArcCore::new(x0.clone());
+        core.sigma = sigma;
+        let step = core
+            .solve_arc_subproblem(&h0, &g0, sigma, None, &x0)
+            .expect("the cubic subproblem has a step");
+        let step_norm = step.dot(&step).sqrt();
+        assert!(
+            step_norm <= 1e-16,
+            "the regime must be a step below prepare_arc_trial's floor: |s|={step_norm:e}"
+        );
+        assert!(
+            core.prepare_arc_trial(&x0, &step, &g0, &h0, &[false])
+                .is_none()
+        );
+        let mut solver = super::Arc::new(
+            x0.clone(),
+            SecondOrderFn::new(|x: &Array1<f64>| {
+                let d = x[0] - 1.0;
+                (0.5 * d * d, array![d], array![[1.0]])
+            }),
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1e-8))
+        .with_max_iterations(iters(usize::MAX))
+        .with_initial_regularization(sigma)
+        .with_max_regularization(sigma);
+        assert_reject_floor_at_unchanged_iterate(solver.run(), &x0, "step underflow");
+    }
+
+    /// Refusal site: `prepare_arc_trial`'s model-gradient accuracy test, the path
+    /// parity1561 measured in gam #2817 (20000 silent passes at `sigma_max`). At a
+    /// 1e6-scale model and `sigma = 1e30` the step is about 1e-12, above the 1e-16
+    /// floor, but the subproblem's roundoff residual exceeds `theta·|s|²` (floored at
+    /// 1e-14), so every trial is refused before it is evaluated.
+    #[test]
+    fn arc_reports_the_reject_floor_when_the_model_gradient_test_refuses_at_the_ceiling() {
+        let scale = 1.0e6;
+        let h0 = array![[2.0, 0.3, 0.1], [0.3, 1.5, 0.2], [0.1, 0.2, 1.0]] * scale;
+        let center = array![0.5, -0.35, 0.2];
+        let x0 = array![0.0, 0.0, 0.0];
+        let g0 = h0.dot(&(&x0 - &center));
+        let sigma = 1e30;
+        let mut core = super::ArcCore::new(x0.clone());
+        core.sigma = sigma;
+        let active = [false; 3];
+        let step = core
+            .solve_arc_subproblem(&h0, &g0, sigma, None, &x0)
+            .expect("the cubic subproblem has a step");
+        let step_norm = step.dot(&step).sqrt();
+        let (model_delta, _, model_gradient) =
+            core.arc_model_value(&g0, &h0, sigma, &step, Some(&active));
+        let residual = model_gradient.dot(&model_gradient).sqrt();
+        assert!(
+            step_norm > 1e-16
+                && model_delta <= 0.0
+                && residual > (core.theta * step_norm * step_norm).max(1e-14),
+            "the regime must be the model-gradient accuracy refusal: |s|={step_norm:e} \
+             delta={model_delta:e} residual={residual:e}"
+        );
+        assert!(
+            core.prepare_arc_trial(&x0, &step, &g0, &h0, &active)
+                .is_none()
+        );
+        let h_objective = h0.clone();
+        let mut solver = super::Arc::new(
+            x0.clone(),
+            SecondOrderFn::new(move |x: &Array1<f64>| {
+                let d = x - &center;
+                let hd = h_objective.dot(&d);
+                (0.5 * d.dot(&hd), hd, h_objective.clone())
+            }),
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1e-8))
+        .with_max_iterations(iters(usize::MAX))
+        .with_initial_regularization(sigma)
+        .with_max_regularization(sigma);
+        assert_reject_floor_at_unchanged_iterate(solver.run(), &x0, "model-gradient accuracy");
+    }
+
+    /// Census of the all-active refusal site. The mask marks a coordinate active only
+    /// when it is fixed, or at a bound with a strictly outward gradient.
+    /// `kkt_projected_gradient` zeroes every such coordinate (`g >= 0` at the lower
+    /// bound, `g <= 0` at the upper), so an all-active mask implies a zero projected
+    /// gradient, and the stationarity test returns before the branch is reached. The
+    /// saturation verdict still covers that site if the two ever disagree.
+    #[test]
+    fn arc_an_all_active_mask_implies_a_zero_projected_gradient() {
+        let bound_tol = 1e-8;
+        let bounds = super::BoxSpec::new(array![0.0, -1.0, 2.0], array![1.0, 1.0, 2.0], bound_tol);
+        let positions = |lower: f64, upper: f64| {
+            [
+                lower,
+                lower + 0.5 * bound_tol,
+                0.5 * (lower + upper),
+                upper - 0.5 * bound_tol,
+                upper,
+            ]
+        };
+        let signs = [-1.0, 0.0, 1.0];
+        let mut all_active = 0usize;
+        for &x_first in &positions(0.0, 1.0) {
+            for &x_second in &positions(-1.0, 1.0) {
+                for &g_first in &signs {
+                    for &g_second in &signs {
+                        for &g_fixed in &signs {
+                            let x = array![x_first, x_second, 2.0];
+                            let g = array![g_first, g_second, g_fixed];
+                            if bounds
+                                .second_order_active_mask(&x, &g)
+                                .iter()
+                                .all(|&active| active)
+                            {
+                                all_active += 1;
+                                assert!(
+                                    bounds.projected_gradient(&x, &g).iter().all(|&v| v == 0.0),
+                                    "an all-active state with a nonzero projected gradient: \
+                                     x={x:?} g={g:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            all_active > 0,
+            "the census grid must contain all-active states"
+        );
     }
 
     /// A function whose gradient is constant, causing `y_k` to be zero.
