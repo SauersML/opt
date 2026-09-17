@@ -1289,28 +1289,110 @@ impl<E: std::fmt::Display> std::fmt::Display for RootError<E> {
 
 impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for RootError<E> {}
 
+/// What the oracle evaluations of [`find_root_monotone`] have established: the
+/// smallest-`|F|` point seen, and on each side of the root the evaluated point
+/// nearest to it. A monotone `F` is negative on one side of its root and
+/// positive on the other, so the nearest negative and the nearest positive
+/// point bracket the root as soon as both exist.
+struct RootEvaluations {
+    increasing: bool,
+    best: (f64, RootSample),
+    negative: Option<f64>,
+    positive: Option<f64>,
+}
+
+impl RootEvaluations {
+    fn new(increasing: bool, at: f64, sample: RootSample) -> Self {
+        let mut known = Self {
+            increasing,
+            best: (at, sample),
+            negative: None,
+            positive: None,
+        };
+        known.observe(at, sample);
+        known
+    }
+
+    fn observe(&mut self, at: f64, sample: RootSample) {
+        if sample.value.abs() < self.best.1.value.abs() {
+            self.best = (at, sample);
+        }
+        // An increasing `F` is negative below its root, so the nearest
+        // negative point is the largest and the nearest positive point the
+        // smallest; a decreasing `F` mirrors both.
+        let nearer = |current: Option<f64>, larger_is_nearer: bool| match current {
+            None => true,
+            Some(point) if larger_is_nearer => at > point,
+            Some(point) => at < point,
+        };
+        if sample.value < 0.0 {
+            if nearer(self.negative, self.increasing) {
+                self.negative = Some(at);
+            }
+        } else if sample.value > 0.0 && nearer(self.positive, !self.increasing) {
+            self.positive = Some(at);
+        }
+    }
+
+    fn bracket(&self) -> Option<(f64, f64)> {
+        let (negative, positive) = (self.negative?, self.positive?);
+        Some((negative.min(positive), negative.max(positive)))
+    }
+}
+
+/// The safeguarded Halley step from `at` when it lands strictly inside
+/// `(lo, hi)` and its denominator clears `curvature_floor`, else the Newton
+/// step when that lands inside, else `None`.
+fn accelerated_root_step(
+    at: f64,
+    sample: RootSample,
+    curvature_floor: f64,
+    lo: f64,
+    hi: f64,
+) -> Option<f64> {
+    let (f, fp, fpp) = (sample.value, sample.d1, sample.d2);
+    if !(fp.is_finite() && fp.abs() > curvature_floor) {
+        return None;
+    }
+    let inside = |candidate: f64| candidate > lo && candidate < hi;
+    let halley_denom = 2.0 * fp * fp - f * fpp;
+    if halley_denom.is_finite() && halley_denom.abs() > curvature_floor {
+        let candidate = at - (2.0 * f * fp) / halley_denom;
+        if inside(candidate) {
+            return Some(candidate);
+        }
+    }
+    let candidate = at - f / fp;
+    inside(candidate).then_some(candidate)
+}
+
 /// Safeguarded root-finder for a strictly monotone scalar equation
 /// `F(a) = 0`, with the monotone direction inferred from the sign of
 /// `F'` at the seed (so it handles both increasing and decreasing `F`).
 ///
-/// The algorithm has two phases. **Bracketing** first tries up to two
-/// trust-region-capped warm-start Newton corrections from the seed (a
-/// good seed is often within one or two Newton steps), then, if the root
-/// is not yet found, either honors a supplied `analytic_bracket` or
-/// grows a geometric straddle outward from the seed. **Refinement** then
-/// runs a hybrid inside the bracket: a safeguarded Halley step when the
-/// second derivative is well-conditioned, falling back to a monotone
-/// Newton step, and to a guaranteed-progress bisection whenever the
-/// accelerated probe would leave the bracket or the curvature is below
-/// `curvature_floor`. The best (smallest-`|F|`) point seen is tracked and
-/// returned. Convergence is declared on `|F| <= convergence_tol` or a
-/// bracket width within the same tolerance scale.
+/// Every oracle evaluation is kept: the smallest-`|F|` point seen is what is
+/// returned, and on each side of the root the evaluated point nearest to it
+/// bounds the root, because the sign of `F(a)` says which side `a` lies on.
 ///
-/// This is a faithful generalization of the fixed-signature monotone root
-/// solver used by the calibration kernels: the guarantees (globally
-/// convergent bracketed fallback, Halley abandoned below the curvature
-/// floor, best-point tracking, positive returned derivative) are
-/// preserved exactly.
+/// **Bracketing** first tries up to two trust-region-capped warm-start Newton
+/// corrections from the seed (a good seed is often within one or two Newton
+/// steps). If the evaluations so far already straddle the root, they are the
+/// bracket. Otherwise a supplied `analytic_bracket` is honored, tightened by
+/// every evaluation inside it, or a geometric straddle is grown outward from
+/// the evaluated point nearest the root. **Refinement** then proposes a
+/// safeguarded Halley step from the best point when the second derivative is
+/// well-conditioned, falling back to a Newton step, and to bisection when
+/// neither lands inside the bracket or the curvature is below
+/// `curvature_floor`. Every evaluation replaces whichever bracket end has its
+/// sign, and an accelerated step that leaves the bracket wider than half its
+/// width at the last halving is followed by a bisection, so the bracket width
+/// halves at least every two iterations whatever the shape of `F`: neither end
+/// can sit fixed while the other creeps. Convergence is declared on
+/// `|F| <= convergence_tol` or a bracket width within the same tolerance scale.
+///
+/// The guarantees of the calibration kernels' solver are kept: globally
+/// convergent bracketed fallback, Halley abandoned below the curvature floor,
+/// best-point tracking, positive returned derivative.
 pub fn find_root_monotone<E>(
     mut oracle: impl FnMut(f64) -> Result<RootSample, E>,
     seed: f64,
@@ -1345,8 +1427,11 @@ pub fn find_root_monotone<E>(
         });
     }
 
+    let mut known = RootEvaluations::new(f_deriv_init > 0.0, seed, seed_sample);
+
     // Warm-start Newton probes before spending evaluations on a global
-    // bracket; fall through to the bracketed solver if not decisive.
+    // bracket; fall through to the bracketed solver if not decisive. What they
+    // establish is kept for the bracket and the best point.
     let mut a = seed;
     let mut f = f_init;
     let mut fp = f_deriv_init;
@@ -1373,6 +1458,7 @@ pub fn find_root_monotone<E>(
         }
         let cand = a + step;
         let sample = oracle(cand).map_err(RootError::Eval)?;
+        known.observe(cand, sample);
         if sample.value.abs() <= tol {
             let abs_d = sample.d1.abs();
             if !abs_d.is_finite() || abs_d == 0.0 {
@@ -1392,41 +1478,40 @@ pub fn find_root_monotone<E>(
     }
 
     // --- Phase 1: bracket the root. ---
-    let (mut neg_pt, mut pos_pt) = if let Some((lo, hi)) = analytic_bracket {
+    let bracket = if let Some((lo, hi)) = analytic_bracket {
         if !lo.is_finite() || !hi.is_finite() || lo == hi {
             return Err(RootError::BracketInvalid { lo, hi });
         }
-        let f_lo = oracle(lo).map_err(RootError::Eval)?.value;
-        let f_hi = oracle(hi).map_err(RootError::Eval)?.value;
-        if f_lo <= 0.0 && f_hi >= 0.0 {
-            (lo, hi)
-        } else if f_hi <= 0.0 && f_lo >= 0.0 {
-            (hi, lo)
-        } else {
+        let lo_sample = oracle(lo).map_err(RootError::Eval)?;
+        let hi_sample = oracle(hi).map_err(RootError::Eval)?;
+        let (f_lo, f_hi) = (lo_sample.value, hi_sample.value);
+        if !((f_lo <= 0.0 && f_hi >= 0.0) || (f_hi <= 0.0 && f_lo >= 0.0)) {
             return Err(RootError::BracketNoStraddle { f_lo, f_hi });
         }
+        known.observe(lo, lo_sample);
+        known.observe(hi, hi_sample);
+        known.bracket()
+    } else if let Some(bracket) = known.bracket() {
+        Some(bracket)
     } else {
-        // Search direction: step_sign = -sign(f · F').
+        // Search direction: step_sign = -sign(f · F'). No evaluation has
+        // changed sign yet, so every one lies on the seed's side, and the
+        // search starts from the one nearest the root.
         let step_sign: f64 = if f_init * f_deriv_init < 0.0 {
             1.0
         } else {
             -1.0
         };
-        let f_init_negative = f_init < 0.0;
-        let mut same_side = seed;
-        let mut step_mag = (config.initial_bracket_frac * (1.0 + seed.abs())).max(1.0);
+        let mut same_side = known.negative.or(known.positive).unwrap_or(seed);
+        let mut step_mag = (config.initial_bracket_frac * (1.0 + same_side.abs())).max(1.0);
         let step_cap = 1.0e6_f64.max(1024.0 * (1.0 + seed.abs()));
-        let mut found_other: Option<f64> = None;
+        let mut crossed = false;
         for _ in 0..config.max_bracket_iters {
             let probe = same_side + step_mag * step_sign;
-            let f_probe = oracle(probe).map_err(RootError::Eval)?.value;
-            let crossed = if f_init_negative {
-                f_probe >= 0.0
-            } else {
-                f_probe <= 0.0
-            };
-            if crossed {
-                found_other = Some(probe);
+            let sample = oracle(probe).map_err(RootError::Eval)?;
+            known.observe(probe, sample);
+            if sample.value.abs() <= tol || known.bracket().is_some() {
+                crossed = true;
                 break;
             }
             same_side = probe;
@@ -1435,102 +1520,54 @@ pub fn find_root_monotone<E>(
                 break;
             }
         }
-        let Some(other) = found_other else {
+        if !crossed {
             return Err(RootError::BracketingExhausted {
                 direction: step_sign,
                 seed,
             });
-        };
-        if f_init_negative {
-            (same_side, other)
-        } else {
-            (other, same_side)
         }
+        known.bracket()
     };
 
     // --- Phase 2: hybrid bisection / Newton / Halley refinement. ---
-    let mut best_a = seed;
-    let mut best_f = f_init;
-    let mut best_abs_deriv = f_deriv_init.abs();
-
-    let mut update_best = |a: f64, f: f64, f_d: f64| {
-        if f.abs() < best_f.abs() {
-            best_a = a;
-            best_f = f;
-            best_abs_deriv = f_d.abs();
-        }
-    };
-
     let mut refine_iters = 0usize;
-    for _ in 0..config.max_refine_iters {
-        refine_iters += 1;
-        let (lo, hi) = if neg_pt <= pos_pt {
-            (neg_pt, pos_pt)
-        } else {
-            (pos_pt, neg_pt)
-        };
-        let mid = 0.5 * (lo + hi);
-        let mid_sample = oracle(mid).map_err(RootError::Eval)?;
-        let (f_mid, f_a_mid, f_aa_mid) = (mid_sample.value, mid_sample.d1, mid_sample.d2);
-        update_best(mid, f_mid, f_a_mid);
-
-        if f_mid.abs() <= tol {
-            break;
-        }
-
-        // Safeguarded Halley step when the curvature is well-conditioned.
-        let halley_probe = if f_a_mid.is_finite() && f_a_mid.abs() > curv_floor {
-            let halley_denom = 2.0 * f_a_mid * f_a_mid - f_mid * f_aa_mid;
-            if halley_denom.is_finite() && halley_denom.abs() > curv_floor {
-                let cand = mid - (2.0 * f_mid * f_a_mid) / halley_denom;
-                if cand > lo && cand < hi {
-                    Some(cand)
-                } else {
-                    None
-                }
-            } else {
-                None
+    if let Some((mut lo, mut hi)) = bracket {
+        let mut width_at_halving = hi - lo;
+        let mut accelerated_since_halving = false;
+        for _ in 0..config.max_refine_iters {
+            let (best_a, best_sample) = known.best;
+            if best_sample.value.abs() <= tol || (hi - lo) <= tol * (1.0 + hi.abs() + lo.abs()) {
+                break;
             }
-        } else {
-            None
-        };
-
-        // Monotone Newton fallback, then bisection.
-        let probe = if let Some(cand) = halley_probe {
-            cand
-        } else if f_a_mid.is_finite() && f_a_mid.abs() > curv_floor {
-            let cand = mid - f_mid / f_a_mid;
-            if cand > lo && cand < hi { cand } else { mid }
-        } else {
-            mid
-        };
-
-        let (bracket_pt, f_bracket) = if (probe - mid).abs() > 0.0 {
-            let probe_sample = oracle(probe).map_err(RootError::Eval)?;
-            update_best(probe, probe_sample.value, probe_sample.d1);
-            (probe, probe_sample.value)
-        } else {
-            (mid, f_mid)
-        };
-
-        if f_bracket <= 0.0 {
-            neg_pt = bracket_pt;
-        } else {
-            pos_pt = bracket_pt;
-        }
-
-        let (next_lo, next_hi) = if neg_pt <= pos_pt {
-            (neg_pt, pos_pt)
-        } else {
-            (pos_pt, neg_pt)
-        };
-        if (next_hi - next_lo).abs() <= tol * (1.0 + next_hi.abs() + next_lo.abs()) {
-            break;
+            refine_iters += 1;
+            if hi - lo <= 0.5 * width_at_halving {
+                width_at_halving = hi - lo;
+                accelerated_since_halving = false;
+            }
+            let accelerated = if accelerated_since_halving {
+                None
+            } else {
+                accelerated_root_step(best_a, best_sample, curv_floor, lo, hi)
+            };
+            let probe = match accelerated {
+                Some(candidate) => {
+                    accelerated_since_halving = true;
+                    candidate
+                }
+                None => 0.5 * (lo + hi),
+            };
+            let sample = oracle(probe).map_err(RootError::Eval)?;
+            known.observe(probe, sample);
+            if let Some(next) = known.bracket() {
+                (lo, hi) = next;
+            }
         }
     }
 
     // Final validation: re-evaluate the derivative at the best point if
     // it is suspect.
+    let (best_a, best_sample) = known.best;
+    let mut best_abs_deriv = best_sample.d1.abs();
     if !best_abs_deriv.is_finite() || best_abs_deriv == 0.0 {
         let f_a_best = oracle(best_a).map_err(RootError::Eval)?.d1;
         best_abs_deriv = f_a_best.abs();
@@ -1541,7 +1578,7 @@ pub fn find_root_monotone<E>(
 
     Ok(RootSolution {
         root: best_a,
-        value: best_f,
+        value: best_sample.value,
         abs_deriv: best_abs_deriv,
         iters: refine_iters,
         method_used: RootMethod::Bracketed,
@@ -17903,6 +17940,329 @@ mod added_primitive_tests {
         let err = find_root_monotone(|_a| Err::<RootSample, _>("oracle down"), 1.0, &cfg(), None)
             .unwrap_err();
         assert_eq!(err, RootError::Eval("oracle down"));
+    }
+
+    // --- find_root_monotone: stagnation and warm-start probes (opt#18) -----
+
+    /// Numerical Recipes' `erfcc`: smooth, with relative error below 1.2e-7 and
+    /// accurate in relative terms deep in the tail. The oracles below need a
+    /// smooth monotone `Φ`, not its last digits.
+    fn erfc_for_root_tests(x: f64) -> f64 {
+        let z = x.abs();
+        let t = 1.0 / (1.0 + 0.5 * z);
+        let poly = -1.265_512_23
+            + t * (1.000_023_68
+                + t * (0.374_091_96
+                    + t * (0.096_784_18
+                        + t * (-0.186_288_06
+                            + t * (0.278_868_07
+                                + t * (-1.135_203_98
+                                    + t * (1.488_515_87
+                                        + t * (-0.822_152_23 + t * 0.170_872_77))))))));
+        let tail = t * (-z * z + poly).exp();
+        if x >= 0.0 { tail } else { 2.0 - tail }
+    }
+
+    fn normal_cdf_for_root_tests(x: f64) -> f64 {
+        0.5 * erfc_for_root_tests(-x / std::f64::consts::SQRT_2)
+    }
+
+    fn normal_pdf_for_root_tests(x: f64) -> f64 {
+        (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+    }
+
+    /// `F(a) = log Σ wᵢ Φ(a + b·zᵢ) − log μ★` and its first two derivatives: the
+    /// calibrated intercept of a row under a finite latent law, which gam's
+    /// Bernoulli marginal-slope prediction solves at every quadrature node.
+    fn phi_mixture_intercept(
+        a: f64,
+        slope: f64,
+        target_mu: f64,
+        nodes: &[f64],
+        weights: &[f64],
+    ) -> RootSample {
+        let (mut cdf, mut pdf, mut eta_pdf) = (0.0, 0.0, 0.0);
+        for (&node, &weight) in nodes.iter().zip(weights) {
+            let eta = a + slope * node;
+            let density = normal_pdf_for_root_tests(eta);
+            cdf += weight * normal_cdf_for_root_tests(eta);
+            pdf += weight * density;
+            eta_pdf += weight * eta * density;
+        }
+        let d1 = pdf / cdf;
+        RootSample {
+            value: cdf.ln() - target_mu.ln(),
+            d1,
+            d2: -eta_pdf / cdf - d1 * d1,
+        }
+    }
+
+    /// The 12-node latent law of the opt#18 capture (gam-cli's marginal-slope
+    /// fixture, standardized scores at equal mass, with ties).
+    const CAPTURED_NODES: [f64; 12] = [
+        -1.8255629993581926,
+        -1.2313276572905227,
+        -0.8029379970544664,
+        -0.8029379970544664,
+        -0.4368079942486818,
+        -0.09471751209927097,
+        0.2473729700501398,
+        0.6135029728559244,
+        0.6135029728559244,
+        1.0418926330919809,
+        1.0418926330919809,
+        1.6361279751596505,
+    ];
+
+    /// An evaluation record as a solver that keeps the nearest negative and
+    /// positive point sees it, over the last `refinement_evals` evaluations: the
+    /// bracket they start from, the longest run of them over which the bracket
+    /// did not halve since it last halved, and whether each end moved.
+    #[derive(Debug)]
+    struct BracketReplay {
+        first: (f64, f64),
+        longest_run_without_halving: usize,
+        lower_moved: bool,
+        upper_moved: bool,
+    }
+
+    fn replay_bracket(
+        evaluations: &[(f64, f64)],
+        increasing: bool,
+        refinement_evals: usize,
+    ) -> Option<BracketReplay> {
+        let (mut negative, mut positive): (Option<f64>, Option<f64>) = (None, None);
+        let mut replay: Option<BracketReplay> = None;
+        let mut width_at_halving = f64::INFINITY;
+        let mut run = 0usize;
+        let refinement_start = evaluations.len().saturating_sub(refinement_evals);
+        for (index, &(at, value)) in evaluations.iter().enumerate() {
+            if value < 0.0 {
+                if negative.is_none_or(|point| (at > point) == increasing) {
+                    negative = Some(at);
+                }
+            } else if value > 0.0 && positive.is_none_or(|point| (at < point) == increasing) {
+                positive = Some(at);
+            }
+            let (Some(negative), Some(positive)) = (negative, positive) else {
+                continue;
+            };
+            let (lo, hi) = (negative.min(positive), negative.max(positive));
+            if index + 1 == refinement_start {
+                replay = Some(BracketReplay {
+                    first: (lo, hi),
+                    longest_run_without_halving: 0,
+                    lower_moved: false,
+                    upper_moved: false,
+                });
+                width_at_halving = hi - lo;
+                continue;
+            }
+            if let Some(state) = replay.as_mut() {
+                state.lower_moved |= lo > state.first.0;
+                state.upper_moved |= hi < state.first.1;
+                if hi - lo <= 0.5 * width_at_halving {
+                    width_at_halving = hi - lo;
+                    run = 0;
+                } else {
+                    run += 1;
+                    state.longest_run_without_halving = state.longest_run_without_halving.max(run);
+                }
+            }
+        }
+        replay
+    }
+
+    /// Solves one monotone profile from `seed` and holds the solver to its
+    /// guarantees: the residual reaches the tolerance, and once refinement
+    /// starts the bracket halves at least every two evaluations, so neither end
+    /// sits fixed while the other creeps (the opt#18 stagnation), within the
+    /// refinement count that rate implies.
+    fn assert_root_without_stagnation(
+        label: &str,
+        increasing: bool,
+        seed: f64,
+        tol: f64,
+        oracle: impl Fn(f64) -> RootSample,
+    ) {
+        let evaluations = std::cell::RefCell::new(Vec::new());
+        let solution = find_root_monotone(
+            |a| {
+                let sample = oracle(a);
+                evaluations.borrow_mut().push((a, sample.value));
+                Ok::<_, ()>(sample)
+            },
+            seed,
+            &RootConfig::new(tol, 64, 64),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("[{label}] {e:?}"));
+        let evaluations = evaluations.into_inner();
+        let replay = replay_bracket(&evaluations, increasing, solution.iters);
+        eprintln!(
+            "[{label}] root {:+.12} F {:+.2e}, {} refinement of {} evaluations; {replay:?}",
+            solution.root,
+            solution.value,
+            solution.iters,
+            evaluations.len()
+        );
+        assert!(
+            solution.value.abs() <= tol,
+            "[{label}] stopped at F = {:e} after {} refinement iterations",
+            solution.value,
+            solution.iters
+        );
+        if let Some(replay) = replay {
+            assert!(
+                replay.longest_run_without_halving <= 1,
+                "[{label}] the bracket went {} evaluations without halving: {replay:?}",
+                replay.longest_run_without_halving
+            );
+            let (lo, hi) = replay.first;
+            let halvings = ((hi - lo) / (tol * (1.0 + lo.abs() + hi.abs())))
+                .log2()
+                .ceil()
+                .max(0.0);
+            assert!(
+                (solution.iters as f64) <= 2.0 * halvings + 1.0,
+                "[{label}] {} refinement iterations from [{lo}, {hi}], beyond the {} its halving \
+                 rate allows",
+                solution.iters,
+                2.0 * halvings + 1.0
+            );
+        }
+    }
+
+    /// The opt#18 capture: at rev 75bb98e the warm-start probes reached
+    /// `F = −9.1e-6`, bracketing restarted from the seed, and refinement moved
+    /// only the probe end of `[9.989, 12.737]` for all 48 iterations, returning
+    /// `F = −4.75e-3`. Same law, slope, target and seed here.
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn root_monotone_converges_on_the_captured_phi_mixture_intercept() {
+        let weights = [1.0 / 12.0; 12];
+        let (slope, target_mu, seed) = (
+            10.653_187_290_718_356_9,
+            0.824_741_868_009_762_014,
+            9.989_413_042_819_224_49,
+        );
+        assert_root_without_stagnation(
+            "captured phi-mixture intercept",
+            true,
+            seed,
+            9.094_947_017_729_282e-13,
+            |a| phi_mixture_intercept(a, slope, target_mu, &CAPTURED_NODES, &weights),
+        );
+    }
+
+    fn steep_exponential(a: f64) -> RootSample {
+        let e = (12.0 * a).exp();
+        RootSample {
+            value: e - 3.0,
+            d1: 12.0 * e,
+            d2: 144.0 * e,
+        }
+    }
+
+    fn saturating_exponential(a: f64) -> RootSample {
+        let e = (-12.0 * a).exp();
+        RootSample {
+            value: 0.1 - e,
+            d1: 12.0 * e,
+            d2: -144.0 * e,
+        }
+    }
+
+    fn log_probit_tail(a: f64) -> RootSample {
+        let u = 8.0 * a;
+        let cdf = normal_cdf_for_root_tests(u);
+        let ratio = normal_pdf_for_root_tests(u) / cdf;
+        RootSample {
+            value: cdf.ln() - 0.95_f64.ln(),
+            d1: 8.0 * ratio,
+            d2: 64.0 * (-u * ratio - ratio * ratio),
+        }
+    }
+
+    fn flat_odd_power(a: f64) -> RootSample {
+        RootSample {
+            value: 0.5 - a.powi(9) - a,
+            d1: -9.0 * a.powi(8) - 1.0,
+            d2: -72.0 * a.powi(7),
+        }
+    }
+
+    /// Monotone profiles with one steep and one flat side, from seeds far on
+    /// the flat side: the shapes on which moving one bracket end at a time
+    /// stagnates. The Φ-mixture intercept is swept over slopes and targets on
+    /// the captured law, from gam's closed-form seed `Φ⁻¹(μ★)·√(1 + b²)`.
+    #[test]
+    fn root_monotone_bracket_halves_on_one_sided_profiles() {
+        let tol = 1e-12;
+        assert_root_without_stagnation("exp(12a) - 3", true, -2.0, tol, steep_exponential);
+        assert_root_without_stagnation("0.1 - exp(-12a)", true, 3.0, tol, saturating_exponential);
+        assert_root_without_stagnation("log Phi(8a) - log 0.95", true, -1.0, tol, log_probit_tail);
+        assert_root_without_stagnation("0.5 - a^9 - a", false, -1.5, tol, flat_odd_power);
+        let weights = [1.0 / 12.0; 12];
+        for &slope in &[4.0_f64, 10.653_187_290_718_357, 25.0] {
+            for &target_mu in &[0.05_f64, 0.5, 0.824_741_868_009_762, 0.97] {
+                let (mut low, mut high) = (-40.0_f64, 40.0_f64);
+                for _ in 0..200 {
+                    let mid = 0.5 * (low + high);
+                    if normal_cdf_for_root_tests(mid) < target_mu {
+                        low = mid;
+                    } else {
+                        high = mid;
+                    }
+                }
+                let seed = 0.5 * (low + high) * (1.0 + slope * slope).sqrt();
+                assert_root_without_stagnation(
+                    &format!("phi-mixture b={slope:.3} mu*={target_mu}"),
+                    true,
+                    seed,
+                    tol,
+                    |a| phi_mixture_intercept(a, slope, target_mu, &CAPTURED_NODES, &weights),
+                );
+            }
+        }
+    }
+
+    /// When the warm-start Newton probes already straddle the root they are the
+    /// bracket: from seed 99 on `exp(a − 100) − 1` the first probe overshoots to
+    /// `99 + (e − 1)`, and nothing may be evaluated outside `[99, 99 + (e − 1)]`.
+    /// At rev 75bb98e bracketing restarted from the seed with a step of 25 and
+    /// evaluated `a = 124`.
+    #[test]
+    fn root_monotone_uses_the_bracket_its_warm_start_probes_establish() {
+        let evaluations = std::cell::RefCell::new(Vec::new());
+        let solution = find_root_monotone(
+            |a| {
+                let e = (a - 100.0).exp();
+                evaluations.borrow_mut().push((a, e - 1.0));
+                Ok::<_, ()>(RootSample {
+                    value: e - 1.0,
+                    d1: e,
+                    d2: e,
+                })
+            },
+            99.0,
+            &cfg(),
+            None,
+        )
+        .unwrap();
+        let evaluations = evaluations.into_inner();
+        let (seed_value, (probe, probe_value)) = (evaluations[0].1, evaluations[1]);
+        assert!(
+            seed_value < 0.0 && probe_value > 0.0,
+            "the first warm-start probe must overshoot the root: {evaluations:?}"
+        );
+        assert!((solution.root - 100.0).abs() < 1e-9, "{solution:?}");
+        assert!(
+            evaluations
+                .iter()
+                .all(|&(at, _)| (99.0..=probe).contains(&at)),
+            "evaluated outside the probe bracket [99, {probe}]: {evaluations:?}"
+        );
     }
 
     // --- find_root_bracketed --------------------------------------------
