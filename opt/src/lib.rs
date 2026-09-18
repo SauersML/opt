@@ -4065,6 +4065,10 @@ pub enum StationarityNorm {
     L2,
     /// Maximum-absolute-component norm of the (bound-projected) gradient.
     LInf,
+    /// Not a gradient norm: the Newton decrement against rounding bands
+    /// ([`newton_decrement_verdict`]). `measured` is `½λ̂² + band_λ²` and
+    /// `threshold` is `band_f`, both in the objective's own units.
+    NewtonDecrement,
 }
 
 /// Whether a stationarity threshold was absolute or rescaled by the iterate.
@@ -4200,6 +4204,15 @@ pub enum TerminationReason {
         threshold: f64,
         grad_norm: f64,
     },
+    /// The objective supplied rounding bands
+    /// ([`SecondOrderObjective::decrement_bands`]) and
+    /// [`newton_decrement_verdict`] certified the returned point on them:
+    /// `½λ̂² + band_λ² ≤ band_f`, so no Newton step the arithmetic resolves
+    /// lowers the objective. The gradient tolerance was not consulted.
+    NewtonDecrementCertified {
+        evidence: DecrementEvidence,
+        grad_norm: f64,
+    },
     /// The trust radius (or cubic regularization) reached its floor
     /// with `consecutive_rejections` steps rejected in a row: the
     /// region cannot shrink further and no step is acceptable. Further
@@ -4311,6 +4324,12 @@ impl TerminationReason {
                 StationarityNorm::L2,
                 StationarityScaling::Absolute,
             ),
+            Self::NewtonDecrementCertified { evidence, .. } => ev(
+                0.5 * evidence.lambda_sq + evidence.band_lambda_sq,
+                evidence.band_f,
+                StationarityNorm::NewtonDecrement,
+                StationarityScaling::Absolute,
+            ),
             // A noise-floor stop is a statement about the MODEL's
             // resolution, not about the gradient: the gradient was never
             // compared to a threshold, so there is no evidence to report.
@@ -4337,6 +4356,7 @@ impl TerminationReason {
             | Self::CostStallFloor { grad_norm, .. }
             | Self::ModelNoiseFloor { grad_norm, .. }
             | Self::ModelDecrementTolerance { grad_norm, .. }
+            | Self::NewtonDecrementCertified { grad_norm, .. }
             | Self::TrustRegionRejectFloor { grad_norm, .. }
             | Self::IterationBudget { grad_norm, .. }
             | Self::LineSearchFailed { grad_norm } => Some(grad_norm),
@@ -4366,6 +4386,7 @@ impl TerminationReason {
                 | Self::CostStallStationary { .. }
                 | Self::ModelNoiseFloor { .. }
                 | Self::ModelDecrementTolerance { .. }
+                | Self::NewtonDecrementCertified { .. }
                 | Self::StepNormTolerance { .. }
         )
     }
@@ -4381,6 +4402,7 @@ impl TerminationReason {
             Self::GradientTolerance { .. }
             | Self::SmallStepFlatObjective { .. }
             | Self::RelativeStationarityWindow { .. }
+            | Self::NewtonDecrementCertified { .. }
             | Self::StepNormTolerance { .. }
             | Self::FixedPointRequestedStop { .. } => OptimizationStatus::Converged,
             Self::ModelNoiseFloor { .. } => OptimizationStatus::NumericallyConverged,
@@ -4416,6 +4438,7 @@ impl TerminationReason {
             Self::CostStallFloor { .. } => "cost_stall_floor",
             Self::ModelNoiseFloor { .. } => "model_noise_floor",
             Self::ModelDecrementTolerance { .. } => "model_decrement_tolerance",
+            Self::NewtonDecrementCertified { .. } => "newton_decrement_certified",
             Self::TrustRegionRejectFloor { .. } => "trust_region_reject_floor",
             Self::StepNormTolerance { .. } => "step_norm_tolerance",
             Self::FixedPointRequestedStop { .. } => "fixed_point_requested_stop",
@@ -4476,6 +4499,13 @@ impl std::fmt::Display for TerminationReason {
             } => write!(
                 f,
                 "(interior Newton decrement {predicted_decrease:.6e} <= {threshold:.6e})"
+            ),
+            Self::NewtonDecrementCertified { evidence, .. } => write!(
+                f,
+                "(1/2 lambda^2={:.6e} + band_lambda^2={:.6e} <= band_f={:.6e})",
+                0.5 * evidence.lambda_sq,
+                evidence.band_lambda_sq,
+                evidence.band_f,
             ),
             Self::TrustRegionRejectFloor {
                 radius,
@@ -5144,6 +5174,55 @@ where
 
 pub trait SecondOrderObjective: FirstOrderObjective {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError>;
+
+    /// The rounding bands of the objective, gradient and Hessian formed at
+    /// `x`, the point this objective last evaluated. When bands are supplied,
+    /// a second-order solver decides stationarity at `x` by
+    /// [`newton_decrement_verdict`] on them instead of by its gradient
+    /// tolerance, and stops only where that verdict certifies. `None` keeps
+    /// the gradient tolerance.
+    fn decrement_bands(&mut self, _x: &Array1<f64>) -> Option<DecrementBands> {
+        None
+    }
+}
+
+/// The stationarity test a second-order solver applies at an evaluated point.
+///
+/// Where the objective supplies rounding bands, the point is stationary iff
+/// [`newton_decrement_verdict`] certifies it. Every other verdict continues the
+/// search, `DecrementUnresolved` included: an undecidable certificate is not a
+/// stationary point, and the gradient tolerance is not consulted in its place.
+/// Without bands the test is the gradient tolerance on a positive-semidefinite
+/// reduced Hessian.
+fn second_order_stationarity_exit<ObjFn: SecondOrderObjective>(
+    obj_fn: &mut ObjFn,
+    x: &Array1<f64>,
+    projected_gradient: &Array1<f64>,
+    grad_norm: f64,
+    hessian: &Array2<f64>,
+    active: &[bool],
+    effective_tol: f64,
+) -> Option<TerminationReason> {
+    match obj_fn.decrement_bands(x) {
+        Some(bands) => {
+            match newton_decrement_verdict(hessian, projected_gradient, Some(active), &bands) {
+                DecrementVerdict::Certified(evidence) => {
+                    Some(TerminationReason::NewtonDecrementCertified {
+                        evidence,
+                        grad_norm,
+                    })
+                }
+                _ => None,
+            }
+        }
+        None => (grad_norm.is_finite()
+            && grad_norm <= effective_tol
+            && reduced_hessian_is_positive_semidefinite(hessian, Some(active)))
+        .then_some(TerminationReason::GradientTolerance {
+            grad_norm,
+            threshold: effective_tol,
+        }),
+    }
 }
 
 pub trait FixedPointObjective {
@@ -7460,10 +7539,15 @@ impl ArcCore {
             let g_proj_k = self.projected_gradient(&x_k, &g_k);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
             let active = self.second_order_active_mask(&x_k, &g_k);
-            if g_norm.is_finite()
-                && g_norm <= effective_tol
-                && reduced_hessian_is_positive_semidefinite(&h_k, Some(&active))
-            {
+            if let Some(termination) = second_order_stationarity_exit(
+                obj_fn,
+                &x_k,
+                &g_proj_k,
+                g_norm,
+                &h_k,
+                &active,
+                effective_tol,
+            ) {
                 return Ok(Solution::gradient_based(
                     x_k,
                     f_k,
@@ -7474,10 +7558,7 @@ impl ArcCore {
                     func_evals,
                     grad_evals,
                     hess_evals,
-                    TerminationReason::GradientTolerance {
-                        grad_norm: g_norm,
-                        threshold: effective_tol,
-                    },
+                    termination,
                 ));
             }
 
@@ -7627,10 +7708,15 @@ impl ArcCore {
             let g_proj_trial = self.projected_gradient(&x_trial, &g_trial);
             let g_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
             let trial_active = self.second_order_active_mask(&x_trial, &g_trial);
-            if g_trial_norm.is_finite()
-                && g_trial_norm <= effective_tol
-                && reduced_hessian_is_positive_semidefinite(&h_trial, Some(&trial_active))
-            {
+            if let Some(termination) = second_order_stationarity_exit(
+                obj_fn,
+                &x_trial,
+                &g_proj_trial,
+                g_trial_norm,
+                &h_trial,
+                &trial_active,
+                effective_tol,
+            ) {
                 if h_trial.nrows() != n || h_trial.ncols() != n {
                     return Err(ArcError::HessianShapeMismatch {
                         expected: n,
@@ -7648,10 +7734,7 @@ impl ArcCore {
                     func_evals,
                     grad_evals,
                     hess_evals,
-                    TerminationReason::GradientTolerance {
-                        grad_norm: g_trial_norm,
-                        threshold: effective_tol,
-                    },
+                    termination,
                 ));
             }
             let rho = (f_k - f_trial) / denom;
@@ -13172,16 +13255,17 @@ mod tests {
     use super::{
         AcceptedStep, ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, BacktrackConfig,
         BatchZerothOrderObjective, Bfgs, BfgsError, Bounds, CostStallConfig, CostStallState,
-        FallbackPolicy, FirstOrderCache, FirstOrderObjective, FirstOrderObjectiveInto,
-        FirstOrderSample, FirstOrderWorkspace, FixedPoint, FixedPointObjective, FixedPointSample,
-        FixedPointStatus, FusedObjective, GradientTolerance, HessianMaterialization,
-        HessianOperator, HessianValue, InitialMetric, IterationInfo, LineSearchFailureReason,
-        MatrixFreeTrustRegion, MatrixFreeTrustRegionError, MaxIterations, NewtonTrustRegion,
-        ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus,
-        OptimizerObserver, Problem, Profile, RidgeSchedule, SecondOrderObjective,
-        SecondOrderObjectiveInto, SecondOrderProblem, SecondOrderSample, SecondOrderWorkspace,
-        Solution, StationarityKind, StepInfo, TerminationReason, Tolerance, ZerothOrderObjective,
-        backtracking_line_search, escalate_ridge, optimize,
+        DecrementBands, DecrementVerdict, FallbackPolicy, FirstOrderCache, FirstOrderObjective,
+        FirstOrderObjectiveInto, FirstOrderSample, FirstOrderWorkspace, FixedPoint,
+        FixedPointObjective, FixedPointSample, FixedPointStatus, FusedObjective, GradientTolerance,
+        HessianMaterialization, HessianOperator, HessianValue, InitialMetric, IterationInfo,
+        LineSearchFailureReason, MatrixFreeTrustRegion, MatrixFreeTrustRegionError, MaxIterations,
+        NewtonTrustRegion, ObjectiveEvalError, OperatorObjective, OperatorSample,
+        OptimizationStatus, OptimizerObserver, Problem, Profile, RidgeSchedule,
+        SecondOrderObjective, SecondOrderObjectiveInto, SecondOrderProblem, SecondOrderSample,
+        SecondOrderWorkspace, Solution, StationarityKind, StationarityNorm, StepInfo,
+        TerminationReason, Tolerance, ZerothOrderObjective, backtracking_line_search,
+        escalate_ridge, newton_decrement_verdict, optimize,
     };
     use ndarray::{Array1, Array2, array};
 
@@ -14216,6 +14300,210 @@ mod tests {
             .run()
             .expect("zero-multiplier bound saddle must expose its inward negative curvature");
         assert!((solution.final_point[0] - 1.0).abs() < 1e-7);
+    }
+
+    /// A second-order objective whose rounding bands are fixed, so the
+    /// stationarity exit it selects is decided by the bands alone.
+    struct BandedSecondOrder<F> {
+        inner: F,
+        bands: Option<DecrementBands>,
+    }
+
+    impl<F> ZerothOrderObjective for BandedSecondOrder<F>
+    where
+        F: FnMut(&Array1<f64>) -> (f64, Array1<f64>, Array2<f64>),
+    {
+        fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+            Ok((self.inner)(x).0)
+        }
+    }
+
+    impl<F> FirstOrderObjective for BandedSecondOrder<F>
+    where
+        F: FnMut(&Array1<f64>) -> (f64, Array1<f64>, Array2<f64>),
+    {
+        fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+            let (f, g, _) = (self.inner)(x);
+            Ok(FirstOrderSample {
+                value: f,
+                gradient: g,
+            })
+        }
+    }
+
+    impl<F> SecondOrderObjective for BandedSecondOrder<F>
+    where
+        F: FnMut(&Array1<f64>) -> (f64, Array1<f64>, Array2<f64>),
+    {
+        fn eval_hessian(
+            &mut self,
+            x: &Array1<f64>,
+        ) -> Result<SecondOrderSample, ObjectiveEvalError> {
+            let (f, g, h) = (self.inner)(x);
+            Ok(SecondOrderSample {
+                value: f,
+                gradient: g,
+                hessian: Some(h),
+            })
+        }
+
+        fn decrement_bands(&mut self, _x: &Array1<f64>) -> Option<DecrementBands> {
+            self.bands.clone()
+        }
+    }
+
+    fn unit_quadratic(x: &Array1<f64>) -> (f64, Array1<f64>, Array2<f64>) {
+        (0.5 * x[0] * x[0], array![x[0]], array![[1.0]])
+    }
+
+    fn uniform_bands(objective: f64, gradient: f64, hessian: f64) -> DecrementBands {
+        DecrementBands {
+            objective,
+            gradient: array![gradient],
+            hessian,
+        }
+    }
+
+    /// `V = ½x²` from `x₀ = 1e-3` with the scalar tolerance `1`: the gradient
+    /// tolerance accepts the seed, while the Newton step still buys
+    /// `½λ̂² = 5e-7` against `band_f = 1e-12`. With bands supplied ARC steps on
+    /// and stops only where the verdict certifies, which bounds `|x|` by
+    /// `√(2·band_f)`. The same objective without bands is today's exit: the
+    /// seed, at iteration 0.
+    #[test]
+    fn arc_stops_on_the_decrement_verdict_where_the_objective_supplies_bands() {
+        let x0 = 1.0e-3;
+        let band_f = 1.0e-12;
+
+        let mut without_bands = super::Arc::new(
+            array![x0],
+            BandedSecondOrder {
+                inner: unit_quadratic,
+                bands: None,
+            },
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1.0))
+        .with_max_iterations(iters(50));
+        let control = without_bands
+            .run()
+            .expect("the gradient tolerance accepts the seed");
+        assert!(matches!(
+            control.termination,
+            TerminationReason::GradientTolerance { .. }
+        ));
+        assert_eq!(control.iterations, 0);
+        assert_eq!(control.final_point[0].to_bits(), x0.to_bits());
+
+        let mut with_bands = super::Arc::new(
+            array![x0],
+            BandedSecondOrder {
+                inner: unit_quadratic,
+                bands: Some(uniform_bands(band_f, 1.0e-15, 1.0e-15)),
+            },
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1.0))
+        .with_max_iterations(iters(50));
+        let solution = with_bands
+            .run()
+            .expect("ARC must step to a point the decrement verdict certifies");
+        let TerminationReason::NewtonDecrementCertified { evidence, .. } = solution.termination
+        else {
+            panic!(
+                "a banded objective stops only on the decrement verdict; got {}",
+                solution.termination
+            );
+        };
+        assert!(solution.iterations > 0);
+        assert!(0.5 * evidence.lambda_sq + evidence.band_lambda_sq <= evidence.band_f);
+        assert!(solution.final_point[0].abs() <= (2.0 * band_f).sqrt());
+        let reported = solution
+            .termination
+            .stationarity_evidence()
+            .expect("a certified decrement reports what it was decided against");
+        assert_eq!(reported.norm, StationarityNorm::NewtonDecrement);
+        assert_eq!(reported.threshold.to_bits(), band_f.to_bits());
+    }
+
+    /// At `x₀ = 1e-3` with `δg = 1e-7` and `band_f = 1e-10` the decrement's own
+    /// rounding `band_λ² ≈ 2·|g|·δg = 2e-10` reaches `band_f`, so the verdict is
+    /// `DecrementUnresolved`, while `½λ̂² − band_λ² ≈ 5e-7` is a decrease the
+    /// arithmetic resolves. That point is not stationary: ARC continues and
+    /// stops where the verdict certifies.
+    #[test]
+    fn arc_continues_past_an_unresolved_decrement_that_still_buys_a_resolvable_decrease() {
+        let x0 = 1.0e-3;
+        let bands = uniform_bands(1.0e-10, 1.0e-7, 1.0e-15);
+        let (_, seed_gradient, seed_hessian) = unit_quadratic(&array![x0]);
+        let seed_verdict = newton_decrement_verdict(&seed_hessian, &seed_gradient, None, &bands);
+        let DecrementVerdict::DecrementUnresolved(seed) = seed_verdict else {
+            panic!("the seed verdict must be undecidable; got {seed_verdict:?}");
+        };
+        assert!(
+            0.5 * seed.lambda_sq - seed.band_lambda_sq > seed.band_f,
+            "control: the seed still buys a resolvable decrease: {seed:?}"
+        );
+
+        let mut solver = super::Arc::new(
+            array![x0],
+            BandedSecondOrder {
+                inner: unit_quadratic,
+                bands: Some(bands),
+            },
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1.0))
+        .with_max_iterations(iters(50));
+        let solution = solver
+            .run()
+            .expect("ARC must continue past an undecidable verdict and certify");
+        assert!(
+            matches!(
+                solution.termination,
+                TerminationReason::NewtonDecrementCertified { .. }
+            ),
+            "got {}",
+            solution.termination
+        );
+        assert!(solution.iterations > 0);
+    }
+
+    /// `V = ¼(x² − 1)²` from its saddle `x = 0`, where the verdict is
+    /// `NotPositiveDefinite`: the exit does not fire, ARC escapes along the
+    /// negative curvature and certifies inside a minimum's basin, nearer
+    /// `|x| = 1` than the saddle.
+    #[test]
+    fn arc_does_not_stop_at_a_saddle_the_decrement_verdict_refuses() {
+        let mut solver = super::Arc::new(
+            array![0.0],
+            BandedSecondOrder {
+                inner: |x: &Array1<f64>| {
+                    let square = x[0] * x[0];
+                    (
+                        0.25 * (square - 1.0).powi(2),
+                        array![x[0] * (square - 1.0)],
+                        array![[3.0 * square - 1.0]],
+                    )
+                },
+                bands: Some(uniform_bands(1.0e-12, 1.0e-15, 1.0e-15)),
+            },
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1.0))
+        .with_max_iterations(iters(50));
+        let solution = solver
+            .run()
+            .expect("ARC must escape the saddle and certify at a minimum");
+        assert!(
+            matches!(
+                solution.termination,
+                TerminationReason::NewtonDecrementCertified { .. }
+            ),
+            "got {}",
+            solution.termination
+        );
+        assert!((solution.final_point[0].abs() - 1.0).abs() < 0.5);
     }
 
     #[test]
