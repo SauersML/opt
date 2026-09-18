@@ -3665,6 +3665,13 @@ pub struct SecondOrderSample {
     pub value: f64,
     pub gradient: Array1<f64>,
     pub hessian: Option<Array2<f64>>,
+    /// The rounding bands of this sample's value, gradient and Hessian. When
+    /// they are supplied, a second-order solver decides stationarity at this
+    /// sample's point by [`newton_decrement_verdict`] on them, and stops there
+    /// only when that verdict certifies. They are part of the sample, so a
+    /// solver never pairs one point's bands with another point's derivatives.
+    /// `None` keeps the solver's gradient tolerance.
+    pub decrement_bands: Option<DecrementBands>,
 }
 
 /// How (and whether) a `HessianOperator` can produce a dense materialized
@@ -4204,9 +4211,9 @@ pub enum TerminationReason {
         threshold: f64,
         grad_norm: f64,
     },
-    /// The objective supplied rounding bands
-    /// ([`SecondOrderObjective::decrement_bands`]) and
-    /// [`newton_decrement_verdict`] certified the returned point on them:
+    /// The returned point's sample carried rounding bands
+    /// ([`SecondOrderSample::decrement_bands`]) and
+    /// [`newton_decrement_verdict`] certified the point on them:
     /// `½λ̂² + band_λ² ≤ band_f`, so no Newton step the arithmetic resolves
     /// lowers the objective. The gradient tolerance was not consulted.
     NewtonDecrementCertified {
@@ -5174,46 +5181,26 @@ where
 
 pub trait SecondOrderObjective: FirstOrderObjective {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError>;
-
-    /// The rounding bands of the objective, gradient and Hessian formed at
-    /// `x`, the point this objective last evaluated. When bands are supplied,
-    /// a second-order solver decides stationarity at `x` by
-    /// [`newton_decrement_verdict`] on them instead of by its gradient
-    /// tolerance, and stops only where that verdict certifies. `None` keeps
-    /// the gradient tolerance.
-    fn decrement_bands(&mut self, _x: &Array1<f64>) -> Option<DecrementBands> {
-        None
-    }
 }
 
-/// The stationarity test a second-order solver applies at an evaluated point.
+/// The stationarity test a second-order solver applies at an evaluated point,
+/// with the rounding bands of that point's own sample
+/// ([`SecondOrderSample::decrement_bands`]).
 ///
-/// Where the objective supplies rounding bands, the point is stationary iff
-/// [`newton_decrement_verdict`] certifies it. Every other verdict continues the
-/// search, `DecrementUnresolved` included: an undecidable certificate is not a
-/// stationary point, and the gradient tolerance is not consulted in its place.
-/// Without bands the test is the gradient tolerance on a positive-semidefinite
-/// reduced Hessian.
-fn second_order_stationarity_exit<ObjFn: SecondOrderObjective>(
-    obj_fn: &mut ObjFn,
-    x: &Array1<f64>,
+/// Where the sample carries bands, the point is stationary iff
+/// [`decrement_stationarity_exit`] certifies it. Without bands the test is the
+/// gradient tolerance on a positive-semidefinite reduced Hessian.
+fn second_order_stationarity_exit(
+    bands: Option<&DecrementBands>,
     projected_gradient: &Array1<f64>,
     grad_norm: f64,
     hessian: &Array2<f64>,
     active: &[bool],
     effective_tol: f64,
 ) -> Option<TerminationReason> {
-    match obj_fn.decrement_bands(x) {
+    match bands {
         Some(bands) => {
-            match newton_decrement_verdict(hessian, projected_gradient, Some(active), &bands) {
-                DecrementVerdict::Certified(evidence) => {
-                    Some(TerminationReason::NewtonDecrementCertified {
-                        evidence,
-                        grad_norm,
-                    })
-                }
-                _ => None,
-            }
+            decrement_stationarity_exit(bands, projected_gradient, grad_norm, hessian, active)
         }
         None => (grad_norm.is_finite()
             && grad_norm <= effective_tol
@@ -5222,6 +5209,30 @@ fn second_order_stationarity_exit<ObjFn: SecondOrderObjective>(
             grad_norm,
             threshold: effective_tol,
         }),
+    }
+}
+
+/// The stationarity exit every second-order solver takes on a sample that
+/// carries rounding bands: the point is stationary iff
+/// [`newton_decrement_verdict`] certifies it on those bands. Every other
+/// verdict continues the search, `DecrementUnresolved` included: an
+/// undecidable certificate is not a stationary point, and the gradient
+/// tolerance is not consulted in its place.
+fn decrement_stationarity_exit(
+    bands: &DecrementBands,
+    projected_gradient: &Array1<f64>,
+    grad_norm: f64,
+    hessian: &Array2<f64>,
+    active: &[bool],
+) -> Option<TerminationReason> {
+    match newton_decrement_verdict(hessian, projected_gradient, Some(active), bands) {
+        DecrementVerdict::Certified(evidence) => {
+            Some(TerminationReason::NewtonDecrementCertified {
+                evidence,
+                grad_norm,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -5701,6 +5712,7 @@ fn sanitize_second_order_sample(
         value,
         gradient: sample.gradient,
         hessian,
+        decrement_bands: sample.decrement_bands,
     })
 }
 
@@ -5897,11 +5909,16 @@ impl FirstOrderCache {
     }
 }
 
+/// One evaluated point of a second-order solver: value, gradient, Hessian and
+/// the rounding bands its sample carried ([`SecondOrderSample::decrement_bands`]).
+type SecondOrderPoint = (f64, Array1<f64>, Array2<f64>, Option<DecrementBands>);
+
 struct SecondOrderCache {
     last_x: Option<Array1<f64>>,
     last_cost: Option<f64>,
     last_grad: Array1<f64>,
     last_hessian: SymmetricMatrix,
+    last_bands: Option<DecrementBands>,
     have_last_sample: bool,
 }
 
@@ -5912,6 +5929,7 @@ impl SecondOrderCache {
             last_cost: None,
             last_grad: Array1::zeros(n),
             last_hessian: SymmetricMatrix::from_verified(Array2::zeros((n, n))),
+            last_bands: None,
             have_last_sample: false,
         }
     }
@@ -5967,11 +5985,13 @@ impl SecondOrderCache {
                 ));
             }
             self.last_hessian = SymmetricMatrix::from_verified(h.clone());
+            self.last_bands = sample.decrement_bands.clone();
             self.have_last_sample = true;
         } else {
             // Cache only the (cost, grad) component when the sample
             // omits the Hessian. The first eval_cost_grad_hessian call
-            // re-evaluates the objective for it.
+            // re-evaluates the objective for it, bands included.
+            self.last_bands = None;
             self.have_last_sample = false;
         }
         self.last_x = Some(x.clone());
@@ -5987,7 +6007,7 @@ impl SecondOrderCache {
         func_evals: &mut usize,
         grad_evals: &mut usize,
         hess_evals: &mut usize,
-    ) -> Result<(f64, Array1<f64>, Array2<f64>), ObjectiveEvalError>
+    ) -> Result<SecondOrderPoint, ObjectiveEvalError>
     where
         ObjFn: SecondOrderObjective,
     {
@@ -5999,6 +6019,7 @@ impl SecondOrderCache {
                 last_cost,
                 self.last_grad.clone(),
                 self.last_hessian.as_array().clone(),
+                self.last_bands.clone(),
             ));
         }
         let sample = sanitize_second_order_sample(obj_fn.eval_hessian(x)?)?;
@@ -6017,8 +6038,14 @@ impl SecondOrderCache {
         self.last_cost = Some(sample.value);
         self.last_grad.assign(&sample.gradient);
         self.last_hessian = SymmetricMatrix::from_verified(hessian.clone());
+        self.last_bands = sample.decrement_bands.clone();
         self.have_last_sample = true;
-        Ok((sample.value, self.last_grad.clone(), hessian))
+        Ok((
+            sample.value,
+            self.last_grad.clone(),
+            hessian,
+            sample.decrement_bands,
+        ))
     }
 }
 
@@ -6465,7 +6492,7 @@ impl NewtonTrustRegionCore {
         );
         let mut history: VecDeque<(Array1<f64>, Array1<f64>)> =
             VecDeque::with_capacity(self.history_cap.max(2));
-        let (mut f_k, mut g_k, mut h_k) = match initial {
+        let (mut f_k, mut g_k, mut h_k, mut b_k) = match initial {
             Ok(sample) => sample,
             Err(err) if err.is_recoverable() => {
                 if matches!(self.fallback_policy, FallbackPolicy::AutoBfgs) {
@@ -6557,7 +6584,20 @@ impl NewtonTrustRegionCore {
         for k in 0..self.max_iterations {
             self.last_trust_radius = Some(trust_radius);
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
-            if g_norm.is_finite() && g_norm <= effective_tol {
+            let stationary = match b_k.as_ref() {
+                Some(bands) => {
+                    let active = self.active_mask(&x_k, &g_k);
+                    decrement_stationarity_exit(bands, &g_proj_k, g_norm, &h_k, &active)
+                }
+                None if g_norm.is_finite() && g_norm <= effective_tol => {
+                    Some(TerminationReason::GradientTolerance {
+                        grad_norm: g_norm,
+                        threshold: effective_tol,
+                    })
+                }
+                None => None,
+            };
+            if let Some(termination) = stationary {
                 return Ok(Solution::gradient_based(
                     x_k,
                     f_k,
@@ -6568,10 +6608,7 @@ impl NewtonTrustRegionCore {
                     func_evals,
                     grad_evals,
                     hess_evals,
-                    TerminationReason::GradientTolerance {
-                        grad_norm: g_norm,
-                        threshold: effective_tol,
-                    },
+                    termination,
                 ));
             }
 
@@ -6618,7 +6655,7 @@ impl NewtonTrustRegionCore {
                 shrink_or_report_floor!(k);
             }
 
-            let (f_trial, g_trial, h_trial) = match oracle.eval_cost_grad_hessian(
+            let (f_trial, g_trial, h_trial, b_trial) = match oracle.eval_cost_grad_hessian(
                 obj_fn,
                 &x_trial,
                 &mut func_evals,
@@ -6703,6 +6740,7 @@ impl NewtonTrustRegionCore {
                 }
                 g_k = g_trial;
                 h_k = h_trial;
+                b_k = b_trial;
                 g_proj_k = self.projected_gradient(&x_k, &g_k);
                 consecutive_rejections = 0;
             } else {
@@ -7414,7 +7452,7 @@ impl ArcCore {
         );
         let mut history: VecDeque<(Array1<f64>, Array1<f64>)> =
             VecDeque::with_capacity(self.history_cap.max(2));
-        let (mut f_k, mut g_k, mut h_k) = match initial {
+        let (mut f_k, mut g_k, mut h_k, mut b_k) = match initial {
             Ok(sample) => sample,
             Err(err) if err.is_recoverable() => {
                 if matches!(self.fallback_policy, FallbackPolicy::AutoBfgs) {
@@ -7540,8 +7578,7 @@ impl ArcCore {
             let g_norm = g_proj_k.dot(&g_proj_k).sqrt();
             let active = self.second_order_active_mask(&x_k, &g_k);
             if let Some(termination) = second_order_stationarity_exit(
-                obj_fn,
-                &x_k,
+                b_k.as_ref(),
                 &g_proj_k,
                 g_norm,
                 &h_k,
@@ -7610,9 +7647,14 @@ impl ArcCore {
             // test is dominated by floating-point noise on f_trial - f_k
             // rather than real curvature. Continuing here just makes
             // sigma oscillate. Declare numerical convergence instead.
-            // See `ARC_NUMERICAL_CONV_FACTOR` for the full rationale.
-            let f_scale = (1.0 + f_k.abs()) * f64::EPSILON;
-            if candidate.predicted_decrease <= ARC_NUMERICAL_CONV_FACTOR * f_scale
+            // See `ARC_NUMERICAL_CONV_FACTOR` for the full rationale. A sample
+            // that carries rounding bands states the objective's own
+            // resolution, and that band is the floor instead.
+            let noise_floor = match b_k.as_ref() {
+                Some(bands) => bands.objective,
+                None => ARC_NUMERICAL_CONV_FACTOR * (1.0 + f_k.abs()) * f64::EPSILON,
+            };
+            if candidate.predicted_decrease <= noise_floor
                 && reduced_hessian_is_positive_semidefinite(h_model, Some(&active))
             {
                 return Ok(Solution::gradient_based(
@@ -7627,7 +7669,7 @@ impl ArcCore {
                     hess_evals,
                     TerminationReason::ModelNoiseFloor {
                         predicted_decrease: candidate.predicted_decrease,
-                        noise_floor: ARC_NUMERICAL_CONV_FACTOR * f_scale,
+                        noise_floor,
                         grad_norm: g_norm,
                     },
                 ));
@@ -7640,7 +7682,7 @@ impl ArcCore {
                 &mut grad_evals,
                 &mut hess_evals,
             );
-            let (f_trial, g_trial, h_trial) = match primary_sample {
+            let (f_trial, g_trial, h_trial, b_trial) = match primary_sample {
                 Ok(sample) => sample,
                 Err(err) if err.is_recoverable() => {
                     // At negative curvature the cubic model has two opposing
@@ -7709,8 +7751,7 @@ impl ArcCore {
             let g_trial_norm = g_proj_trial.dot(&g_proj_trial).sqrt();
             let trial_active = self.second_order_active_mask(&x_trial, &g_trial);
             if let Some(termination) = second_order_stationarity_exit(
-                obj_fn,
-                &x_trial,
+                b_trial.as_ref(),
                 &g_proj_trial,
                 g_trial_norm,
                 &h_trial,
@@ -7783,6 +7824,7 @@ impl ArcCore {
                 f_k = f_trial;
                 g_k = g_trial;
                 h_k = h_trial;
+                b_k = b_trial;
                 consecutive_rejections = 0;
             } else {
                 consecutive_rejections += 1;
@@ -13440,6 +13482,7 @@ mod tests {
                 value: f,
                 gradient: g,
                 hessian: Some(h),
+                decrement_bands: None,
             })
         }
     }
@@ -13507,6 +13550,7 @@ mod tests {
                 value: f,
                 gradient: g,
                 hessian: Some(h),
+                decrement_bands: None,
             })
         }
     }
@@ -13797,6 +13841,7 @@ mod tests {
                     value: (x[0] - 1.0).powi(2),
                     gradient: array![2.0 * (x[0] - 1.0)],
                     hessian: Some(array![[f64::NAN]]),
+                    decrement_bands: None,
                 })
             }
         }
@@ -14184,6 +14229,7 @@ mod tests {
                     value: 0.25 * (x_sq - 1.0).powi(2) + 0.5 * x[1] * x[1] + LINEAR_Y * x[1],
                     gradient: array![x[0] * (x_sq - 1.0), x[1] + LINEAR_Y],
                     hessian: Some(array![[3.0 * x_sq - 1.0, 0.0], [0.0, 1.0]]),
+                    decrement_bands: None,
                 }
             }
         }
@@ -14302,8 +14348,8 @@ mod tests {
         assert!((solution.final_point[0] - 1.0).abs() < 1e-7);
     }
 
-    /// A second-order objective whose rounding bands are fixed, so the
-    /// stationarity exit it selects is decided by the bands alone.
+    /// A second-order objective whose samples carry fixed rounding bands, so
+    /// the stationarity exit they select is decided by the bands alone.
     struct BandedSecondOrder<F> {
         inner: F,
         bands: Option<DecrementBands>,
@@ -14344,11 +14390,8 @@ mod tests {
                 value: f,
                 gradient: g,
                 hessian: Some(h),
+                decrement_bands: self.bands.clone(),
             })
-        }
-
-        fn decrement_bands(&mut self, _x: &Array1<f64>) -> Option<DecrementBands> {
-            self.bands.clone()
         }
     }
 
@@ -14504,6 +14547,113 @@ mod tests {
             solution.termination
         );
         assert!((solution.final_point[0].abs() - 1.0).abs() < 0.5);
+    }
+
+    /// A seed handed over through `with_initial_sample` is judged by the bands
+    /// its own sample carries: ARC serves the seed from that sample, so the
+    /// objective's later samples cannot lend it theirs. The same objective,
+    /// seeded with a sample that carries no bands, stops at the seed on the
+    /// gradient tolerance.
+    #[test]
+    fn arc_judges_a_seeded_sample_by_the_bands_that_sample_carries() {
+        let x0 = 1.0e-3;
+        let bands = uniform_bands(1.0e-12, 1.0e-15, 1.0e-15);
+        let seed_sample = |decrement_bands: Option<DecrementBands>| {
+            let (value, gradient, hessian) = unit_quadratic(&array![x0]);
+            SecondOrderSample {
+                value,
+                gradient,
+                hessian: Some(hessian),
+                decrement_bands,
+            }
+        };
+
+        let mut unbanded_seed = super::Arc::new(
+            array![x0],
+            BandedSecondOrder {
+                inner: unit_quadratic,
+                bands: Some(bands.clone()),
+            },
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1.0))
+        .with_max_iterations(iters(50))
+        .with_initial_sample(array![x0], seed_sample(None));
+        let control = unbanded_seed
+            .run()
+            .expect("a seed sample without bands keeps the gradient tolerance");
+        assert!(matches!(
+            control.termination,
+            TerminationReason::GradientTolerance { .. }
+        ));
+        assert_eq!(control.iterations, 0);
+
+        let mut banded_seed = super::Arc::new(
+            array![x0],
+            BandedSecondOrder {
+                inner: unit_quadratic,
+                bands: Some(bands.clone()),
+            },
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1.0))
+        .with_max_iterations(iters(50))
+        .with_initial_sample(array![x0], seed_sample(Some(bands)));
+        let solution = banded_seed
+            .run()
+            .expect("a banded seed sample is judged by the decrement verdict");
+        assert!(
+            matches!(
+                solution.termination,
+                TerminationReason::NewtonDecrementCertified { .. }
+            ),
+            "got {}",
+            solution.termination
+        );
+        assert!(solution.iterations > 0);
+    }
+
+    /// The Newton trust region takes the same exit: on samples that carry
+    /// bands it stops only where the decrement verdict certifies, and without
+    /// them it keeps its gradient tolerance, which accepts this seed.
+    #[test]
+    fn newton_trust_region_stops_on_the_decrement_verdict_where_samples_carry_bands() {
+        let x0 = 1.0e-3;
+        let band_f = 1.0e-12;
+        let run = |bands: Option<DecrementBands>| {
+            NewtonTrustRegion::new(
+                array![x0],
+                BandedSecondOrder {
+                    inner: unit_quadratic,
+                    bands,
+                },
+            )
+            .with_profile(Profile::Deterministic)
+            .with_tolerance(tol(1.0))
+            .with_max_iterations(iters(50))
+            .run()
+            .expect("the Newton trust region converges on a quadratic")
+        };
+
+        let control = run(None);
+        assert!(matches!(
+            control.termination,
+            TerminationReason::GradientTolerance { .. }
+        ));
+        assert_eq!(control.iterations, 0);
+        assert_eq!(control.final_point[0].to_bits(), x0.to_bits());
+
+        let solution = run(Some(uniform_bands(band_f, 1.0e-15, 1.0e-15)));
+        let TerminationReason::NewtonDecrementCertified { evidence, .. } = solution.termination
+        else {
+            panic!(
+                "banded samples stop only on the decrement verdict; got {}",
+                solution.termination
+            );
+        };
+        assert!(solution.iterations > 0);
+        assert!(0.5 * evidence.lambda_sq + evidence.band_lambda_sq <= evidence.band_f);
+        assert!(solution.final_point[0].abs() <= (2.0 * band_f).sqrt());
     }
 
     #[test]
@@ -15045,6 +15195,7 @@ mod tests {
                     value: 0.5 * (x[0] - 1.0).powi(2),
                     gradient: array![x[0] - 1.0],
                     hessian: Some(array![[1.0]]),
+                    decrement_bands: None,
                 })
             }
         }
@@ -15258,6 +15409,7 @@ mod tests {
                     value: 0.5 * dx * dx,
                     gradient: array![dx],
                     hessian: Some(array![[1.0]]),
+                    decrement_bands: None,
                 })
             }
         }
@@ -15359,6 +15511,7 @@ mod tests {
                     value: 0.5 * (x[0] - 1.0).powi(2),
                     gradient: array![x[0] - 1.0],
                     hessian: Some(array![[1.0]]),
+                    decrement_bands: None,
                 })
             }
         }
@@ -15435,6 +15588,7 @@ mod tests {
                 value: 0.5 * (x[0] - 1.0).powi(2),
                 gradient: array![x[0] - 1.0],
                 hessian: Some(array![[1.0]]),
+                decrement_bands: None,
             })
         }
     }
@@ -16444,6 +16598,7 @@ mod tests {
                 value,
                 gradient: x - 1.0,
                 hessian,
+                decrement_bands: None,
             })
         }
     }
@@ -16490,6 +16645,7 @@ mod tests {
             value: 0.25,
             gradient: &x0 - 1.0,
             hessian: Some(Array2::eye(n)),
+            decrement_bands: None,
         };
         let max_iter = MaxIterations::new(2).unwrap();
 
@@ -17573,6 +17729,7 @@ mod tests {
                 value,
                 gradient: x - 1.0,
                 hessian: Some(Array2::eye(n)),
+                decrement_bands: None,
             })
         }
     }
@@ -17654,6 +17811,7 @@ mod tests {
                     value: 0.5 * (x[0] - 0.05).powi(2) - 0.25 * x[1].powi(2) + 0.05 * x[0] * x[1],
                     gradient: array![(x[0] - 0.05) + 0.05 * x[1], -0.5 * x[1] + 0.05 * x[0]],
                     hessian: Some(array![[1.0, 0.05], [0.05, -0.5]]),
+                    decrement_bands: None,
                 })
             }
         }
@@ -19422,6 +19580,7 @@ mod termination_provenance_tests {
                     value: 1.0,
                     gradient: array![1.0, 1.0],
                     hessian: Some(Array2::eye(2)),
+                    decrement_bands: None,
                 })
             }
         }
