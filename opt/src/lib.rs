@@ -104,6 +104,16 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::collections::VecDeque;
 use std::sync::Arc as StdArc;
 
+mod second_order;
+mod stall_monitor;
+pub use second_order::{
+    certificate_curvature_shift, hessian_is_psd_at_resolution, max_feasible_step_along,
+    newton_predicted_decrease, newton_predicted_decrease_at_resolution,
+};
+pub use stall_monitor::{
+    StallExit, StallMonitor, StallStep, StallVerdict, UnescapableRefusalWindow,
+};
+
 /// Shared constants for generic backtracking and ridge-escalation policies.
 pub mod constants {
     /// Armijo sufficient-decrease parameter `c1`.
@@ -3941,16 +3951,14 @@ pub enum StationarityKind {
 /// pinned near-separable optimum keeps a persistent out-of-bounds
 /// gradient component that inflates the raw norm forever.
 ///
-/// The optional [`stuck_grad_ceiling`](Self::stuck_grad_ceiling) /
-/// [`max_stuck_escapes`](Self::max_stuck_escapes) knobs cover a "stuck
-/// stall": a cost stall whose best-iterate
-/// projected gradient is FAR above tolerance is not a flat valley but an
-/// inconsistent objective/gradient pair (e.g. an inner solve that hit
-/// its own iteration cap), and halting there would ship an under-solved
-/// point. When a ceiling is set, such a stall instead resets the
-/// no-improvement window and lets the optimizer keep descending, for a
-/// bounded number of escapes, before finally halting as a
-/// `CostStallFloor` so a genuinely pathological surface still terminates.
+/// The state machine is [`StallMonitor`], the one stall authority in this
+/// crate. A filled window whose best iterate is above `projected_grad_tol` is
+/// not halted at once: the window reopens so the search can take the descent
+/// the residual says remains. There is no escape count. The escape ends when
+/// reopening it would replay the previous one from a bit-identical incumbent,
+/// or when the reopened window bought neither resolved descent nor a smaller
+/// projected gradient ([`StallMonitor::license_continuation`]); either way the
+/// search halts as a `CostStallFloor`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostStallConfig {
     /// Relative improvement floor: an accepted step counts as "no
@@ -3967,104 +3975,30 @@ pub struct CostStallConfig {
     /// a [`OptimizationStatus::CostStallFloor`]. Use the SAME threshold
     /// the caller's genuine gradient-convergence path uses.
     pub projected_grad_tol: f64,
-    /// When `Some(ceiling)`, a filled-window stall whose best-iterate
-    /// projected gradient exceeds `ceiling` is treated as a NON-flat
-    /// "stuck" stall: instead of halting, the no-improvement window is
-    /// reset and the optimizer keeps descending. `None`
-    /// disables the escape — every filled window halts. A stall at or
-    /// below the ceiling always halts (as converged or floor per
-    /// `projected_grad_tol`).
-    pub stuck_grad_ceiling: Option<f64>,
-    /// Maximum number of consecutive stuck-stall escapes granted before
-    /// the guard halts anyway (as a `CostStallFloor`) so the loop still
-    /// terminates on a pathological surface. Ignored when
-    /// `stuck_grad_ceiling` is `None`.
-    pub max_stuck_escapes: usize,
 }
 
 impl CostStallConfig {
-    /// Build a config with the three core fields; escapes disabled
-    /// (`stuck_grad_ceiling = None`, `max_stuck_escapes = 0`). Use the
-    /// struct literal directly to opt into the stuck-stall escape.
+    /// Build a config from the improvement floor, the window and the
+    /// stationarity threshold.
     pub fn new(rel_tol: f64, window: usize, projected_grad_tol: f64) -> Self {
         Self {
             rel_tol,
             window,
             projected_grad_tol,
-            stuck_grad_ceiling: None,
-            max_stuck_escapes: 0,
         }
     }
 }
 
-/// Running state for the [`CostStallConfig`] guard, folded once per
-/// accepted BFGS iterate. Tracks the monotone best-so-far objective (and
-/// the point/gradient/projected-norm at that best) plus the
-/// no-improvement streak; see `CostStallState::observe`.
+/// The [`CostStallConfig`] guard folded once per accepted BFGS iterate: a
+/// [`StallMonitor`] judging stationarity at `projected_grad_tol`, carrying the
+/// raw gradient at the incumbent so a halt can report `Solution::final_gradient`
+/// for that iterate.
 struct CostStallState {
     config: CostStallConfig,
-    best_value: f64,
-    best_point: Option<Array1<f64>>,
-    /// Raw (un-projected) gradient at the best iterate, kept so the halt
-    /// can report `Solution::final_gradient` for that iterate.
-    best_grad: Option<Array1<f64>>,
-    /// Bound-PROJECTED gradient norm at the best iterate — the value the
-    /// stationarity classification and `Solution::final_gradient_norm`
-    /// use.
-    best_grad_norm: f64,
-    no_improve_streak: usize,
-    stuck_escapes: usize,
+    monitor: StallMonitor<Array1<f64>>,
 }
 
 /// The best-so-far iterate a filled-window cost stall halts back to, plus
-/// What a [`StallResolver`] decides when the cost-stall window fills.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StallResolution {
-    /// Reset the no-improvement window and keep descending. Still bounded by
-    /// [`CostStallConfig::max_stuck_escapes`], so a resolver that always
-    /// escapes cannot prevent termination.
-    Escape,
-    /// Stop, reporting the best-so-far iterate.
-    Halt,
-}
-
-/// What the guard knows at a filled cost-stall window, handed to a
-/// [`StallResolver`] so the consumer can decide on evidence the optimizer does
-/// not have (curvature certificates, active-set state, anything the objective
-/// knows and `Bfgs` does not).
-///
-/// `point`, `value` and `grad` describe the BEST-so-far iterate the halt would
-/// report — not the most recent one. Those differ exactly when the window
-/// filled on oscillating evaluations, which is the case a resolver most needs
-/// to reason about, so a resolver keyed on "most recent" would silently answer
-/// about the wrong iterate.
-pub struct CostStallSummary<'a> {
-    pub point: &'a Array1<f64>,
-    pub value: f64,
-    pub grad: &'a Array1<f64>,
-    /// Bound-PROJECTED gradient norm at the best iterate.
-    pub grad_norm: f64,
-    /// Whether the best iterate cleared `projected_grad_tol`.
-    pub converged: bool,
-    pub escapes_used: usize,
-}
-
-/// Consumer-supplied resolution of a filled cost-stall window.
-///
-/// DETECTION stays here: `Bfgs` owns the window, the improvement floor and the
-/// stationarity classification. The escape DECISION moves to whoever holds the
-/// evidence for it. A consumer that can certify a strict saddle knows something
-/// no gradient threshold can express, and should not have to encode it as a
-/// gradient.
-///
-/// **When a resolver is installed it is the SOLE authority on escapes**, and
-/// [`CostStallConfig::stuck_grad_ceiling`] is ignored — a resolver wanting that
-/// behaviour implements it in three lines. Two authorities on one question is
-/// the failure mode this hook exists to remove, so it is not offered.
-pub trait StallResolver {
-    fn resolve(&mut self, stall: &CostStallSummary<'_>) -> StallResolution;
-}
-
 /// the stationarity verdict. Returned by `CostStallState::observe` when
 /// the guard decides to stop.
 struct CostStallHalt {
@@ -4080,117 +4014,42 @@ struct CostStallHalt {
 
 impl CostStallState {
     fn new(config: CostStallConfig) -> Self {
+        let projected_grad_tol = config.projected_grad_tol;
         Self {
             config,
-            best_value: f64::INFINITY,
-            best_point: None,
-            best_grad: None,
-            best_grad_norm: f64::INFINITY,
-            no_improve_streak: 0,
-            stuck_escapes: 0,
+            monitor: StallMonitor::new(config.rel_tol, config.window, move |_| projected_grad_tol),
         }
     }
 
     /// Fold one accepted iterate `(x, value, raw gradient, projected
     /// gradient norm)` into the guard. Returns `Some(halt)` when the
-    /// objective has stalled over the configured window (and any
-    /// stuck-stall escape budget is exhausted), or `None` to keep
-    /// descending. The guard deliberately does not know about
-    /// application-specific inner-solver convergence flags, so callers
-    /// that need an "untrustworthy iterate" gate should set a
-    /// `stuck_grad_ceiling`, which captures the same "far-above-tolerance
-    /// stall is not a flat valley" signal from the projected gradient
-    /// alone.
+    /// monitor stops the search, or `None` to keep descending.
+    ///
+    /// A converged window and a floor (a replayed escape) halt at the published
+    /// incumbent. An escape continues only while
+    /// [`StallMonitor::license_continuation`] licenses it; an escape that
+    /// bought nothing since the previous window halts at the incumbent as a
+    /// floor.
     fn observe(
         &mut self,
         x: &Array1<f64>,
         value: f64,
         grad: &Array1<f64>,
         grad_proj_norm: f64,
-        resolver: Option<&mut (dyn StallResolver + '_)>,
     ) -> Option<CostStallHalt> {
-        if !value.is_finite() {
-            // A non-finite accepted objective is the objective's problem,
-            // not a stall; reset so a later real descent is not falsely
-            // credited as a no-improvement step.
-            self.no_improve_streak = 0;
-            return None;
-        }
-        let improvement = self.best_value - value;
-        let floor = self.config.rel_tol * (1.0 + self.best_value.abs());
-        if value < self.best_value {
-            self.best_value = value;
-            self.best_point = Some(x.clone());
-            self.best_grad = Some(grad.clone());
-            self.best_grad_norm = grad_proj_norm;
-        }
-        // KKT-stationary at a bound: once the projected gradient
-        // clears the outer tolerance there is no FEASIBLE descent left, so
-        // a still-decreasing raw cost is bound-pinned drift, not progress —
-        // treat the step as no-improvement so the window can fill.
-        let kkt_stationary =
-            grad_proj_norm.is_finite() && grad_proj_norm <= self.config.projected_grad_tol;
-        if improvement <= floor || kkt_stationary {
-            self.no_improve_streak = self.no_improve_streak.saturating_add(1);
-        } else {
-            self.no_improve_streak = 0;
-        }
-        if self.no_improve_streak < self.config.window {
-            return None;
-        }
-        let best_grad_norm = self.best_grad_norm;
-        let converged =
-            best_grad_norm.is_finite() && best_grad_norm <= self.config.projected_grad_tol;
-        // Materialize the best-so-far iterate BEFORE the escape decision: a
-        // resolver has to see the point the halt would report, which is not the
-        // point just observed whenever the window filled on oscillation.
-        let point = self.best_point.clone().unwrap_or_else(|| x.clone());
-        let grad = self.best_grad.clone().unwrap_or_else(|| grad.clone());
-        let value = if self.best_value.is_finite() {
-            self.best_value
-        } else {
-            value
+        self.monitor.stage_payload(Some(grad.clone()));
+        let exit = match self.monitor.observe(x, value, grad_proj_norm, true, None) {
+            StallVerdict::Continue => return None,
+            StallVerdict::Escape { .. } => self.monitor.unprogressing_stop()?,
+            StallVerdict::Converged | StallVerdict::Floor { .. } => self.monitor.exit()?.clone(),
         };
-        // Escape decision, with exactly one authority. A resolver, when
-        // installed, replaces the built-in ceiling rather than composing with
-        // it. The escape budget is enforced HERE in both branches, so no
-        // resolver can prevent termination.
-        let escape = if let Some(resolver) = resolver {
-            let summary = CostStallSummary {
-                point: &point,
-                value,
-                grad: &grad,
-                grad_norm: best_grad_norm,
-                converged,
-                escapes_used: self.stuck_escapes,
-            };
-            resolver.resolve(&summary) == StallResolution::Escape
-                && self.stuck_escapes < self.config.max_stuck_escapes
-        } else if !converged {
-            // Stuck-stall escape: a filled window whose residual is
-            // far above tolerance is not a flat valley.
-            match self.config.stuck_grad_ceiling {
-                Some(ceiling) => {
-                    best_grad_norm.is_finite()
-                        && best_grad_norm > ceiling
-                        && self.stuck_escapes < self.config.max_stuck_escapes
-                }
-                None => false,
-            }
-        } else {
-            false
-        };
-        if escape {
-            self.stuck_escapes = self.stuck_escapes.saturating_add(1);
-            self.no_improve_streak = 0;
-            return None;
-        }
+        let grad = self.monitor.best_payload()?.clone();
         Some(CostStallHalt {
-            converged,
-            point,
-            value,
+            converged: exit.converged,
+            point: exit.point,
+            value: exit.value,
             grad,
-            grad_norm: best_grad_norm,
+            grad_norm: exit.grad_norm,
         })
     }
 }
@@ -5334,6 +5193,13 @@ pub struct StepInfo {
     /// Trust-region radius after the step (for solvers that have one).
     /// `None` for BFGS.
     pub trust_radius: Option<f64>,
+    /// The cubic regularization `σ` the step's model was solved with, for ARC.
+    /// `None` for solvers without one.
+    pub regularization: Option<f64>,
+    /// The accepted line-search step length `α` along the search direction, for
+    /// BFGS. `None` for solvers without a line search, or for a rescue step that
+    /// was not taken along the direction.
+    pub line_search_step: Option<f64>,
 }
 
 /// An objective that can evaluate the cost at a *batch* of candidate
@@ -6730,6 +6596,8 @@ impl NewtonTrustRegionCore {
                     predicted_decrease: pred_dec,
                     actual_decrease: act_dec,
                     trust_radius: Some(trust_radius),
+                    regularization: None,
+                    line_search_step: None,
                 };
                 if accepted {
                     obs.on_step_accepted(&info);
@@ -7804,6 +7672,8 @@ impl ArcCore {
                     predicted_decrease: denom,
                     actual_decrease: f_k - f_trial,
                     trust_radius: None,
+                    regularization: Some(self.sigma),
+                    line_search_step: None,
                 };
                 if accepted {
                     obs.on_step_accepted(&info);
@@ -7970,9 +7840,6 @@ struct BfgsCore {
     /// accepted iterate into the guard and halts at the best-so-far
     /// iterate when the objective flatlines over the configured window.
     cost_stall: Option<CostStallState>,
-    /// Consumer resolution of a filled cost-stall window; `None` = the
-    /// built-in `stuck_grad_ceiling` behaviour, unchanged.
-    stall_resolver: Option<Box<dyn StallResolver>>,
     /// Exact-point line-search value-probe memo capacity (see
     /// `Bfgs::with_value_probe_memo`). `None` (default) disables the memo
     /// so cheap objectives pay no bookkeeping. `Some(cap)` gives the
@@ -8140,10 +8007,6 @@ impl BfgsCore {
             observer: _,
             axis_step_caps: _,
             value_probe_memo_capacity: _,
-            // A consumer-installed hook, not accumulated state: it is
-            // taken and put back within one iteration (see the cost-stall
-            // block), so it is never left mid-run.
-            stall_resolver: _,
             rng_seed,
             // --- per-run state: reset ---
             rng_state,
@@ -8444,7 +8307,6 @@ impl BfgsCore {
             observer: None,
             axis_step_caps: None,
             cost_stall: None,
-            stall_resolver: None,
             value_probe_memo_capacity: None,
         }
     }
@@ -9668,18 +9530,7 @@ impl BfgsCore {
                 // decides `CostStallConverged` (success) vs `CostStallFloor`.
                 if let Some(cost_stall) = self.cost_stall.as_mut() {
                     let g_proj_norm = g_proj_next.dot(&g_proj_next).sqrt();
-                    // Move the resolver out for the call: holding `&mut
-                    // self.stall_resolver` across the rest of this loop body would
-                    // borrow `*self` for longer than the call needs.
-                    let mut resolver_slot = self.stall_resolver.take();
-                    let halt = cost_stall.observe(
-                        &x_next,
-                        f_next,
-                        &g_next,
-                        g_proj_norm,
-                        resolver_slot.as_deref_mut(),
-                    );
-                    self.stall_resolver = resolver_slot;
+                    let halt = cost_stall.observe(&x_next, f_next, &g_next, g_proj_norm);
                     if let Some(halt) = halt {
                         let stall_cfg = &cost_stall.config;
                         let reason = if halt.converged {
@@ -9985,6 +9836,9 @@ impl BfgsCore {
                         predicted_decrease: f64::NAN,
                         actual_decrease: f_k - f_next,
                         trust_radius: None,
+                        regularization: None,
+                        // A rescue step replaces the direction, so no `α` describes it.
+                        line_search_step: s_override.is_none().then_some(alpha_k),
                     });
                 }
                 x_k = x_next;
@@ -10202,19 +10056,13 @@ where
     /// cases return `Ok(Solution)`; callers read the
     /// `status_hint` to tell converged from floor.
     ///
+    /// A filled window above `projected_grad_tol` first reopens so the search
+    /// can take the descent its residual says remains. It halts as a floor once
+    /// reopening would replay the previous window from a bit-identical
+    /// incumbent, or the reopened window bought nothing ([`StallMonitor`]).
+    ///
     /// Calling this twice replaces the previous config. Not calling it
     /// leaves BFGS's behavior exactly unchanged.
-    /// Install a consumer resolver for filled cost-stall windows. See
-    /// [`StallResolver`]; when set it is the sole authority on escapes and
-    /// [`CostStallConfig::stuck_grad_ceiling`] is ignored.
-    pub fn with_stall_resolver<R>(mut self, resolver: R) -> Self
-    where
-        R: StallResolver + 'static,
-    {
-        self.core.stall_resolver = Some(Box::new(resolver));
-        self
-    }
-
     pub fn with_cost_stall(mut self, config: CostStallConfig) -> Self {
         self.core.cost_stall = Some(CostStallState::new(config));
         self
@@ -11466,6 +11314,8 @@ impl MatrixFreeTrustRegionCore {
                     predicted_decrease: predicted,
                     actual_decrease: actual,
                     trust_radius: Some(trust_radius),
+                    regularization: None,
+                    line_search_step: None,
                 };
                 if accepted {
                     obs.on_step_accepted(&info);
@@ -13322,17 +13172,16 @@ mod tests {
     use super::{
         AcceptedStep, ArcError, AutoSecondOrderSolver, BACKTRACKING_MAX_ATTEMPTS, BacktrackConfig,
         BatchZerothOrderObjective, Bfgs, BfgsError, Bounds, CostStallConfig, CostStallState,
-        CostStallSummary, FallbackPolicy, FirstOrderCache, FirstOrderObjective,
-        FirstOrderObjectiveInto, FirstOrderSample, FirstOrderWorkspace, FixedPoint,
-        FixedPointObjective, FixedPointSample, FixedPointStatus, FusedObjective, GradientTolerance,
-        HessianMaterialization, HessianOperator, HessianValue, InitialMetric, IterationInfo,
-        LineSearchFailureReason, MatrixFreeTrustRegion, MatrixFreeTrustRegionError, MaxIterations,
-        NewtonTrustRegion, ObjectiveEvalError, OperatorObjective, OperatorSample,
-        OptimizationStatus, OptimizerObserver, Problem, Profile, RidgeSchedule,
-        SecondOrderObjective, SecondOrderObjectiveInto, SecondOrderProblem, SecondOrderSample,
-        SecondOrderWorkspace, Solution, StallResolution, StallResolver, StationarityKind, StepInfo,
-        TerminationReason, Tolerance, ZerothOrderObjective, backtracking_line_search,
-        escalate_ridge, optimize,
+        FallbackPolicy, FirstOrderCache, FirstOrderObjective, FirstOrderObjectiveInto,
+        FirstOrderSample, FirstOrderWorkspace, FixedPoint, FixedPointObjective, FixedPointSample,
+        FixedPointStatus, FusedObjective, GradientTolerance, HessianMaterialization,
+        HessianOperator, HessianValue, InitialMetric, IterationInfo, LineSearchFailureReason,
+        MatrixFreeTrustRegion, MatrixFreeTrustRegionError, MaxIterations, NewtonTrustRegion,
+        ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus,
+        OptimizerObserver, Problem, Profile, RidgeSchedule, SecondOrderObjective,
+        SecondOrderObjectiveInto, SecondOrderProblem, SecondOrderSample, SecondOrderWorkspace,
+        Solution, StationarityKind, StepInfo, TerminationReason, Tolerance, ZerothOrderObjective,
+        backtracking_line_search, escalate_ridge, optimize,
     };
     use ndarray::{Array1, Array2, array};
 
@@ -17912,17 +17761,23 @@ mod tests {
     #[test]
     fn cost_stall_state_certifies_converged_when_projected_grad_small() {
         // A flat objective (no improvement) whose projected gradient is
-        // already below `projected_grad_tol`: after `window` folds the
+        // already below `projected_grad_tol`: once the window fills the
         // guard halts and certifies a genuine stationary optimum.
+        //
+        // CHANGED (#2900 rows 24.1/24.2): the first fold is the incumbent and
+        // counts toward no window, so a window of 3 fills on fold 4. Counting it
+        // through `improvement = ∞ ≤ floor = ∞` filled every window one fold early.
         let config = CostStallConfig::new(1.0e-7, 3, 1.0e-3);
         let mut state = CostStallState::new(config);
         let x = array![0.5, -0.5];
         let g = array![1.0e-6, -1.0e-6]; // ‖g‖ ≈ 1.4e-6 < 1e-3
-        // First fold moves best off +inf; folds 2..=window fill the streak.
-        let mut halt = None;
-        for _ in 0..3 {
-            halt = state.observe(&x, 1.0, &g, g.dot(&g).sqrt(), None);
+        for fold in 0..3 {
+            assert!(
+                state.observe(&x, 1.0, &g, g.dot(&g).sqrt()).is_none(),
+                "fold {fold} must not fill a window of 3"
+            );
         }
+        let halt = state.observe(&x, 1.0, &g, g.dot(&g).sqrt());
         let halt = halt.expect("stall should fire once the window fills");
         assert!(halt.converged, "small projected gradient ⇒ converged");
         assert_eq!(halt.point, x);
@@ -17932,16 +17787,25 @@ mod tests {
     #[test]
     fn cost_stall_state_flags_floor_when_projected_grad_above_tol() {
         // Identical flatness, but the projected gradient stays above the
-        // outer tolerance: the guard still halts (no further cost progress)
-        // but reports a non-stationary flat-valley floor.
+        // outer tolerance: the guard halts (no further cost progress) and
+        // reports a non-stationary flat-valley floor.
+        //
+        // CHANGED (#2900 rows 24.1/24.2): the first filled window (fold 4, the
+        // first fold being the incumbent) reopens, since its residual says descent
+        // remains. The second fills on fold 7 at a bit-identical incumbent, so
+        // reopening it would replay it, and the guard halts there. It used to halt
+        // at the first filled window, on fold 3.
         let config = CostStallConfig::new(1.0e-7, 3, 1.0e-3);
         let mut state = CostStallState::new(config);
         let x = array![0.5, -0.5];
         let g = array![0.4, -0.3]; // ‖g‖ = 0.5 ≫ 1e-3
-        let mut halt = None;
-        for _ in 0..3 {
-            halt = state.observe(&x, 1.0, &g, g.dot(&g).sqrt(), None);
+        for fold in 0..6 {
+            assert!(
+                state.observe(&x, 1.0, &g, g.dot(&g).sqrt()).is_none(),
+                "fold {fold} must reopen or keep filling the window"
+            );
         }
+        let halt = state.observe(&x, 1.0, &g, g.dot(&g).sqrt());
         let halt = halt.expect("stall should fire once the window fills");
         assert!(
             !halt.converged,
@@ -17961,154 +17825,105 @@ mod tests {
         let mut value = 10.0;
         for _ in 0..8 {
             value -= 1.0; // improvement of 1.0 each step, far above the floor
-            let halt = state.observe(&x, value, &g, g.dot(&g).sqrt(), None);
+            let halt = state.observe(&x, value, &g, g.dot(&g).sqrt());
             assert!(halt.is_none(), "an improving run must not halt");
         }
     }
 
-    /// A resolver that records what it was shown and answers from a script.
-    struct ScriptedResolver {
-        answers: Vec<StallResolution>,
-        seen_points: Vec<Array1<f64>>,
-        seen_converged: Vec<bool>,
-    }
-
-    impl ScriptedResolver {
-        fn new(answers: Vec<StallResolution>) -> Self {
-            Self {
-                answers,
-                seen_points: Vec::new(),
-                seen_converged: Vec::new(),
-            }
-        }
-    }
-
-    impl StallResolver for ScriptedResolver {
-        fn resolve(&mut self, stall: &CostStallSummary<'_>) -> StallResolution {
-            self.seen_points.push(stall.point.clone());
-            self.seen_converged.push(stall.converged);
-            if self.answers.is_empty() {
-                StallResolution::Halt
-            } else {
-                self.answers.remove(0)
-            }
-        }
-    }
-
     #[test]
-    fn stall_resolver_is_the_sole_authority_over_the_gradient_ceiling() {
-        // `stuck_grad_ceiling` would escape here (‖g‖ = 11 > 5). A resolver
-        // saying Halt must win: two authorities on one question is exactly
-        // what the hook exists to remove, so the ceiling is not consulted.
-        let config = CostStallConfig {
-            rel_tol: 1.0e-7,
-            window: 2,
-            projected_grad_tol: 1.0e-3,
-            stuck_grad_ceiling: Some(5.0),
-            max_stuck_escapes: 8,
-        };
-        let mut state = CostStallState::new(config);
-        let mut resolver = ScriptedResolver::new(vec![StallResolution::Halt]);
-        let x = array![0.0];
-        let g = array![11.0_f64];
-        let gn = g.dot(&g).sqrt();
-        assert!(
-            state
-                .observe(&x, 1.0, &g, gn, Some(&mut resolver))
-                .is_none()
-        );
-        let halt = state
-            .observe(&x, 1.0, &g, gn, Some(&mut resolver))
-            .expect("the resolver said Halt, so the ceiling must not escape");
-        assert!(!halt.converged, "‖g‖ = 11 is a floor, not a convergence");
-        assert_eq!(resolver.seen_converged, vec![false]);
-
-        // And the converse: a resolver saying Escape must escape even where
-        // the ceiling would not have (‖g‖ = 1 < 5).
-        let mut state = CostStallState::new(config);
-        let mut resolver = ScriptedResolver::new(vec![StallResolution::Escape]);
+    fn cost_stall_state_halts_an_escape_that_bought_nothing() {
+        // REPLACES `stall_resolver_is_the_sole_authority_over_the_gradient_ceiling`
+        // (#2900 rows 24.1/24.2): `StallResolver` and `stuck_grad_ceiling` are gone,
+        // so escapes have one authority, the monitor. An escape continues only
+        // while it buys resolved descent or a smaller projected gradient.
+        let config = CostStallConfig::new(1.0e-7, 2, 1.0e-3);
         let g = array![1.0_f64];
         let gn = g.dot(&g).sqrt();
+        let mut state = CostStallState::new(config);
+        // Fold 1 is the incumbent, folds 2 and 3 fill the window, and the first
+        // window reopens.
+        for value in [1.0, 1.0, 1.0] {
+            assert!(state.observe(&array![0.0], value, &g, gn).is_none());
+        }
+        // The incumbent moves by less than the floor at the same residual, so the
+        // second window bought nothing and the guard halts at it.
+        assert!(state.observe(&array![0.1], 1.0 - 1.0e-9, &g, gn).is_none());
+        let halt = state
+            .observe(&array![0.1], 1.0 - 1.0e-9, &g, gn)
+            .expect("an escape that bought nothing must halt");
+        assert!(!halt.converged);
+        assert_eq!(halt.point, array![0.1]);
+
+        // Positive control: the same trajectory with a contracting residual keeps
+        // the escape.
+        let mut contracting = CostStallState::new(config);
+        for value in [1.0, 1.0, 1.0] {
+            assert!(contracting.observe(&array![0.0], value, &g, gn).is_none());
+        }
+        let smaller = array![0.5_f64];
         assert!(
-            state
-                .observe(&x, 1.0, &g, gn, Some(&mut resolver))
+            contracting
+                .observe(&array![0.1], 1.0 - 1.0e-9, &smaller, 0.5)
                 .is_none()
         );
         assert!(
-            state
-                .observe(&x, 1.0, &g, gn, Some(&mut resolver))
+            contracting
+                .observe(&array![0.1], 1.0 - 1.0e-9, &smaller, 0.5)
                 .is_none(),
-            "the resolver said Escape, so the filled window must not halt"
+            "a window that contracted the residual must reopen"
         );
     }
 
     #[test]
-    fn stall_resolver_sees_the_best_iterate_not_the_most_recent() {
-        // THE failure this hook can hide: a resolver keyed on the latest
-        // observation answers about a point the halt would never report.
-        // They differ exactly when the window fills on oscillation, which is
-        // the case a resolver is for. Fold a good point first, then worse
-        // ones; the summary must carry the good one.
-        let config = CostStallConfig {
-            rel_tol: 1.0e-7,
-            window: 2,
-            projected_grad_tol: 1.0e-9,
-            stuck_grad_ceiling: None,
-            max_stuck_escapes: 0,
-        };
+    fn cost_stall_state_halts_at_the_best_iterate_not_the_most_recent() {
+        // REWRITTEN from `stall_resolver_sees_the_best_iterate_not_the_most_recent`
+        // (#2900 rows 24.1/24.2): with no resolver, what matters is that the halt
+        // reports the best iterate, which differs from the most recent exactly when
+        // the window fills on oscillation. Fold a good point, then worse ones.
+        let config = CostStallConfig::new(1.0e-7, 2, 1.0e-9);
         let mut state = CostStallState::new(config);
-        let mut resolver = ScriptedResolver::new(vec![StallResolution::Halt]);
         let good = array![1.0_f64];
         let worse = array![99.0_f64];
         let g = array![7.0_f64];
         let gn = g.dot(&g).sqrt();
-        // Fold 1 sets best = `good` (and already counts as no-improvement:
-        // the floor is `rel_tol * (1 + |best|)` against an infinite initial
-        // best, so it is infinite). Fold 2 is WORSE, does not move the best,
-        // and fills the window — so at the moment of the fill the best-so-far
-        // and the most recent observation are different points, which is the
-        // whole point of this test.
-        assert!(
-            state
-                .observe(&good, 1.0, &g, gn, Some(&mut resolver))
-                .is_none()
-        );
+        // Fold 1 is the incumbent. Folds 2 and 3 fill the window, which reopens
+        // because ‖g‖ = 7 is above the tolerance. Folds 4 and 5 refill it at the
+        // same incumbent, a replay, so the guard halts.
+        assert!(state.observe(&good, 1.0, &g, gn).is_none());
+        for _ in 0..3 {
+            assert!(state.observe(&worse, 5.0, &g, gn).is_none());
+        }
         let halt = state
-            .observe(&worse, 5.0, &g, gn, Some(&mut resolver))
-            .expect("filled window with a Halt resolver must halt");
+            .observe(&worse, 5.0, &g, gn)
+            .expect("a replayed window must halt");
         assert_eq!(halt.point, good, "the halt reports the best iterate");
-        assert!(
-            resolver.seen_points.iter().all(|p| *p == good),
-            "the resolver must be shown the BEST iterate, not the most recent: saw {:?}",
-            resolver.seen_points
+        assert_eq!(
+            halt.grad, g,
+            "the halt carries the gradient at the best iterate"
         );
+        assert!(!halt.converged);
     }
 
     #[test]
-    fn cost_stall_state_stuck_escape_defers_then_halts() {
-        // A far-above-tolerance stall with an escape budget: the guard
-        // resets the window instead of halting, up to `max_stuck_escapes`
-        // times, then finally halts as a floor.
-        let config = CostStallConfig {
-            rel_tol: 1.0e-7,
-            window: 2,
-            projected_grad_tol: 1.0e-3,
-            stuck_grad_ceiling: Some(5.0),
-            max_stuck_escapes: 1,
-        };
+    fn cost_stall_state_escape_halts_on_its_replay() {
+        // REWRITTEN from `cost_stall_state_stuck_escape_defers_then_halts` (#2900 rows
+        // 24.1/24.2): there is no escape budget to spend. A far-above-tolerance
+        // stall reopens its window, and the refill at a bit-identical incumbent is a
+        // replay the guard halts on, one fold later than the budget of 1 halted.
+        let config = CostStallConfig::new(1.0e-7, 2, 1.0e-3);
         let mut state = CostStallState::new(config);
         let x = array![0.0];
-        let g = array![11.0_f64]; // ‖g‖ = 11 > ceiling 5.0
+        let g = array![11.0_f64];
         let gn = g.dot(&g).sqrt();
-        // Fold 1 sets best; fold 2 fills the window → first (and only)
-        // escape ⇒ None, streak reset.
-        assert!(state.observe(&x, 1.0, &g, gn, None).is_none());
-        assert!(state.observe(&x, 1.0, &g, gn, None).is_none());
-        // Window refills; escape budget now exhausted ⇒ halt as floor.
-        assert!(state.observe(&x, 1.0, &g, gn, None).is_none());
+        // Fold 1 is the incumbent; folds 2 and 3 fill the window and it reopens.
+        for _ in 0..3 {
+            assert!(state.observe(&x, 1.0, &g, gn).is_none());
+        }
+        // Fold 4 starts the refill; fold 5 fills it at the same incumbent.
+        assert!(state.observe(&x, 1.0, &g, gn).is_none());
         let halt = state
-            .observe(&x, 1.0, &g, gn, None)
-            .expect("with the escape budget spent the stall must halt");
+            .observe(&x, 1.0, &g, gn)
+            .expect("a replayed escape must halt");
         assert!(!halt.converged);
     }
 
@@ -19466,7 +19281,7 @@ mod trust_region_policy_noise_floor_tests {
 
 pub use riemannian::{
     RiemannianGeometry, RiemannianObjective, RiemannianTrustRegion, RiemannianTrustRegionError,
-    RiemannianTrustRegionTermination,
+    RiemannianTrustRegionTermination, relative_stationarity,
 };
 
 /// A trust-region method on an embedded Riemannian manifold, solved in the
@@ -19559,6 +19374,8 @@ mod riemannian {
         InvalidMaxRadius,
         #[error("trust-region gradient tolerance must be finite and non-negative")]
         InvalidGradientTolerance,
+        #[error("trust-region stationarity reference must be finite and non-negative")]
+        InvalidStationarityReference,
         #[error("trust-region objective returned a non-finite value")]
         NonFiniteValue,
         #[error("trust-region objective returned a non-finite terminal value")]
@@ -19631,6 +19448,11 @@ mod riemannian {
         pub max_iter: usize,
         /// Bound on the relative stationarity certificate.
         pub grad_tol: f64,
+        /// The gradient norm the relative stationarity test is scaled by. `None`
+        /// takes this run's first gradient norm. A resumed solve passes the
+        /// reference its first run used, so its certificate and `residual` stay on
+        /// one scale across the resume.
+        pub stationarity_reference: Option<f64>,
     }
 
     impl RiemannianTrustRegion {
@@ -19674,14 +19496,20 @@ mod riemannian {
             if !self.grad_tol.is_finite() || self.grad_tol < 0.0 {
                 return Err(RiemannianTrustRegionError::InvalidGradientTolerance);
             }
+            if self
+                .stationarity_reference
+                .is_some_and(|reference| !reference.is_finite() || reference < 0.0)
+            {
+                return Err(RiemannianTrustRegionError::InvalidStationarityReference);
+            }
 
             // Establish `0 < Δ_k ≤ Δmax` before the first step. Expansion caps at
             // `max_radius` and contraction only shrinks, so the invariant then
             // holds for every iterate and `max_radius` caps every step.
             let mut delta = self.radius.min(self.max_radius);
             // The initial gradient norm: the shift-invariant scale of the relative
-            // stationarity test.
-            let mut grad0_norm: Option<f64> = None;
+            // stationarity test, unless the caller carries one across a resume.
+            let mut grad0_norm: Option<f64> = self.stationarity_reference;
             let mut iterations = 0usize;
 
             for _ in 0..self.max_iter {
@@ -19982,7 +19810,7 @@ mod riemannian {
     /// `max(|f|, 1)` it is invariant under `f → f + C`, which leaves the minimizers
     /// and the accepted path unchanged. A non-finite gradient maps to `+∞`, so a
     /// blown-up iterate is never stationary.
-    fn relative_stationarity(grad_norm: f64, grad0_norm: f64) -> f64 {
+    pub fn relative_stationarity(grad_norm: f64, grad0_norm: f64) -> f64 {
         if !grad_norm.is_finite() || !grad0_norm.is_finite() {
             return f64::INFINITY;
         }
@@ -20090,6 +19918,7 @@ mod riemannian {
                 max_radius: 1.0e6,
                 max_iter,
                 grad_tol: 1.0e-12,
+                stationarity_reference: None,
             }
         }
 
