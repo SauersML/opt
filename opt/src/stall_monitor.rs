@@ -78,29 +78,45 @@ pub struct StallExit {
     pub unescapable_window: Option<UnescapableRefusalWindow>,
 }
 
-/// The whole incumbent in raw bits. Only bit identity supports the claim a
-/// replay cut makes: a deterministic procedure replayed from an identical state
-/// returns an identical result. Raw bits keep the comparison total, and both of
-/// its possible errors (distinct NaN payloads, `-0.0` against `0.0`) grant the
-/// escape rather than cut it.
+/// The search state an escape was granted from, in raw bits: the whole
+/// incumbent, and the trial points the window that filled had observed. Only
+/// bit identity supports the claim a replay cut makes: a deterministic
+/// procedure replayed from an identical state returns an identical result. Raw
+/// bits keep the comparison total, and both of its possible errors (distinct
+/// NaN payloads, `-0.0` against `0.0`) grant the escape rather than cut it.
+///
+/// The incumbent alone is not the search's state. A window of trials that do not
+/// improve it leaves it bit-identical while the solver's own state moves: a
+/// rejected cubic trial raises ARC's regularization, so the next window proposes
+/// shorter steps to new points. The trials the window observed are the part of
+/// that state the monitor can see, so a replay is a window that observed the
+/// same points, in the same order, from the same incumbent (gam 0282f2b560: a
+/// saddle whose window had just evaluated three fresh trials was cut as a
+/// replay).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IncumbentBits {
     point: Vec<u64>,
     value: u64,
     grad_norm: u64,
+    window_trials: Vec<Vec<u64>>,
 }
 
 impl IncumbentBits {
-    fn new(point: &Array1<f64>, value: f64, grad_norm: f64) -> Self {
+    fn new(point: &Array1<f64>, value: f64, grad_norm: f64, window_trials: &[Vec<u64>]) -> Self {
         Self {
-            point: point
-                .iter()
-                .map(|coordinate| coordinate.to_bits())
-                .collect(),
+            point: point_bits(point),
             value: value.to_bits(),
             grad_norm: grad_norm.to_bits(),
+            window_trials: window_trials.to_vec(),
         }
     }
+}
+
+fn point_bits(point: &Array1<f64>) -> Vec<u64> {
+    point
+        .iter()
+        .map(|coordinate| coordinate.to_bits())
+        .collect()
 }
 
 /// The solver state behind one accepted step, kept over the window so a caller
@@ -143,6 +159,10 @@ pub struct StallMonitor<C> {
     /// escapes are bounded by the replay cut and by the caller's budget.
     pub stuck_escapes: usize,
     incumbent_at_last_escape: Option<IncumbentBits>,
+    /// Every trial point observed without improving the incumbent since the
+    /// window last opened, at the latest improvement or escape grant: the half of
+    /// the replay identity the incumbent cannot carry (see [`IncumbentBits`]).
+    window_trials: Vec<Vec<u64>>,
     continuation_incumbent: Option<(f64, f64)>,
     recent: VecDeque<(Array1<f64>, f64)>,
     /// The solver state of the latest `window` accepted steps, oldest first.
@@ -173,6 +193,7 @@ impl<C: Clone> StallMonitor<C> {
             accepted: 0,
             stuck_escapes: 0,
             incumbent_at_last_escape: None,
+            window_trials: Vec::new(),
             continuation_incumbent: None,
             recent: VecDeque::new(),
             recent_steps: VecDeque::new(),
@@ -308,8 +329,20 @@ impl<C: Clone> StallMonitor<C> {
         }
         self.stuck_escapes = self.stuck_escapes.saturating_add(1);
         self.incumbent_at_last_escape = Some(incumbent);
+        self.window_trials.clear();
         self.no_improve_streak = 0;
         true
+    }
+
+    /// The replay identity of the search as it stands (see [`IncumbentBits`]).
+    fn escape_state(&self, point: &Array1<f64>, value: f64, grad_norm: f64) -> IncumbentBits {
+        IncumbentBits::new(point, value, grad_norm, &self.window_trials)
+    }
+
+    /// Record a trial that did not improve the incumbent as part of the open
+    /// window's replay identity.
+    fn record_window_trial(&mut self, point: &Array1<f64>) {
+        self.window_trials.push(point_bits(point));
     }
 
     /// Whether a filled window at a non-stationary stall may be followed by
@@ -352,7 +385,7 @@ impl<C: Clone> StallMonitor<C> {
             return None;
         }
         let point = self.best_point.clone()?;
-        log::info!(
+        log::debug!(
             "[STALL] stopping at an unprogressing stall: the window filled again at value={:.6e} \
              |Pg|={:.3e} after {} trusted sample(s), with no resolved descent and no contraction \
              of the projected gradient since the last one",
@@ -446,6 +479,7 @@ impl<C: Clone> StallMonitor<C> {
         self.best_payload = staged_payload;
         self.no_improve_streak = 0;
         self.refused_streak = 0;
+        self.window_trials.clear();
         self.accepted = self.accepted.saturating_add(1);
         self.record_recent(point, value);
         self.publish_best_so_far();
@@ -475,11 +509,13 @@ impl<C: Clone> StallMonitor<C> {
         let staged_payload = self.staged_payload.take();
         if !value.is_finite() {
             self.no_improve_streak = 0;
+            self.record_window_trial(point);
             return StallVerdict::Continue;
         }
         if !trusted {
             self.refused_streak = 0;
             self.no_improve_streak = 0;
+            self.record_window_trial(point);
             return StallVerdict::Continue;
         }
         self.refused_streak = 0;
@@ -498,8 +534,10 @@ impl<C: Clone> StallMonitor<C> {
         let stationary_at_value = grad_norm.is_finite() && grad_norm <= self.band(value);
         if floor.is_finite() && (improvement <= floor || stationary_at_value) {
             self.no_improve_streak = self.no_improve_streak.saturating_add(1);
+            self.record_window_trial(point);
         } else {
             self.no_improve_streak = 0;
+            self.window_trials.clear();
             self.stuck_escapes = 0;
             self.incumbent_at_last_escape = None;
         }
@@ -509,9 +547,9 @@ impl<C: Clone> StallMonitor<C> {
         if self.best_curvature_psd == Some(false) {
             let (best_point, best_value, best_grad_norm) =
                 self.best_iterate_or(point, value, grad_norm);
-            let incumbent = IncumbentBits::new(&best_point, best_value, best_grad_norm);
+            let incumbent = self.escape_state(&best_point, best_value, best_grad_norm);
             if self.grant_escape_unless_replay(incumbent) {
-                log::warn!(
+                log::debug!(
                     "[STALL] window filled at a strict-saddle incumbent (value={:.6e}): refusing \
                      to stop there and returning control to the solver to take the negative \
                      curvature (escape {})",
@@ -522,10 +560,10 @@ impl<C: Clone> StallMonitor<C> {
                 return StallVerdict::Continue;
             }
             self.replay_proven = true;
-            log::info!(
+            log::debug!(
                 "[STALL] strict-saddle refusal cut at escape {}: the previous refusal reopened a \
-                 full {}-sample window and left the incumbent bit-identical (best={:.9e}, \
-                 |g|={:.3e}); halting",
+                 full {}-sample window that observed the same trials from a bit-identical incumbent \
+                 (best={:.9e}, |g|={:.3e}); halting",
                 self.stuck_escapes,
                 self.window,
                 best_value,
@@ -533,6 +571,21 @@ impl<C: Clone> StallMonitor<C> {
             );
         }
         self.publish_stall(point, value, grad_norm)
+    }
+
+    /// Fold one finite trial the solver's ratio test rejected.
+    ///
+    /// The iterate did not move, so this is not a step: the incumbent, the
+    /// trusted-sample count and the no-improvement streak are untouched. What
+    /// the trial does change: its finite value ends a run of refused trials,
+    /// which are consecutive trials that did not evaluate, and it is a point the
+    /// open window observed, so it belongs to the replay identity (see
+    /// [`IncumbentBits`]). The payload staged for it is dropped, since it never
+    /// becomes the incumbent.
+    pub fn observe_rejected_trial(&mut self, point: &Array1<f64>) {
+        self.staged_payload = None;
+        self.refused_streak = 0;
+        self.record_window_trial(point);
     }
 
     /// Fold one trial refused before it produced a finite criterion value.
@@ -549,13 +602,14 @@ impl<C: Clone> StallMonitor<C> {
         }
         self.refused_streak = self.refused_streak.saturating_add(1);
         self.unescapable_streak = 0;
+        self.record_window_trial(point);
         if self.refused_streak < self.window {
             return StallVerdict::Continue;
         }
         if self.best_curvature_psd == Some(false) {
             self.refused_streak = 0;
             self.no_improve_streak = 0;
-            log::warn!(
+            log::debug!(
                 "[STALL] refused-trial run reached a strict-saddle incumbent; refusing the stall \
                  and returning control to the solver"
             );
@@ -579,6 +633,7 @@ impl<C: Clone> StallMonitor<C> {
             return StallVerdict::Continue;
         }
         self.refused_streak = self.refused_streak.saturating_add(1);
+        self.record_window_trial(point);
         self.unescapable_streak = match self.refused_streak {
             1 => 1,
             _ => self.unescapable_streak.saturating_add(1),
@@ -675,7 +730,7 @@ impl<C: Clone> StallMonitor<C> {
             return StallVerdict::Converged;
         }
         let non_stationary = best_grad_norm.is_finite() && best_grad_norm > band;
-        let incumbent = IncumbentBits::new(&best_point, best_value, best_grad_norm);
+        let incumbent = self.escape_state(&best_point, best_value, best_grad_norm);
         if non_stationary && self.grant_escape_unless_replay(incumbent.clone()) {
             self.refused_streak = 0;
             return StallVerdict::Escape {
@@ -685,9 +740,10 @@ impl<C: Clone> StallMonitor<C> {
         }
         if non_stationary && self.incumbent_at_last_escape.as_ref() == Some(&incumbent) {
             self.replay_proven = true;
-            log::info!(
-                "[STALL] escape streak cut at {}: escape {} reopened a full {}-sample window and \
-                 left the incumbent bit-identical (best={:.9e}, |g|={:.3e}); halting",
+            log::debug!(
+                "[STALL] escape streak cut at {}: escape {} reopened a full {}-sample window that \
+                 observed the same trials from a bit-identical incumbent (best={:.9e}, |g|={:.3e}); \
+                 halting",
                 self.stuck_escapes,
                 self.stuck_escapes,
                 self.window,
@@ -805,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn an_escape_is_cut_only_when_it_replays_a_bit_identical_incumbent() {
+    fn an_escape_is_cut_only_when_it_replays_the_same_window_from_a_bit_identical_incumbent() {
         let mut stall = monitor(2);
         stall.observe(&point(0.0), 1.0, 1.0, true, None);
         stall.observe(&point(0.1), 1.0, 1.0, true, None);
@@ -814,13 +870,33 @@ mod tests {
             StallVerdict::Escape { .. }
         ));
         assert_eq!(stall.stuck_escapes, 1);
-        stall.observe(&point(0.3), 1.0, 1.0, true, None);
+        // The reopened window observes the same trials from the same incumbent:
+        // a deterministic procedure replayed from an identical state.
+        stall.observe(&point(0.1), 1.0, 1.0, true, None);
         assert!(matches!(
-            stall.observe(&point(0.4), 1.0, 1.0, true, None),
+            stall.observe(&point(0.2), 1.0, 1.0, true, None),
             StallVerdict::Floor { .. }
         ));
         assert!(stall.replay_proven());
         assert!(!stall.exit().expect("published").converged);
+
+        // Positive control: a reopened window that observes trials the previous
+        // one never saw is a search in a different state, however still its
+        // incumbent, and earns another escape instead of the cut.
+        let mut exploring = monitor(2);
+        exploring.observe(&point(0.0), 1.0, 1.0, true, None);
+        exploring.observe(&point(0.1), 1.0, 1.0, true, None);
+        assert!(matches!(
+            exploring.observe(&point(0.2), 1.0, 1.0, true, None),
+            StallVerdict::Escape { .. }
+        ));
+        exploring.observe(&point(0.3), 1.0, 1.0, true, None);
+        assert!(matches!(
+            exploring.observe(&point(0.4), 1.0, 1.0, true, None),
+            StallVerdict::Escape { .. }
+        ));
+        assert_eq!(exploring.stuck_escapes, 2);
+        assert!(!exploring.replay_proven());
 
         // Positive control: an incumbent that moved between the windows (a lower
         // value by less than the floor) earns another escape instead of the cut.
@@ -850,6 +926,16 @@ mod tests {
         );
         assert!(stall.take_strict_saddle_refusal());
         assert!(!stall.take_strict_saddle_refusal());
+        // A window on new trials is the search still exploring the saddle, so it
+        // escapes again.
+        stall.observe(&point(0.3), 1.0, 0.0, true, Some(false));
+        assert_eq!(
+            stall.observe(&point(0.4), 1.0, 0.0, true, Some(false)),
+            StallVerdict::Continue
+        );
+        assert!(stall.take_strict_saddle_refusal());
+        assert!(!stall.replay_proven());
+        // The same trials again from the same incumbent are the replay.
         stall.observe(&point(0.3), 1.0, 0.0, true, Some(false));
         assert_eq!(
             stall.observe(&point(0.4), 1.0, 0.0, true, Some(false)),
@@ -866,6 +952,40 @@ mod tests {
             minimum.observe(&point(0.2), 1.0, 0.0, true, Some(true)),
             StallVerdict::Converged
         );
+    }
+
+    #[test]
+    fn a_rejected_trial_joins_the_replay_identity_and_nothing_else() {
+        let mut stall = monitor(2);
+        stall.observe(&point(0.0), 1.0, 1.0, true, None);
+        stall.observe(&point(0.1), 1.0, 1.0, true, None);
+        assert!(matches!(
+            stall.observe(&point(0.2), 1.0, 1.0, true, None),
+            StallVerdict::Escape { .. }
+        ));
+        let accepted = stall.accepted();
+        // A rejected trial between the windows: not a step, but a point the
+        // search observed, so the window that follows is not a replay.
+        stall.observe_rejected_trial(&point(0.9));
+        assert_eq!(stall.accepted(), accepted, "a rejected trial is not a step");
+        assert_eq!(
+            stall.observe(&point(0.1), 1.0, 1.0, true, None),
+            StallVerdict::Continue,
+            "a rejected trial does not count toward the window"
+        );
+        assert!(matches!(
+            stall.observe(&point(0.2), 1.0, 1.0, true, None),
+            StallVerdict::Escape { .. }
+        ));
+        assert!(!stall.replay_proven());
+
+        // Its finite value ends a run of refused trials.
+        let mut refused = monitor(2);
+        refused.observe_seed(&point(0.0), 1.0, 0.0, None);
+        refused.observe_refused(&point(9.0));
+        refused.observe_rejected_trial(&point(9.5));
+        assert_eq!(refused.refused_streak(), 0);
+        assert_eq!(refused.observe_refused(&point(9.0)), StallVerdict::Continue);
     }
 
     #[test]

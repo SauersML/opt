@@ -3966,10 +3966,11 @@ pub enum StationarityKind {
 /// crate. A filled window whose best iterate is above `projected_grad_tol` is
 /// not halted at once: the window reopens so the search can take the descent
 /// the residual says remains. There is no escape count. The escape ends when
-/// reopening it would replay the previous one from a bit-identical incumbent,
-/// or when the reopened window bought neither resolved descent nor a smaller
-/// projected gradient ([`StallMonitor::license_continuation`]); either way the
-/// search halts as a `CostStallFloor`.
+/// reopening it would replay the previous window, its same trials from a
+/// bit-identical incumbent, or when the reopened window bought neither resolved
+/// descent nor a smaller projected gradient
+/// ([`StallMonitor::license_continuation`]); either way the search halts as a
+/// `CostStallFloor`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostStallConfig {
     /// Relative improvement floor: an accepted step counts as "no
@@ -10185,8 +10186,8 @@ where
     ///
     /// A filled window above `projected_grad_tol` first reopens so the search
     /// can take the descent its residual says remains. It halts as a floor once
-    /// reopening would replay the previous window from a bit-identical
-    /// incumbent, or the reopened window bought nothing ([`StallMonitor`]).
+    /// reopening would replay the previous window, its same trials from a
+    /// bit-identical incumbent, or the reopened window bought nothing ([`StallMonitor`]).
     ///
     /// Calling this twice replaces the previous config. Not calling it
     /// leaves BFGS's behavior exactly unchanged.
