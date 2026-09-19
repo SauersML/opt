@@ -107,8 +107,9 @@ use std::sync::Arc as StdArc;
 mod second_order;
 mod stall_monitor;
 pub use second_order::{
-    certificate_curvature_shift, hessian_is_psd_at_resolution, max_feasible_step_along,
-    newton_predicted_decrease, newton_predicted_decrease_at_resolution,
+    NegativeCurvatureClaim, certificate_curvature_shift, hessian_is_psd_at_resolution,
+    max_feasible_step_along, negative_curvature_claim, newton_predicted_decrease,
+    newton_predicted_decrease_at_resolution, unresolvable_curvature_magnitude,
 };
 pub use stall_monitor::{
     StallExit, StallMonitor, StallStep, StallVerdict, UnescapableRefusalWindow,

@@ -167,6 +167,84 @@ fn shifted_newton_predicted_decrease(
     Some(0.5 * quad)
 }
 
+/// The largest magnitude of a negative curvature that a criterion known only to
+/// within `objective_resolution` cannot resolve over steps up to `alpha_max` along
+/// its eigenvector: `2·objective_resolution / α_max²`.
+///
+/// A curvature `λ < 0` at or under it predicts at most `½|λ|·α_max² ≤
+/// objective_resolution` of decrease at the largest step, which the criterion cannot
+/// represent ([`negative_curvature_claim`]). It is the one number both a verdict on
+/// a single claim and a definiteness test shifted to the criterion's resolution
+/// read.
+///
+/// `None` when `alpha_max` is not a finite positive step or `objective_resolution`
+/// is not a finite positive resolution.
+#[must_use]
+pub fn unresolvable_curvature_magnitude(alpha_max: f64, objective_resolution: f64) -> Option<f64> {
+    if !(alpha_max.is_finite() && alpha_max > 0.0)
+        || !(objective_resolution.is_finite() && objective_resolution > 0.0)
+    {
+        return None;
+    }
+    Some(2.0 * objective_resolution / (alpha_max * alpha_max))
+}
+
+/// What a criterion can say about a claim of negative curvature at a stationary
+/// point ([`negative_curvature_claim`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NegativeCurvatureClaim {
+    /// The claim predicts a decrease the criterion can represent. Steps from
+    /// `alpha_max` down to `alpha_min`, where the prediction reaches the resolution,
+    /// are its whole falsifiable range.
+    Resolvable { alpha_min: f64 },
+    /// The largest decrease the claim predicts, `predicted_at_largest = ½|λ_min|·α_max²`,
+    /// is at or below the criterion's resolution. No allowed step can produce a
+    /// decrease the criterion represents, so the criterion can neither confirm nor
+    /// falsify the claim, and a curvature it cannot resolve cannot refuse the point.
+    Unresolvable { predicted_at_largest: f64 },
+}
+
+/// Whether a negative eigenvalue `lambda_min` of a criterion Hessian at a
+/// stationary point is resolvable by the criterion, over steps up to `alpha_max`
+/// along its eigenvector.
+///
+/// Along the eigenvector the quadratic model of the claim is
+/// `V(x ± αv) − V(x) ≈ ½λ_min α²`, so it predicts a decrease of at most
+/// `½|λ_min|α_max²`. A criterion known only to within `objective_resolution` can
+/// represent that decrease only when it is larger:
+///
+/// ```text
+///     resolvable  ⟺  ½|λ_min|·α_max² > objective_resolution
+///                 ⟺  |λ_min| > unresolvable_curvature_magnitude(α_max, objective_resolution),
+///     α_min = √(2·objective_resolution / |λ_min|)  (< α_max when resolvable).
+/// ```
+///
+/// This is a statement about the criterion, not the matrix: the matrix's own
+/// error enters its verdict through [`certificate_curvature_shift`].
+///
+/// `None` when `lambda_min` is not a finite negative number, `alpha_max` is not a
+/// finite positive step, or `objective_resolution` is not a finite positive
+/// resolution.
+#[must_use]
+pub fn negative_curvature_claim(
+    lambda_min: f64,
+    alpha_max: f64,
+    objective_resolution: f64,
+) -> Option<NegativeCurvatureClaim> {
+    if !(lambda_min.is_finite() && lambda_min < 0.0) {
+        return None;
+    }
+    let unresolvable = unresolvable_curvature_magnitude(alpha_max, objective_resolution)?;
+    if lambda_min.abs() <= unresolvable {
+        return Some(NegativeCurvatureClaim::Unresolvable {
+            predicted_at_largest: 0.5 * lambda_min.abs() * alpha_max * alpha_max,
+        });
+    }
+    Some(NegativeCurvatureClaim::Resolvable {
+        alpha_min: (2.0 * objective_resolution / lambda_min.abs()).sqrt(),
+    })
+}
+
 /// The largest `α ≥ 0` keeping `point + α·ray` inside the box `[lower, upper]`.
 ///
 /// A coordinate with no bound entry, or a zero ray component, sets no limit, so
@@ -199,8 +277,9 @@ pub fn max_feasible_step_along(
 #[cfg(test)]
 mod tests {
     use super::{
-        certificate_curvature_shift, hessian_is_psd_at_resolution, max_feasible_step_along,
-        newton_predicted_decrease, newton_predicted_decrease_at_resolution,
+        NegativeCurvatureClaim, certificate_curvature_shift, hessian_is_psd_at_resolution,
+        max_feasible_step_along, negative_curvature_claim, newton_predicted_decrease,
+        newton_predicted_decrease_at_resolution, unresolvable_curvature_magnitude,
     };
     use ndarray::{Array1, array};
 
@@ -256,6 +335,62 @@ mod tests {
             newton_predicted_decrease(&indefinite, &ones)
         );
         assert_eq!(newton_predicted_decrease(&hessian, &array![1.0]), None);
+    }
+
+    #[test]
+    fn a_negative_curvature_is_resolvable_only_above_the_criterions_resolution() {
+        // gam#3036's Gaussian location-scale fit: ½|λ| = 6.47e-7 at α = 1 against a
+        // resolution of 1.23e-5. No step up to one e-fold can resolve it.
+        let lambda = -1.294787e-6;
+        assert_eq!(
+            negative_curvature_claim(lambda, 1.0, 1.228631e-5),
+            Some(NegativeCurvatureClaim::Unresolvable {
+                predicted_at_largest: 0.5 * lambda.abs()
+            })
+        );
+        // Positive control: the same curvature over a longer ladder predicts
+        // ½|λ|·16 = 1.04e-5 at α = 4, still under the resolution, and at α = 5 it
+        // predicts 1.62e-5, which the criterion resolves down to α_min = 4.36.
+        assert!(matches!(
+            negative_curvature_claim(lambda, 4.0, 1.228631e-5),
+            Some(NegativeCurvatureClaim::Unresolvable { .. })
+        ));
+        let Some(NegativeCurvatureClaim::Resolvable { alpha_min }) =
+            negative_curvature_claim(lambda, 5.0, 1.228631e-5)
+        else {
+            panic!("½|λ|·25 exceeds the resolution");
+        };
+        assert!((alpha_min - (2.0 * 1.228631e-5 / lambda.abs()).sqrt()).abs() <= 1e-15 * alpha_min);
+        assert!(alpha_min < 5.0);
+        // A prediction exactly at the resolution is not resolvable.
+        assert_eq!(
+            negative_curvature_claim(-2.0, 1.0, 1.0),
+            Some(NegativeCurvatureClaim::Unresolvable {
+                predicted_at_largest: 1.0
+            })
+        );
+        assert_eq!(negative_curvature_claim(1e-3, 1.0, 1e-5), None);
+        assert_eq!(negative_curvature_claim(-1e-3, 0.0, 1e-5), None);
+        assert_eq!(negative_curvature_claim(-1e-3, 1.0, 0.0), None);
+        assert_eq!(negative_curvature_claim(f64::NAN, 1.0, 1e-5), None);
+        // The magnitude both a single claim and a definiteness test shifted to the
+        // criterion's resolution read: 2·res/α², and the claim is unresolvable exactly
+        // at or under it.
+        assert_eq!(
+            unresolvable_curvature_magnitude(1.0, 1.228631e-5),
+            Some(2.0 * 1.228631e-5)
+        );
+        assert_eq!(unresolvable_curvature_magnitude(2.0, 1.0), Some(0.5));
+        assert_eq!(unresolvable_curvature_magnitude(0.0, 1.0), None);
+        assert_eq!(unresolvable_curvature_magnitude(1.0, f64::NAN), None);
+        assert!(matches!(
+            negative_curvature_claim(-0.5, 2.0, 1.0),
+            Some(NegativeCurvatureClaim::Unresolvable { .. })
+        ));
+        assert!(matches!(
+            negative_curvature_claim(-0.5 - 1e-12, 2.0, 1.0),
+            Some(NegativeCurvatureClaim::Resolvable { .. })
+        ));
     }
 
     #[test]
