@@ -2529,11 +2529,16 @@ impl ReducedSymmetricSpectrum {
             lambda_sq,
             band_lambda_sq,
             band_f: bands.objective,
+            tolerance: bands.tolerance,
             retained,
             flat,
             curvature_resolution,
         };
-        if !(lambda_sq.is_finite() && band_lambda_sq.is_finite() && bands.objective.is_finite()) {
+        if !(lambda_sq.is_finite()
+            && band_lambda_sq.is_finite()
+            && bands.objective.is_finite()
+            && bands.tolerance.is_finite())
+        {
             return DecrementVerdict::DecrementUnresolved(evidence);
         }
         if valley > 0 {
@@ -2542,9 +2547,9 @@ impl ReducedSymmetricSpectrum {
                 evidence,
             };
         }
-        if lambda_sq + band_lambda_sq <= bands.objective {
+        if lambda_sq + band_lambda_sq <= bands.tolerance {
             DecrementVerdict::Certified(evidence)
-        } else if band_lambda_sq >= bands.objective {
+        } else if band_lambda_sq >= bands.tolerance {
             DecrementVerdict::DecrementUnresolved(evidence)
         } else {
             DecrementVerdict::DecrementAboveTolerance(evidence)
@@ -2558,15 +2563,26 @@ fn reduced_hessian_is_positive_semidefinite(h: &Array2<f64>, active: Option<&[bo
 }
 
 /// The rounding bands a Newton-decrement stationarity certificate is decided
-/// against.
+/// against, and the decrease it may leave to the minimum.
 ///
 /// Every band is absolute, in the units of the objective, its gradient and its
 /// Hessian respectively, so rescaling the objective together with its bands
 /// leaves the verdict unchanged.
+///
+/// `objective` and `tolerance` are two quantities. `objective` is what the
+/// arithmetic can resolve in the value: a step, a trial or a noise floor that
+/// asks whether a change in the objective is real reads it. `tolerance` is the
+/// verdict's bar, the decrease a certified point may still leave, which a caller
+/// may set from its own standard (a statistical resolution, say). It is never
+/// below what the arithmetic resolves. A caller with no standard of its own sets
+/// `tolerance = objective`, and the verdict is then the rounding-band verdict.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecrementBands {
     /// Rounding band of the objective value at the point being certified.
     pub objective: f64,
+    /// The decrease the verdict may leave to the minimum: it certifies iff
+    /// `λ̂² + band_λ² ≤ tolerance`.
+    pub tolerance: f64,
     /// Rounding band of each gradient component, over the full dimension.
     pub gradient: Array1<f64>,
     /// Spectral-norm rounding band of the Hessian's own formation. The
@@ -2581,8 +2597,10 @@ pub struct DecrementEvidence {
     pub lambda_sq: f64,
     /// Propagated rounding band of `lambda_sq`.
     pub band_lambda_sq: f64,
-    /// The objective's rounding band.
+    /// The objective's rounding band ([`DecrementBands::objective`]).
     pub band_f: f64,
+    /// The verdict's bar ([`DecrementBands::tolerance`]).
+    pub tolerance: f64,
     /// Free directions with curvature above `curvature_resolution`.
     pub retained: usize,
     /// Free directions with curvature within `curvature_resolution` of zero.
@@ -2595,13 +2613,13 @@ pub struct DecrementEvidence {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum DecrementVerdict {
-    /// `λ̂² + band_λ² ≤ band_f`: the objective decrease left to the minimum,
-    /// which `λ̂²` bounds, is within the objective's rounding band.
+    /// `λ̂² + band_λ² ≤ tolerance`: the objective decrease left to the minimum,
+    /// which `λ̂²` bounds, is within the verdict's tolerance.
     Certified(DecrementEvidence),
-    /// A Newton step still buys a decrease the arithmetic resolves.
+    /// The decrease left to the minimum is above the tolerance.
     DecrementAboveTolerance(DecrementEvidence),
-    /// The decrement's own rounding is as large as the objective band, or a
-    /// decided quantity is not finite, so the arithmetic cannot decide.
+    /// The decrement's own rounding is as large as the tolerance, or a decided
+    /// quantity is not finite, so the arithmetic cannot decide.
     DecrementUnresolved(DecrementEvidence),
     /// A free direction has curvature below `−curvature_resolution`: a genuine
     /// saddle. Curvature refuses only here.
@@ -2637,7 +2655,7 @@ impl DecrementVerdict {
 /// coordinates `active` leaves free.
 ///
 /// ```text
-/// certify iff λ̂² + band_λ² ≤ band_f,   λ̂² = Σ_{μ_i > r} c_i²/μ_i,   c = Wᵀ·g_F
+/// certify iff λ̂² + band_λ² ≤ tolerance,   λ̂² = Σ_{μ_i > r} c_i²/μ_i,   c = Wᵀ·g_F
 /// ```
 ///
 /// `W·diag(μ)·Wᵀ` is the spectrum of the symmetrized Hessian on the free
@@ -2649,8 +2667,9 @@ impl DecrementVerdict {
 /// Optimization*, (9.50)), and along an exponential tail `f∞ + a·e^(−x)` the
 /// decrement is the whole decrease left, `λ² = f − f∞`, twice what the model
 /// promises. Read off the spectrum rather than off a step, the verdict is
-/// affine-invariant and independent of the problem's size. The bar holds rounding bands only: any decrease the
-/// arithmetic resolves refuses.
+/// affine-invariant and independent of the problem's size. The bar is
+/// [`DecrementBands::tolerance`]; with `tolerance = objective` it holds rounding
+/// bands only, and any decrease the arithmetic resolves refuses.
 ///
 /// Coordinates railed at a bound belong in `active`. Their optimality is the
 /// sign of the projected gradient at the bound, which
@@ -2696,6 +2715,7 @@ mod newton_decrement_tests {
     fn bands(objective: f64, gradient: f64, hessian: f64) -> DecrementBands {
         DecrementBands {
             objective,
+            tolerance: objective,
             gradient: Array1::from_elem(3, gradient),
             hessian,
         }
@@ -2729,6 +2749,38 @@ mod newton_decrement_tests {
                 assert_eq!(evidence.flat, 0);
             }
             other => panic!("a resolvable decrease must refuse: {other:?}"),
+        }
+    }
+
+    /// The verdict's bar is `tolerance`, and the evidence reports it beside the
+    /// rounding band `band_f` as its own number (gam#3012): a caller that reads
+    /// `band_f` to judge whether a change in the objective is real gets the
+    /// rounding band, whatever tolerance the verdict was decided against.
+    #[test]
+    fn the_verdict_is_decided_against_its_tolerance_and_reports_the_rounding_band_apart() {
+        let q = rotation();
+        let eigenvalues = [1.0, 3.0, 10.0];
+        let hessian = spectral(&q, eigenvalues);
+        let inverse = spectral(&q, eigenvalues.map(|value| 1.0 / value));
+        let gradient = array![1e-3, -2e-3, 5e-4];
+        let lambda_sq = gradient.dot(&inverse.dot(&gradient));
+        let rounding = bands(1e-12, 1e-15, 1e-15);
+        let loose = DecrementBands {
+            tolerance: 2.0 * lambda_sq,
+            ..rounding.clone()
+        };
+        match newton_decrement_verdict(&hessian, &gradient, None, &rounding) {
+            DecrementVerdict::DecrementAboveTolerance(evidence) => {
+                assert_eq!(evidence.tolerance.to_bits(), evidence.band_f.to_bits());
+            }
+            other => panic!("a decrease above the rounding band must refuse: {other:?}"),
+        }
+        match newton_decrement_verdict(&hessian, &gradient, None, &loose) {
+            DecrementVerdict::Certified(evidence) => {
+                assert_eq!(evidence.band_f.to_bits(), 1e-12_f64.to_bits());
+                assert_eq!(evidence.tolerance.to_bits(), (2.0 * lambda_sq).to_bits());
+            }
+            other => panic!("a decrease inside the tolerance must certify: {other:?}"),
         }
     }
 
@@ -2837,7 +2889,10 @@ mod newton_decrement_tests {
         let gradient = array![1e-3, -2e-3, 5e-4];
         match newton_decrement_verdict(&hessian, &gradient, None, &bands(1e-12, 1.0, 1e-15)) {
             DecrementVerdict::DecrementUnresolved(evidence) => {
-                assert!(evidence.band_lambda_sq >= evidence.band_f, "{evidence:?}");
+                assert!(
+                    evidence.band_lambda_sq >= evidence.tolerance,
+                    "{evidence:?}"
+                );
             }
             other => panic!(
                 "a decrement whose rounding swamps the objective band must be unresolved: {other:?}"
@@ -4080,7 +4135,8 @@ pub enum StationarityNorm {
     LInf,
     /// Not a gradient norm: the Newton decrement against rounding bands
     /// ([`newton_decrement_verdict`]). `measured` is `λ̂² + band_λ²` and
-    /// `threshold` is `band_f`, both in the objective's own units.
+    /// `threshold` is the verdict's `tolerance`, both in the objective's own
+    /// units.
     NewtonDecrement,
 }
 
@@ -4220,7 +4276,7 @@ pub enum TerminationReason {
     /// The returned point's sample carried rounding bands
     /// ([`SecondOrderSample::decrement_bands`]) and
     /// [`newton_decrement_verdict`] certified the point on them:
-    /// `λ̂² + band_λ² ≤ band_f`, so no decrease the arithmetic resolves is left
+    /// `λ̂² + band_λ² ≤ tolerance`, so no decrease above the tolerance is left
     /// to the minimum. The gradient tolerance was not consulted.
     NewtonDecrementCertified {
         evidence: DecrementEvidence,
@@ -4339,7 +4395,7 @@ impl TerminationReason {
             ),
             Self::NewtonDecrementCertified { evidence, .. } => ev(
                 evidence.lambda_sq + evidence.band_lambda_sq,
-                evidence.band_f,
+                evidence.tolerance,
                 StationarityNorm::NewtonDecrement,
                 StationarityScaling::Absolute,
             ),
@@ -4515,8 +4571,8 @@ impl std::fmt::Display for TerminationReason {
             ),
             Self::NewtonDecrementCertified { evidence, .. } => write!(
                 f,
-                "(lambda^2={:.6e} + band_lambda^2={:.6e} <= band_f={:.6e})",
-                evidence.lambda_sq, evidence.band_lambda_sq, evidence.band_f,
+                "(lambda^2={:.6e} + band_lambda^2={:.6e} <= tolerance={:.6e}, band_f={:.6e})",
+                evidence.lambda_sq, evidence.band_lambda_sq, evidence.tolerance, evidence.band_f,
             ),
             Self::TrustRegionRejectFloor {
                 radius,
@@ -14466,6 +14522,7 @@ mod tests {
     fn uniform_bands(objective: f64, gradient: f64, hessian: f64) -> DecrementBands {
         DecrementBands {
             objective,
+            tolerance: objective,
             gradient: array![gradient],
             hessian,
         }
