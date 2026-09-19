@@ -5260,6 +5260,34 @@ pub trait OptimizerObserver: Send {
     fn on_iteration_start(&mut self, _info: &IterationInfo) {}
     fn on_step_accepted(&mut self, _info: &StepInfo) {}
     fn on_step_rejected(&mut self, _info: &StepInfo) {}
+    /// The objective refused the trial a step proposed: it raised a recoverable
+    /// error or returned a non-finite value, so no ratio test was taken. The
+    /// step's model decrease is known before the trial is evaluated, so
+    /// `predicted_decrease` is reported; `actual_decrease` is `NAN`. ARC and the
+    /// matrix-free trust region fire it once per refused evaluation.
+    fn on_trial_refused(&mut self, _info: &StepInfo) {}
+}
+
+/// Report a trial the objective refused ([`OptimizerObserver::on_trial_refused`]).
+fn notify_trial_refused(
+    observer: Option<&mut (dyn OptimizerObserver + 'static)>,
+    iter: usize,
+    step_norm: f64,
+    predicted_decrease: f64,
+    trust_radius: Option<f64>,
+    regularization: Option<f64>,
+) {
+    if let Some(obs) = observer {
+        obs.on_trial_refused(&StepInfo {
+            iter,
+            step_norm,
+            predicted_decrease,
+            actual_decrease: f64::NAN,
+            trust_radius,
+            regularization,
+            line_search_step: None,
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7689,6 +7717,14 @@ impl ArcCore {
             let (f_trial, g_trial, h_trial, b_trial) = match primary_sample {
                 Ok(sample) => sample,
                 Err(err) if err.is_recoverable() => {
+                    notify_trial_refused(
+                        self.observer.as_deref_mut(),
+                        k,
+                        candidate.step_norm,
+                        candidate.predicted_decrease,
+                        None,
+                        Some(self.sigma),
+                    );
                     // At negative curvature the cubic model has two opposing
                     // escape orientations.  Eigenvector sign is arbitrary, and
                     // one orientation can enter an objective-domain wall (for
@@ -7725,6 +7761,14 @@ impl ArcCore {
                     match antipodal_sample {
                         Ok(sample) => sample,
                         Err(err) if err.is_recoverable() => {
+                            notify_trial_refused(
+                                self.observer.as_deref_mut(),
+                                k,
+                                candidate.step_norm,
+                                candidate.predicted_decrease,
+                                None,
+                                Some(self.sigma),
+                            );
                             refuse_or_escalate!(
                                 "both the trial and its antipode raised recoverable objective errors"
                             );
@@ -11308,6 +11352,14 @@ impl MatrixFreeTrustRegionCore {
             let trial = match trial_eval {
                 Ok(t) => t,
                 Err(err) if err.is_recoverable() => {
+                    notify_trial_refused(
+                        self.observer.as_deref_mut(),
+                        k,
+                        s_feas_norm,
+                        predicted,
+                        Some(trust_radius),
+                        None,
+                    );
                     consecutive_rejections += 1;
                     trust_radius *= 0.5;
                     if trust_radius < self.trust_radius_min {
@@ -11342,6 +11394,14 @@ impl MatrixFreeTrustRegionCore {
             func_evals += 1;
             grad_evals += 1;
             if !trial.value.is_finite() || trial.gradient.iter().any(|v| !v.is_finite()) {
+                notify_trial_refused(
+                    self.observer.as_deref_mut(),
+                    k,
+                    s_feas_norm,
+                    predicted,
+                    Some(trust_radius),
+                    None,
+                );
                 consecutive_rejections += 1;
                 trust_radius *= 0.5;
                 if trust_radius < self.trust_radius_min {
@@ -18098,6 +18158,113 @@ mod tests {
             report.solution.iterations < max_iters,
             "must stop before exhausting the iteration budget: iters={}",
             report.solution.iterations
+        );
+    }
+
+    /// `½‖x − 1‖²` whose objective refuses every point past `x₀ = wall` with a
+    /// recoverable error, as a domain wall does.
+    struct WalledQuadratic {
+        wall: f64,
+    }
+    impl WalledQuadratic {
+        fn value(&self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+            if x[0] > self.wall {
+                return Err(ObjectiveEvalError::recoverable("past the wall"));
+            }
+            Ok(x.iter().map(|v| 0.5 * (v - 1.0) * (v - 1.0)).sum())
+        }
+    }
+    impl ZerothOrderObjective for WalledQuadratic {
+        fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+            self.value(x)
+        }
+    }
+    impl FirstOrderObjective for WalledQuadratic {
+        fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+            Ok(FirstOrderSample {
+                value: self.value(x)?,
+                gradient: x - 1.0,
+            })
+        }
+    }
+    impl SecondOrderObjective for WalledQuadratic {
+        fn eval_hessian(
+            &mut self,
+            x: &Array1<f64>,
+        ) -> Result<SecondOrderSample, ObjectiveEvalError> {
+            Ok(SecondOrderSample {
+                value: self.value(x)?,
+                gradient: x - 1.0,
+                hessian: Some(Array2::eye(x.len())),
+                decrement_bands: None,
+            })
+        }
+    }
+    impl OperatorObjective for WalledQuadratic {
+        fn eval_value_grad_op(
+            &mut self,
+            x: &Array1<f64>,
+        ) -> Result<OperatorSample, ObjectiveEvalError> {
+            Ok(OperatorSample {
+                value: self.value(x)?,
+                gradient: x - 1.0,
+                hessian: HessianValue::Dense(Array2::eye(x.len())),
+            })
+        }
+    }
+
+    /// Records every refused trial a solver reports.
+    struct RefusalLog(std::sync::Arc<std::sync::Mutex<Vec<StepInfo>>>);
+    impl OptimizerObserver for RefusalLog {
+        fn on_trial_refused(&mut self, info: &StepInfo) {
+            self.0.lock().expect("refusal log").push(info.clone());
+        }
+    }
+
+    /// ARC and the matrix-free trust region report each trial the objective
+    /// refused, with the decrease the step's model predicted, which a caller can
+    /// judge against its own resolution without a value at the trial. The
+    /// optimum `x = 1` lies past a wall at `x₀ = 0.5`, so the first model step
+    /// from `(−2, −2)` is refused, and every report must carry that step's
+    /// positive, finite model decrease and no measured one.
+    #[test]
+    fn trust_region_solvers_report_each_refused_trial_with_its_model_decrease() {
+        let arc_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut arc = super::Arc::new(array![-2.0, -2.0], WalledQuadratic { wall: 0.5 })
+            .with_max_iterations(MaxIterations::new(30).unwrap())
+            .with_observer(RefusalLog(std::sync::Arc::clone(&arc_log)));
+        let _arc_outcome = arc.run();
+        let tr_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tr = MatrixFreeTrustRegion::new(array![-2.0, -2.0], WalledQuadratic { wall: 0.5 })
+            .with_max_iterations(MaxIterations::new(30).unwrap())
+            .with_initial_trust_radius(10.0)
+            .with_observer(RefusalLog(std::sync::Arc::clone(&tr_log)));
+        let _tr_outcome = tr.run();
+        for (solver, log) in [("ARC", &arc_log), ("MatrixFreeTR", &tr_log)] {
+            let log = log.lock().expect("refusal log");
+            assert!(!log.is_empty(), "{solver} reported no refused trial");
+            for info in log.iter() {
+                assert!(
+                    info.predicted_decrease.is_finite() && info.predicted_decrease > 0.0,
+                    "{solver} refused trial must carry its step's model decrease: {info:?}"
+                );
+                assert!(info.actual_decrease.is_nan(), "{solver}: {info:?}");
+                assert!(info.step_norm > 0.0, "{solver}: {info:?}");
+            }
+        }
+        assert!(
+            arc_log
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|info| info.regularization.is_some())
+        );
+        assert!(
+            tr_log
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|info| info.trust_radius.is_some())
         );
     }
 
