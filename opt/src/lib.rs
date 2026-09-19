@@ -2541,7 +2541,7 @@ impl ReducedSymmetricSpectrum {
                 evidence,
             };
         }
-        if 0.5 * lambda_sq + band_lambda_sq <= bands.objective {
+        if lambda_sq + band_lambda_sq <= bands.objective {
             DecrementVerdict::Certified(evidence)
         } else if band_lambda_sq >= bands.objective {
             DecrementVerdict::DecrementUnresolved(evidence)
@@ -2594,8 +2594,8 @@ pub struct DecrementEvidence {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum DecrementVerdict {
-    /// `½·λ̂² + band_λ² ≤ band_f`: the objective decrease a Newton step would
-    /// still buy is within the objective's rounding band.
+    /// `λ̂² + band_λ² ≤ band_f`: the objective decrease left to the minimum,
+    /// which `λ̂²` bounds, is within the objective's rounding band.
     Certified(DecrementEvidence),
     /// A Newton step still buys a decrease the arithmetic resolves.
     DecrementAboveTolerance(DecrementEvidence),
@@ -2636,15 +2636,19 @@ impl DecrementVerdict {
 /// coordinates `active` leaves free.
 ///
 /// ```text
-/// certify iff ½·λ̂² + band_λ² ≤ band_f,   λ̂² = Σ_{μ_i > r} c_i²/μ_i,   c = Wᵀ·g_F
+/// certify iff λ̂² + band_λ² ≤ band_f,   λ̂² = Σ_{μ_i > r} c_i²/μ_i,   c = Wᵀ·g_F
 /// ```
 ///
 /// `W·diag(μ)·Wᵀ` is the spectrum of the symmetrized Hessian on the free
 /// coordinates, and `r` its curvature resolution: the Hessian formation band
-/// plus the eigensolver's backward error. The decrement is the objective
-/// decrease a Newton step would still buy, read off the spectrum rather than
-/// off a step, so the verdict is affine-invariant and independent of the
-/// problem's size. The bar holds rounding bands only: any decrease the
+/// plus the eigensolver's backward error. The bar is on `λ̂²`, not on the
+/// quadratic model's decrease `½λ̂²`, because `λ̂²` is what bounds the decrease
+/// left to the minimum where the model is not exact: `f(x) − f* ≤ λ²` for a
+/// self-concordant `f` once `λ ≤ 0.68` (Boyd & Vandenberghe, *Convex
+/// Optimization*, (9.50)), and along an exponential tail `f∞ + a·e^(−x)` the
+/// decrement is the whole decrease left, `λ² = f − f∞`, twice what the model
+/// promises. Read off the spectrum rather than off a step, the verdict is
+/// affine-invariant and independent of the problem's size. The bar holds rounding bands only: any decrease the
 /// arithmetic resolves refuses.
 ///
 /// Coordinates railed at a bound belong in `active`. Their optimality is the
@@ -4073,7 +4077,7 @@ pub enum StationarityNorm {
     /// Maximum-absolute-component norm of the (bound-projected) gradient.
     LInf,
     /// Not a gradient norm: the Newton decrement against rounding bands
-    /// ([`newton_decrement_verdict`]). `measured` is `½λ̂² + band_λ²` and
+    /// ([`newton_decrement_verdict`]). `measured` is `λ̂² + band_λ²` and
     /// `threshold` is `band_f`, both in the objective's own units.
     NewtonDecrement,
 }
@@ -4214,8 +4218,8 @@ pub enum TerminationReason {
     /// The returned point's sample carried rounding bands
     /// ([`SecondOrderSample::decrement_bands`]) and
     /// [`newton_decrement_verdict`] certified the point on them:
-    /// `½λ̂² + band_λ² ≤ band_f`, so no Newton step the arithmetic resolves
-    /// lowers the objective. The gradient tolerance was not consulted.
+    /// `λ̂² + band_λ² ≤ band_f`, so no decrease the arithmetic resolves is left
+    /// to the minimum. The gradient tolerance was not consulted.
     NewtonDecrementCertified {
         evidence: DecrementEvidence,
         grad_norm: f64,
@@ -4332,7 +4336,7 @@ impl TerminationReason {
                 StationarityScaling::Absolute,
             ),
             Self::NewtonDecrementCertified { evidence, .. } => ev(
-                0.5 * evidence.lambda_sq + evidence.band_lambda_sq,
+                evidence.lambda_sq + evidence.band_lambda_sq,
                 evidence.band_f,
                 StationarityNorm::NewtonDecrement,
                 StationarityScaling::Absolute,
@@ -4509,10 +4513,8 @@ impl std::fmt::Display for TerminationReason {
             ),
             Self::NewtonDecrementCertified { evidence, .. } => write!(
                 f,
-                "(1/2 lambda^2={:.6e} + band_lambda^2={:.6e} <= band_f={:.6e})",
-                0.5 * evidence.lambda_sq,
-                evidence.band_lambda_sq,
-                evidence.band_f,
+                "(lambda^2={:.6e} + band_lambda^2={:.6e} <= band_f={:.6e})",
+                evidence.lambda_sq, evidence.band_lambda_sq, evidence.band_f,
             ),
             Self::TrustRegionRejectFloor {
                 radius,
@@ -14408,10 +14410,10 @@ mod tests {
     }
 
     /// `V = ½x²` from `x₀ = 1e-3` with the scalar tolerance `1`: the gradient
-    /// tolerance accepts the seed, while the Newton step still buys
-    /// `½λ̂² = 5e-7` against `band_f = 1e-12`. With bands supplied ARC steps on
-    /// and stops only where the verdict certifies, which bounds `|x|` by
-    /// `√(2·band_f)`. The same objective without bands is today's exit: the
+    /// tolerance accepts the seed, while the decrease left to the minimum is
+    /// `λ̂² = x₀² = 1e-6` against `band_f = 1e-12`. With bands supplied ARC steps
+    /// on and stops only where the verdict certifies, which bounds `|x|` by
+    /// `√band_f`. The same objective without bands is today's exit: the
     /// seed, at iteration 0.
     #[test]
     fn arc_stops_on_the_decrement_verdict_where_the_objective_supplies_bands() {
@@ -14459,8 +14461,8 @@ mod tests {
             );
         };
         assert!(solution.iterations > 0);
-        assert!(0.5 * evidence.lambda_sq + evidence.band_lambda_sq <= evidence.band_f);
-        assert!(solution.final_point[0].abs() <= (2.0 * band_f).sqrt());
+        assert!(evidence.lambda_sq + evidence.band_lambda_sq <= evidence.band_f);
+        assert!(solution.final_point[0].abs() <= band_f.sqrt());
         let reported = solution
             .termination
             .stationarity_evidence()
@@ -14471,8 +14473,8 @@ mod tests {
 
     /// At `x₀ = 1e-3` with `δg = 1e-7` and `band_f = 1e-10` the decrement's own
     /// rounding `band_λ² ≈ 2·|g|·δg = 2e-10` reaches `band_f`, so the verdict is
-    /// `DecrementUnresolved`, while `½λ̂² − band_λ² ≈ 5e-7` is a decrease the
-    /// arithmetic resolves. That point is not stationary: ARC continues and
+    /// `DecrementUnresolved`, while `λ̂² − band_λ² ≈ 1e-6` is a decrease left to
+    /// the minimum that the arithmetic resolves. That point is not stationary: ARC continues and
     /// stops where the verdict certifies.
     #[test]
     fn arc_continues_past_an_unresolved_decrement_that_still_buys_a_resolvable_decrease() {
@@ -14484,7 +14486,7 @@ mod tests {
             panic!("the seed verdict must be undecidable; got {seed_verdict:?}");
         };
         assert!(
-            0.5 * seed.lambda_sq - seed.band_lambda_sq > seed.band_f,
+            seed.lambda_sq - seed.band_lambda_sq > seed.band_f,
             "control: the seed still buys a resolvable decrease: {seed:?}"
         );
 
@@ -14652,8 +14654,8 @@ mod tests {
             );
         };
         assert!(solution.iterations > 0);
-        assert!(0.5 * evidence.lambda_sq + evidence.band_lambda_sq <= evidence.band_f);
-        assert!(solution.final_point[0].abs() <= (2.0 * band_f).sqrt());
+        assert!(evidence.lambda_sq + evidence.band_lambda_sq <= evidence.band_f);
+        assert!(solution.final_point[0].abs() <= band_f.sqrt());
     }
 
     #[test]
