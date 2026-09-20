@@ -626,12 +626,10 @@ mod psd_trust_region_tests {
 ///
 /// The four `Accepted`-family variants (`GrowAtBoundary`, `HoldInside`,
 /// `HoldModerate`, `ShrinkOnMarginalAccept`) all correspond to accepted
-/// steps; the remaining two to rejected ones. Two orthogonal signals —
-/// whether the realized reduction was within the objective's round-off
-/// noise floor, and whether the model's predicted reduction was
-/// non-positive — are reported as booleans on [`TrustRegionStep`] rather
-/// than stealing a decision label, so the classification above stays a
-/// faithful superset of every consumer's existing telemetry.
+/// steps; the remaining two to rejected ones. Whether the model's
+/// predicted reduction was non-positive is an orthogonal signal, reported
+/// as a boolean on [`TrustRegionStep`] rather than stealing a decision
+/// label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrustRegionDecision {
     /// `rho > eta_expand` AND the step reached the region boundary — the
@@ -686,10 +684,10 @@ impl TrustRegionDecision {
 /// Outcome of a single [`TrustRegionPolicy::update`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrustRegionStep {
-    /// The ratio `actual_reduction / predicted_reduction` used to drive
-    /// the update. `1.0` when the realized reduction was within the
-    /// noise floor (a numerically neutral step) and `f64::NEG_INFINITY`
-    /// when the predicted reduction was not finite-positive.
+    /// The noise-tolerant ratio
+    /// `(actual + r·ε_f) / (predicted + r·ε_f)` used to drive the update
+    /// (see [`TrustRegionPolicy`]), and `f64::NEG_INFINITY` when the
+    /// predicted reduction was not finite-positive.
     pub rho: f64,
     /// The radius to use on the next iteration, already clamped to
     /// `[min_radius, max_radius]`.
@@ -697,14 +695,10 @@ pub struct TrustRegionStep {
     /// Whether the trial step should be accepted (the caller keeps the
     /// trial iterate) or rejected (the caller restores the incumbent).
     pub accepted: bool,
-    /// `true` when `|actual_reduction|` was within the objective's
-    /// round-off noise floor, so `rho` was forced to `1.0` (neutral
-    /// step) rather than dividing two round-off-level quantities.
-    pub within_noise_floor: bool,
     /// `true` when the model's predicted reduction was not
-    /// finite-positive (above the noise floor), so no meaningful `rho`
-    /// could be formed. A caller that detects this pre-trial can shrink
-    /// and retry without evaluating a trial point at all.
+    /// finite-positive, so no ratio could be formed. A caller that
+    /// detects this pre-trial can shrink and retry without evaluating a
+    /// trial point at all.
     pub predicted_nonpositive: bool,
     /// The branch of the policy that fired.
     pub decision: TrustRegionDecision,
@@ -719,15 +713,34 @@ pub struct TrustRegionStep {
 /// its configuration and the per-step scalars — it holds no state, so a
 /// single policy value can drive many independent solves.
 ///
+/// # The noise-tolerant ratio
+///
+/// `objective_band = ε_f` bounds the error of each objective evaluation.
+/// The ratio is Sun and Nocedal's (2023, "A trust region method for the
+/// optimization of noisy functions", Algorithm 1):
+///
+/// ```text
+/// rho = (actual + r·ε_f) / (predicted + r·ε_f),   r = 2 / (1 − eta_expand).
+/// ```
+///
+/// The realized reduction is the difference of two evaluations, so its
+/// error is at most `2ε_f`. When the model is exact to within that error,
+/// `|rho − 1| ≤ 2ε_f / (predicted + r·ε_f) < 2/r = 1 − eta_expand`: the
+/// step is accepted and the radius is never shrunk for noise. That is the
+/// property the plain ratio lacks — at a radius whose predicted reduction
+/// is comparable to `ε_f`, `actual/predicted` is a ratio of noise to a
+/// promise and drives the radius down to its floor. `ε_f = 0` recovers
+/// the classical ratio `actual/predicted` exactly.
+///
 /// # Acceptance and radius rules
 ///
-/// Let `nf = |objective_scale|.max(1) * noise_floor_rel` be the round-off
-/// noise floor. Then:
-/// - `rho = 1` if `|actual_reduction| <= nf` (numerically neutral step);
-///   else `rho = actual/predicted` if `predicted` is finite and `> nf`;
-///   else `rho = -inf`.
-/// - The step is **accepted** iff `rho` is finite, `rho > eta_accept`,
-///   and `actual_reduction >= -nf`.
+/// - `rho = −inf` (and `predicted_nonpositive`) unless `predicted` is
+///   finite and positive.
+/// - The step is **accepted** iff `rho` is finite and `rho > eta_accept`.
+///   The theory requires `0 < eta_accept ≤ eta_shrink < eta_expand < 1`:
+///   with `eta_accept = 0` and `ε_f > 0`, a step that realized nothing
+///   against any prediction has `rho = rε_f/(predicted + rε_f) > 0` and
+///   would be accepted.
 /// - **Rejected** ⇒ radius `*= shrink_factor`, then (if
 ///   `rejection_step_cap_fraction = Some(f)`) `radius = min(radius,
 ///   f * step_norm)`.
@@ -743,21 +756,22 @@ pub struct TrustRegionStep {
 ///
 /// # Consumers
 ///
-/// [`classic`](TrustRegionPolicy::classic) reproduces a boundary-driven
-/// controller with an absolute noise floor of zero (`eta_accept = 0.1`,
-/// no rejection step cap): the caller passes the `hit_boundary` flag its
-/// subproblem solver reports. [`noise_aware`](TrustRegionPolicy::noise_aware)
-/// reproduces a controller with a relative round-off floor, a `0.5`
-/// rejection step cap, and `eta_accept = 0` (accept any real descent):
-/// the caller supplies `hit_boundary = step_norm >= 0.99 * radius`.
+/// [`classic`](TrustRegionPolicy::classic) is the boundary-driven
+/// controller with an exact objective (`ε_f = 0`, `eta_accept = 0.1`, no
+/// rejection step cap): the caller passes the `hit_boundary` flag its
+/// subproblem solver reports.
+/// [`noise_tolerant`](TrustRegionPolicy::noise_tolerant) takes the
+/// objective's evaluation band and adds a `0.5` rejection step cap; the
+/// caller supplies `hit_boundary = step_norm >= 0.99 * radius`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrustRegionPolicy {
-    /// Accept the step iff `rho > eta_accept` (and the reduction is not
-    /// worse than the noise floor). Typically in `[0, 0.25)`.
+    /// Accept the step iff `rho > eta_accept`. Must be positive when
+    /// `objective_band` is (see the type docs).
     pub eta_accept: f64,
     /// `rho` below this shrinks the radius even on an accepted step.
     pub eta_shrink: f64,
     /// `rho` above this expands the radius when the step hit the boundary.
+    /// It also sets the ratio's band weight `r = 2/(1 − eta_expand)`.
     pub eta_expand: f64,
     /// Multiplier applied to the radius on a shrink (`< 1`).
     pub shrink_factor: f64,
@@ -766,26 +780,20 @@ pub struct TrustRegionPolicy {
     /// Lower clamp on the radius, and the value a non-finite/non-positive
     /// radius collapses to.
     pub min_radius: f64,
-    /// Upper clamp on the radius (the advertised hard cap).
+    /// Upper clamp on the radius.
     pub max_radius: f64,
-    /// Relative round-off noise floor: the absolute floor is
-    /// `|objective_scale|.max(1) * noise_floor_rel`. `0.0` disables the
-    /// neutral-step guard entirely.
-    pub noise_floor_rel: f64,
+    /// Absolute bound `ε_f` on the error of one objective evaluation, in
+    /// the objective's units. `0.0` states an exact objective and gives
+    /// the classical ratio.
+    pub objective_band: f64,
     /// When `Some(f)`, a rejected step additionally caps the radius at
     /// `f * step_norm` so a re-proposal is constrained inside the region
     /// that was just rejected. `None` leaves the plain shrink.
     pub rejection_step_cap_fraction: Option<f64>,
 }
 
-impl Default for TrustRegionPolicy {
-    fn default() -> Self {
-        Self::noise_aware(1.0e-12, 1.0e6, 1.0e-14)
-    }
-}
-
 impl TrustRegionPolicy {
-    /// A boundary-driven controller with **no** round-off noise floor.
+    /// A boundary-driven controller for an exact objective (`ε_f = 0`).
     /// Accepts iff `rho > 0.1`; shrinks by `0.25` when `rho < 0.25`;
     /// expands by `2.0` when `rho > 0.75` and the step reached the
     /// boundary. `min_radius` is `0` (the caller owns any convergence
@@ -800,27 +808,28 @@ impl TrustRegionPolicy {
             expand_factor: 2.0,
             min_radius: 0.0,
             max_radius,
-            noise_floor_rel: 0.0,
+            objective_band: 0.0,
             rejection_step_cap_fraction: None,
         }
     }
 
-    /// A round-off-aware controller. Accepts any real descent
-    /// (`eta_accept = 0`) above the relative noise floor, shrinks by
-    /// `0.25` (rejections additionally capped at `0.5 * step_norm`),
-    /// expands by `2.0` at the boundary, and clamps the radius to
+    /// A controller for an objective whose every evaluation is accurate to
+    /// `objective_band` (absolute). The thresholds are
+    /// [`classic`](Self::classic)'s; the ratio carries the band (see the
+    /// type docs), rejections additionally cap the radius at
+    /// `0.5 * step_norm`, and the radius is clamped to
     /// `[min_radius, max_radius]`.
     #[must_use]
-    pub fn noise_aware(min_radius: f64, max_radius: f64, noise_floor_rel: f64) -> Self {
+    pub fn noise_tolerant(min_radius: f64, max_radius: f64, objective_band: f64) -> Self {
         Self {
-            eta_accept: 0.0,
+            eta_accept: 0.1,
             eta_shrink: 0.25,
             eta_expand: 0.75,
             shrink_factor: 0.25,
             expand_factor: 2.0,
             min_radius,
             max_radius,
-            noise_floor_rel,
+            objective_band,
             rejection_step_cap_fraction: Some(0.5),
         }
     }
@@ -855,6 +864,13 @@ impl TrustRegionPolicy {
         self
     }
 
+    /// Set the per-evaluation objective band `ε_f`.
+    #[must_use]
+    pub fn with_objective_band(mut self, objective_band: f64) -> Self {
+        self.objective_band = objective_band;
+        self
+    }
+
     /// Decide acceptance and the next radius for a proposed step.
     ///
     /// - `radius`: the current trust-region radius.
@@ -866,8 +882,6 @@ impl TrustRegionPolicy {
     /// - `actual_reduction`: `f(x) - f(x_trial)` (positive is descent).
     /// - `predicted_reduction`: the model's `m(0) - m(step)` (positive
     ///   for a descent model).
-    /// - `objective_scale`: a magnitude used to size the round-off noise
-    ///   floor (e.g. `|f(x)|`).
     #[must_use]
     pub fn update(
         &self,
@@ -876,52 +890,19 @@ impl TrustRegionPolicy {
         hit_boundary: bool,
         actual_reduction: f64,
         predicted_reduction: f64,
-        objective_scale: f64,
     ) -> TrustRegionStep {
-        let noise_floor = objective_scale.abs().max(1.0) * self.noise_floor_rel;
-        let predicted_finite_positive =
-            predicted_reduction.is_finite() && predicted_reduction > noise_floor;
-        // `noise_floor_rel = 0.0` is documented to disable this guard
-        // entirely, but `|actual| <= 0.0` is TRUE at exactly zero, so a
-        // step that changed the objective by precisely nothing was being
-        // promoted to a numerically-neutral ACCEPT with `rho = 1.0`. That
-        // is the opposite of what a zero floor is asked for, and it is
-        // reachable: a plateau, a saturated barrier, or any objective that
-        // returns a constant over a region all produce an exactly-zero
-        // reduction. Require a positive floor before the guard can fire.
-        //
-        // A step is numerically neutral only when NEITHER side of the ratio
-        // is resolvable: the objective did not move beyond its round-off
-        // floor AND the model did not promise more than that floor. When
-        // the model predicts a reduction the objective can resolve and the
-        // objective realizes none, that is not a plateau — it is the model
-        // being wrong at this radius — and the ratio (≈ 0) has to say so.
-        // Judging the realized change alone promoted exactly that case to
-        // `rho = 1`: a joint Newton whose quadratic model was built from a
-        // singular-information gradient kept proposing `|δ|∞ ≈ 4e-14` with
-        // `pred = 0.27`, realized nothing, and was told "accepted, grow"
-        // for forty cycles in a row.
-        let within_noise_floor = noise_floor > 0.0
-            && actual_reduction.abs() <= noise_floor
-            && predicted_reduction.abs() <= noise_floor;
-        let (rho, predicted_nonpositive) = if within_noise_floor {
-            // Realized change is at the round-off floor and so was the
-            // model's promise: the step neither helped nor hurt beyond
-            // noise, so treat it as a numerically neutral (converged) step
-            // with rho = 1 rather than dividing two round-off-level
-            // quantities.
-            (1.0, false)
-        } else if predicted_finite_positive {
-            (actual_reduction / predicted_reduction, false)
+        let predicted_nonpositive = !(predicted_reduction.is_finite() && predicted_reduction > 0.0);
+        let rho = if predicted_nonpositive {
+            f64::NEG_INFINITY
         } else {
-            (f64::NEG_INFINITY, true)
+            noise_tolerant_ratio(
+                actual_reduction,
+                predicted_reduction,
+                self.objective_band,
+                self.eta_expand,
+            )
         };
-        // Outside the neutral band an accepted step is a REAL descent: one the
-        // objective resolves above its own floor. A realized change inside
-        // the floor against a resolvable prediction is a ratio of noise to
-        // a promise, and `eta_accept = 0` must not read that as descent.
-        let accepted = within_noise_floor
-            || (rho.is_finite() && rho > self.eta_accept && actual_reduction > noise_floor);
+        let accepted = rho.is_finite() && rho > self.eta_accept;
 
         let mut new_radius = radius;
         let mut decision;
@@ -964,11 +945,34 @@ impl TrustRegionPolicy {
             rho,
             new_radius,
             accepted,
-            within_noise_floor,
             predicted_nonpositive,
             decision,
         }
     }
+}
+
+/// Sun and Nocedal's noise-tolerant reduction ratio
+/// `(actual + r·ε_f) / (predicted + r·ε_f)` with `r = 2/(1 − c₂)`, where
+/// `c₂ = very_successful` is the threshold above which a step counts as
+/// very successful and `ε_f = objective_band` bounds each evaluation's
+/// error. The realized reduction differs by at most `2ε_f` from the
+/// noise-free one, so an exact model gives `|rho − 1| < 1 − c₂`: a step is
+/// never judged unsuccessful for noise. `ε_f = 0` is the classical ratio.
+/// A non-finite or negative band is treated as zero, so a missing band
+/// never loosens the test.
+fn noise_tolerant_ratio(
+    actual_reduction: f64,
+    predicted_reduction: f64,
+    objective_band: f64,
+    very_successful: f64,
+) -> f64 {
+    let band = if objective_band.is_finite() && objective_band > 0.0 {
+        objective_band
+    } else {
+        0.0
+    };
+    let slack = 2.0 / (1.0 - very_successful) * band;
+    (actual_reduction + slack) / (predicted_reduction + slack)
 }
 
 // =====================================================================
@@ -6989,12 +6993,22 @@ impl NewtonTrustRegionCore {
             // being detected separately.
             //
             // The constants are this loop's own, stated explicitly rather
-            // than inherited from `classic`/`noise_aware`: routing the
+            // than inherited from `classic`/`noise_tolerant`: routing the
             // MECHANISM through the shared policy must not silently change
-            // the POLICY. `noise_aware` would additionally enable a
-            // round-off neutral-step guard and a rejection step cap that
-            // this solver has never had; both look like improvements and
-            // neither is landing without a measured A/B.
+            // the POLICY.
+            //
+            // The ratio carries the objective's evaluation band. A sample
+            // that states its rounding band bounds each value's error; the
+            // realized decrease is a difference of two such values, so it
+            // is judged against the larger of the incumbent's and the
+            // trial's bands. A sample without bands states an exact
+            // objective and the ratio is the classical one.
+            let objective_band = b_k
+                .as_ref()
+                .map(|bands| bands.objective)
+                .into_iter()
+                .chain(b_trial.as_ref().map(|bands| bands.objective))
+                .fold(0.0_f64, f64::max);
             let policy = TrustRegionPolicy {
                 eta_accept: self.eta_accept,
                 eta_shrink: 0.25,
@@ -7003,11 +7017,11 @@ impl NewtonTrustRegionCore {
                 expand_factor: 2.0,
                 min_radius: degenerate_trust_radius(&x_k),
                 max_radius: self.trust_radius_max.max(1.0),
-                noise_floor_rel: 0.0,
+                objective_band,
                 rejection_step_cap_fraction: None,
             };
             let hit_boundary = s_norm > 0.99 * trust_radius;
-            let step = policy.update(trust_radius, s_norm, hit_boundary, act_dec, pred_dec, f_k);
+            let step = policy.update(trust_radius, s_norm, hit_boundary, act_dec, pred_dec);
             trust_radius = step.new_radius;
             let accepted = step.accepted;
             if let Some(obs) = self.observer.as_mut() {
@@ -7961,29 +7975,45 @@ impl ArcCore {
             // See `ARC_NUMERICAL_CONV_FACTOR` for the full rationale. A sample
             // that carries rounding bands states the objective's own
             // resolution, and that band is the floor instead.
+            //
+            // A banded sample is certified by `λ̂² + band_λ² ≤ tolerance`,
+            // while the cubic model promises only about `½λ̂²`. An iterate
+            // with `½λ̂² ≤ band_f < λ̂²` is therefore below the model's floor
+            // yet one step from a certificate. Stopping before that step is
+            // evaluated reports an uncertified `ModelNoiseFloor` at a point
+            // whose next sample would certify, so a banded run evaluates the
+            // trial first: its own stationarity exit below returns it when it
+            // certifies, and the floor is reported only when it does not.
+            // Without bands there is no certificate to reach, and the floor
+            // stops the run before the evaluation as before.
             let noise_floor = match b_k.as_ref() {
                 Some(bands) => bands.objective,
                 None => ARC_NUMERICAL_CONV_FACTOR * (1.0 + f_k.abs()) * f64::EPSILON,
             };
-            if candidate.predicted_decrease <= noise_floor
-                && reduced_hessian_is_positive_semidefinite(h_model, Some(&active))
-            {
-                return Ok(Solution::gradient_based(
-                    x_k,
-                    f_k,
-                    g_k,
-                    g_norm,
-                    Some(h_k),
-                    k,
-                    func_evals,
-                    grad_evals,
-                    hess_evals,
-                    TerminationReason::ModelNoiseFloor {
-                        predicted_decrease: candidate.predicted_decrease,
-                        noise_floor,
-                        grad_norm: g_norm,
-                    },
-                ));
+            let below_noise_floor = candidate.predicted_decrease <= noise_floor
+                && reduced_hessian_is_positive_semidefinite(h_model, Some(&active));
+            macro_rules! model_noise_floor {
+                ($predicted_decrease:expr) => {{
+                    return Ok(Solution::gradient_based(
+                        x_k,
+                        f_k,
+                        g_k,
+                        g_norm,
+                        Some(h_k),
+                        k,
+                        func_evals,
+                        grad_evals,
+                        hess_evals,
+                        TerminationReason::ModelNoiseFloor {
+                            predicted_decrease: $predicted_decrease,
+                            noise_floor,
+                            grad_norm: g_norm,
+                        },
+                    ));
+                }};
+            }
+            if below_noise_floor && b_k.is_none() {
+                model_noise_floor!(candidate.predicted_decrease);
             }
 
             let primary_sample = oracle.eval_cost_grad_hessian(
@@ -8004,6 +8034,11 @@ impl ArcCore {
                         None,
                         Some(self.sigma),
                     );
+                    // A step below the floor that the objective refuses is
+                    // the floor verdict the unbanded path reports unevaluated.
+                    if below_noise_floor {
+                        model_noise_floor!(candidate.predicted_decrease);
+                    }
                     // At negative curvature the cubic model has two opposing
                     // escape orientations.  Eigenvector sign is arbitrary, and
                     // one orientation can enter an objective-domain wall (for
@@ -8105,7 +8140,23 @@ impl ArcCore {
                     termination,
                 ));
             }
-            let rho = (f_k - f_trial) / denom;
+            // The trial did not certify and the model promised no more than
+            // the objective resolves: the incumbent is the floor verdict.
+            if below_noise_floor {
+                model_noise_floor!(denom);
+            }
+            // Sun–Nocedal noise-tolerant ratio, with the very-successful
+            // threshold `eta2` as the `c₂` that sets its band weight (see
+            // `noise_tolerant_ratio`). The band is the larger of the
+            // incumbent's and the trial's stated objective bands; samples
+            // without bands state an exact objective.
+            let objective_band = b_k
+                .as_ref()
+                .map(|bands| bands.objective)
+                .into_iter()
+                .chain(b_trial.as_ref().map(|bands| bands.objective))
+                .fold(0.0_f64, f64::max);
+            let rho = noise_tolerant_ratio(f_k - f_trial, denom, objective_band, self.eta2);
             model_failure_streak = 0;
             // ARC accept/reject decision:
             // accept trial point iff rho >= eta1.
@@ -15243,6 +15294,128 @@ mod tests {
         assert!(solution.final_point[0].abs() <= band_f.sqrt());
     }
 
+    /// `V = ½x²` evaluated with an error of `band_f` in each value: `+band_f`
+    /// inside `|x| < edge`, `−band_f` outside. The gradient and Hessian are
+    /// exact. Every step that crosses into the basin realizes `2·band_f` less
+    /// than the noise-free decrease, while the stopping verdict needs
+    /// `λ̂² = x² ≤ band_f`.
+    fn basin_offset_quadratic(
+        band_f: f64,
+        edge: f64,
+    ) -> impl FnMut(&Array1<f64>) -> (f64, Array1<f64>, Array2<f64>) {
+        move |x: &Array1<f64>| {
+            let error = if x[0].abs() < edge { band_f } else { -band_f };
+            (0.5 * x[0] * x[0] + error, array![x[0]], array![[1.0]])
+        }
+    }
+
+    /// The Newton trust region judges a step against the objective's stated
+    /// band (Sun–Nocedal). With `edge = √(2·band_f)` and `x₀ = 1.2·edge` the
+    /// whole noise-free decrease is `½x₀² = 1.44·band_f`, so a step into the
+    /// basin realizes less than nothing. That shortfall is noise, not model
+    /// failure: the step is accepted and the solve certifies inside the
+    /// basin. The classical ratio read the same step as
+    /// `ρ = (1.44 − 2)/1.44 < 0`, shrank the radius onto the basin's edge, and
+    /// ended in `TrustRegionRejectFloor` at `x = edge`, where `λ̂² = 2·band_f`
+    /// is not certifiable.
+    #[test]
+    fn newton_trust_region_accepts_a_step_whose_shortfall_is_within_the_objective_band() {
+        let band_f: f64 = 1.0e-10;
+        let edge = (2.0 * band_f).sqrt();
+        let x0 = 1.2 * edge;
+        let solution = NewtonTrustRegion::new(
+            array![x0],
+            BandedSecondOrder {
+                inner: basin_offset_quadratic(band_f, edge),
+                bands: Some(uniform_bands(band_f, 1.0e-18, 1.0e-15)),
+            },
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1.0))
+        .with_max_iterations(iters(50))
+        .run()
+        .expect("a step whose shortfall is within the band must be accepted");
+        let TerminationReason::NewtonDecrementCertified { evidence, .. } = solution.termination
+        else {
+            panic!(
+                "expected a certified decrement; got {}",
+                solution.termination
+            );
+        };
+        assert!(evidence.lambda_sq + evidence.band_lambda_sq <= evidence.band_f);
+        assert!(solution.final_point[0].abs() <= band_f.sqrt());
+    }
+
+    /// ARC carries the same band in its ratio, weighted by its
+    /// very-successful threshold `eta2 = 0.9` (`r = 20`). In units of
+    /// `√band_f`: from `x₀ = 2.5` with `sigma₀ = 4`, the cubic step lands at
+    /// `x ≈ 1.82`, inside the basin (`edge = 2.25`) but not certifiable
+    /// (`x² > 1`), predicting `≈ 1.05·band_f` and realizing `≈ −0.54·band_f`.
+    /// The classical ratio `≈ −0.51` rejected it and escalated `sigma`; the
+    /// noise-tolerant one is `≈ 0.92`, a very successful step.
+    #[test]
+    fn arc_accepts_a_step_whose_shortfall_is_within_the_objective_band() {
+        let band_f: f64 = 1.0e-10;
+        let unit = band_f.sqrt();
+        let x0 = 2.5 * unit;
+        let solution = super::Arc::new(
+            array![x0],
+            BandedSecondOrder {
+                inner: basin_offset_quadratic(band_f, 2.25 * unit),
+                bands: Some(uniform_bands(band_f, 1.0e-18, 1.0e-15)),
+            },
+        )
+        .with_initial_regularization(4.0 / unit)
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1.0))
+        .with_max_iterations(iters(50))
+        .run()
+        .expect("a step whose shortfall is within the band must be accepted");
+        let TerminationReason::NewtonDecrementCertified { evidence, .. } = solution.termination
+        else {
+            panic!(
+                "expected a certified decrement; got {}",
+                solution.termination
+            );
+        };
+        assert!(evidence.lambda_sq + evidence.band_lambda_sq <= evidence.band_f);
+        assert!(solution.final_point[0].abs() <= band_f.sqrt());
+    }
+
+    /// `V = ½x²` from `x₀ = √(1.5·band_f)`: the seed's decrement
+    /// `λ̂² = x₀² = 1.5·band_f` does not certify, and the cubic model promises
+    /// `≈ ½λ̂² = 0.75·band_f`, below the objective's band. One Newton step
+    /// lands at the minimum, where the verdict certifies. ARC used to stop at
+    /// the seed with an uncertified `ModelNoiseFloor` before evaluating that
+    /// step; a banded run evaluates it and returns the certified trial.
+    #[test]
+    fn arc_certifies_the_trial_when_the_model_decrease_is_below_the_noise_floor() {
+        let band_f: f64 = 1.0e-12;
+        let x0 = (1.5 * band_f).sqrt();
+        let solution = super::Arc::new(
+            array![x0],
+            BandedSecondOrder {
+                inner: unit_quadratic,
+                bands: Some(uniform_bands(band_f, 1.0e-18, 1.0e-18)),
+            },
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1.0))
+        .with_max_iterations(iters(50))
+        .run()
+        .expect("the trial one Newton step away certifies");
+        let TerminationReason::NewtonDecrementCertified { evidence, .. } = solution.termination
+        else {
+            panic!(
+                "expected a certified decrement at the trial; got {}",
+                solution.termination
+            );
+        };
+        assert_eq!(solution.iterations, 1);
+        assert!(evidence.lambda_sq + evidence.band_lambda_sq <= evidence.band_f);
+        assert!(solution.final_point[0].abs() <= band_f.sqrt());
+    }
+
     #[test]
     fn bfgs_local_mode_forces_strict_search_policy() {
         let mut core = super::BfgsCore::new(array![0.0, 0.0]);
@@ -19332,26 +19505,26 @@ mod added_primitive_tests {
     fn classic_policy_accepts_shrinks_and_expands() {
         let p = TrustRegionPolicy::classic(10.0);
         // rho ~ 0.05 (< eta_accept=0.1): rejected, shrink x0.25.
-        let s = p.update(1.0, 1.0, true, 0.05, 1.0, 1.0);
+        let s = p.update(1.0, 1.0, true, 0.05, 1.0);
         assert!(!s.accepted);
         assert_eq!(s.decision, TrustRegionDecision::ShrinkOnRejection);
         assert!((s.new_radius - 0.25).abs() < 1e-12);
         // rho ~ 0.15 (accept, but < eta_shrink=0.25): accepted + shrink.
-        let s = p.update(1.0, 1.0, true, 0.15, 1.0, 1.0);
+        let s = p.update(1.0, 1.0, true, 0.15, 1.0);
         assert!(s.accepted);
         assert_eq!(s.decision, TrustRegionDecision::ShrinkOnMarginalAccept);
         assert!((s.new_radius - 0.25).abs() < 1e-12);
         // rho ~ 0.5 (moderate): hold.
-        let s = p.update(2.0, 1.0, true, 0.5, 1.0, 1.0);
+        let s = p.update(2.0, 1.0, true, 0.5, 1.0);
         assert!(s.accepted);
         assert_eq!(s.decision, TrustRegionDecision::HoldModerate);
         assert!((s.new_radius - 2.0).abs() < 1e-12);
         // rho ~ 0.9 at boundary: expand x2 capped at max.
-        let s = p.update(2.0, 1.0, true, 0.9, 1.0, 1.0);
+        let s = p.update(2.0, 1.0, true, 0.9, 1.0);
         assert_eq!(s.decision, TrustRegionDecision::GrowAtBoundary);
         assert!((s.new_radius - 4.0).abs() < 1e-12);
         // rho ~ 0.9 inside: hold.
-        let s = p.update(2.0, 1.0, false, 0.9, 1.0, 1.0);
+        let s = p.update(2.0, 1.0, false, 0.9, 1.0);
         assert_eq!(s.decision, TrustRegionDecision::HoldInside);
         assert!((s.new_radius - 2.0).abs() < 1e-12);
     }
@@ -19359,7 +19532,7 @@ mod added_primitive_tests {
     #[test]
     fn classic_policy_expansion_respects_max_radius() {
         let p = TrustRegionPolicy::classic(3.0);
-        let s = p.update(2.0, 1.0, true, 0.9, 1.0, 1.0);
+        let s = p.update(2.0, 1.0, true, 0.9, 1.0);
         assert_eq!(s.decision, TrustRegionDecision::GrowAtBoundary);
         assert!((s.new_radius - 3.0).abs() < 1e-12, "capped at max_radius");
     }
@@ -19367,7 +19540,7 @@ mod added_primitive_tests {
     #[test]
     fn classic_policy_nonpositive_prediction_rejects() {
         let p = TrustRegionPolicy::classic(10.0);
-        let s = p.update(1.0, 1.0, true, 0.5, 0.0, 1.0);
+        let s = p.update(1.0, 1.0, true, 0.5, 0.0);
         assert!(!s.accepted);
         assert!(s.predicted_nonpositive);
         assert_eq!(s.rho, f64::NEG_INFINITY);
@@ -19375,33 +19548,23 @@ mod added_primitive_tests {
     }
 
     #[test]
-    fn noise_aware_neutral_step_is_accepted_with_unit_rho() {
-        // objective_scale=1e6 => noise_floor = 1e6 * 1e-14 = 1e-8.
-        let p = TrustRegionPolicy::noise_aware(1e-12, 1e6, 1e-14);
-        let s = p.update(1.0, 1.0, false, 1e-10, 1e-10, 1e6);
-        assert!(s.within_noise_floor);
-        assert_eq!(s.rho, 1.0);
-        assert!(s.accepted);
-    }
-
-    #[test]
-    fn noise_aware_rejection_caps_radius_to_half_step() {
-        let p = TrustRegionPolicy::noise_aware(1e-12, 1e6, 1e-14);
-        // Rejected (negative reduction well below the noise floor), step_norm=1.0.
+    fn noise_tolerant_rejection_caps_radius_to_half_step() {
+        let p = TrustRegionPolicy::noise_tolerant(1e-12, 1e6, 1e-14);
+        // Rejected (an ascent far beyond the band), step_norm=1.0.
         // radius*0.25 = 0.25, but capped at 0.5*step_norm = 0.5 -> min = 0.25.
-        let s = p.update(1.0, 1.0, false, -0.5, 1.0, 1.0);
+        let s = p.update(1.0, 1.0, false, -0.5, 1.0);
         assert!(!s.accepted);
         assert!((s.new_radius - 0.25).abs() < 1e-12);
         // With a large radius, the 0.5*step cap binds instead of the x0.25 shrink.
-        let s = p.update(100.0, 1.0, false, -0.5, 1.0, 1.0);
+        let s = p.update(100.0, 1.0, false, -0.5, 1.0);
         assert!((s.new_radius - 0.5).abs() < 1e-12);
     }
 
     #[test]
-    fn noise_aware_reject_floor_promotion() {
-        let p = TrustRegionPolicy::noise_aware(1e-12, 1e6, 1e-14);
+    fn noise_tolerant_reject_floor_promotion() {
+        let p = TrustRegionPolicy::noise_tolerant(1e-12, 1e6, 1e-14);
         // Start near the floor; a rejection shrink lands at min_radius -> RejectFloor.
-        let s = p.update(1e-12, 0.0, false, -1.0, 1.0, 1.0);
+        let s = p.update(1e-12, 0.0, false, -1.0, 1.0);
         assert_eq!(s.decision, TrustRegionDecision::RejectFloor);
         assert!((s.new_radius - 1e-12).abs() <= 1e-24);
     }
@@ -20414,71 +20577,115 @@ mod termination_provenance_tests {
 }
 
 #[cfg(test)]
-mod trust_region_policy_noise_floor_tests {
+mod trust_region_policy_noise_band_tests {
     use super::*;
 
-    /// `noise_floor_rel = 0.0` is documented to disable the neutral-step
-    /// guard entirely. It has to hold at EXACTLY zero reduction, which is
-    /// the only place a zero floor and a positive one can disagree — and
-    /// exactly-zero is reachable, not exotic: a plateau, a saturated
-    /// barrier, or any objective constant over a region produces it.
-    ///
-    /// Before this was pinned, a step that changed the objective by
-    /// precisely nothing was promoted to `rho = 1.0` and ACCEPTED, so a
-    /// trust region on a flat patch walked instead of shrinking.
+    /// With `ε_f = 0` the ratio is the classical `actual/predicted`, bit for
+    /// bit, and a step that changed the objective by exactly nothing is a
+    /// zero ratio: rejected, and the region shrinks.
     #[test]
-    fn a_zero_noise_floor_does_not_accept_an_exactly_neutral_step() {
+    fn a_zero_band_is_the_classical_ratio() {
         let policy = TrustRegionPolicy::classic(10.0);
-        assert_eq!(policy.noise_floor_rel, 0.0);
-        let step = policy.update(1.0, 1.0, false, 0.0, 1.0, 1.0);
-        assert!(
-            !step.within_noise_floor,
-            "a zero floor must disable the guard, not fire at exactly zero"
-        );
-        assert_eq!(step.rho, 0.0, "rho is the honest 0/1, not a neutral 1.0");
+        assert_eq!(policy.objective_band, 0.0);
+        for (actual, predicted) in [(0.05, 1.0), (0.3, 0.7), (-2.0, 3.0), (1.0e-300, 1.0e-290)] {
+            let step = policy.update(1.0, 1.0, false, actual, predicted);
+            assert_eq!(step.rho.to_bits(), (actual / predicted).to_bits());
+        }
+        let step = policy.update(1.0, 1.0, false, 0.0, 1.0);
+        assert_eq!(step.rho, 0.0);
         assert!(!step.accepted, "no reduction is not an acceptable step");
         assert!(step.new_radius < 1.0, "and the region must shrink");
     }
 
-    /// The guard still does its job when a floor is actually configured:
-    /// a reduction below the floor is round-off, not information, and
-    /// dividing two round-off-scale quantities to form `rho` is what the
-    /// guard exists to avoid.
+    /// Sun–Nocedal's lemma: when the realized reduction differs from the
+    /// prediction by no more than the `2ε_f` a difference of two evaluations
+    /// can carry, `|rho − 1| < 1 − eta_expand`, so the step is accepted, the
+    /// radius grows at the boundary, and it is never shrunk for noise — at
+    /// every scale of prediction, from far below the band to far above it.
     #[test]
-    fn a_positive_noise_floor_still_neutralizes_a_round_off_step() {
-        let policy = TrustRegionPolicy::noise_aware(1.0e-12, 10.0, 1.0e-14);
-        let step = policy.update(1.0, 1.0, false, 1.0e-16, 1.0e-15, 1.0);
-        assert!(step.within_noise_floor);
-        assert_eq!(step.rho, 1.0);
-        assert!(step.accepted);
+    fn a_shortfall_within_twice_the_band_never_shrinks_the_region() {
+        let band = 1.0e-8;
+        let policy = TrustRegionPolicy::noise_tolerant(1.0e-12, 1.0e6, band);
+        for predicted in [
+            1.0e-14, 1.0e-10, 5.0e-9, 1.0e-8, 2.5e-8, 1.0e-6, 1.0e-2, 1.0,
+        ] {
+            for fraction in [-1.0, -0.999, -0.5, 0.0, 0.5, 0.999, 1.0] {
+                let actual = predicted + fraction * 2.0 * band;
+                let step = policy.update(1.0, 1.0, true, actual, predicted);
+                assert!(
+                    (step.rho - 1.0).abs() <= 1.0 - policy.eta_expand,
+                    "pred={predicted:e} actual={actual:e}: rho={}",
+                    step.rho
+                );
+                assert!(step.accepted, "pred={predicted:e} actual={actual:e}");
+                assert_eq!(
+                    step.decision,
+                    TrustRegionDecision::GrowAtBoundary,
+                    "pred={predicted:e} actual={actual:e}: rho={}",
+                    step.rho
+                );
+            }
+        }
     }
 
-    /// The neutral band is two-sided. A realized change inside the floor is
-    /// neutral only when the model promised no more than the floor; against
-    /// a resolvable prediction it is the model being wrong, and the step is
-    /// rejected with the ratio the numbers actually give, not promoted to
-    /// `rho = 1` and grown.
+    /// The band excuses noise, not a wrong model. A prediction the band
+    /// resolves that realizes nothing is rejected: the joint Newton whose
+    /// model promised `0.274` from a singular-information gradient and
+    /// realized `1.1e-13` stays rejected, and so does an ascent beyond what
+    /// the band can carry.
     #[test]
-    fn a_resolvable_prediction_that_realizes_nothing_is_rejected_not_neutral() {
-        // objective_scale = 1e3 => noise_floor = 1e3 * 1e-14 = 1e-11.
-        let policy = TrustRegionPolicy::noise_aware(1.0e-12, 1.0e6, 1.0e-14);
-        let step = policy.update(9.483e-3, 9.483e-3, true, 1.137e-13, 2.741e-1, 1.0e3);
-        assert!(!step.within_noise_floor);
-        assert!((step.rho - 1.137e-13 / 2.741e-1).abs() < 1e-20);
+    fn a_resolvable_prediction_that_realizes_nothing_is_rejected() {
+        let policy = TrustRegionPolicy::noise_tolerant(1.0e-12, 1.0e6, 1.0e-11);
+        let step = policy.update(9.483e-3, 9.483e-3, true, 1.137e-13, 2.741e-1);
+        assert!(step.rho < 1.0e-9, "rho={}", step.rho);
         assert!(!step.accepted);
         assert_eq!(step.decision, TrustRegionDecision::ShrinkOnRejection);
         // x0.25 shrink = 2.37e-3, capped at 0.5 * step_norm = 4.74e-3: the shrink binds.
         assert!((step.new_radius - 0.25 * 9.483e-3).abs() < 1e-15);
-        // The same realized change against a promise inside the floor is neutral.
-        let neutral = policy.update(9.483e-3, 9.483e-3, true, 1.137e-13, 5.0e-12, 1.0e3);
-        assert!(neutral.within_noise_floor);
-        assert_eq!(neutral.rho, 1.0);
-        assert!(neutral.accepted);
-        // A realized change inside the floor is not a descent either, even
-        // with `eta_accept = 0`: the ratio is noise over a promise.
-        let inside = policy.update(1.0, 1.0, false, 5.0e-12, 1.0e-6, 1.0e3);
-        assert!(!inside.within_noise_floor);
-        assert!(!inside.accepted);
+
+        let r = 2.0 / (1.0 - policy.eta_expand);
+        let ascent = policy.update(1.0, 1.0, false, -r * 1.0e-11, 1.0e-11);
+        assert!(ascent.rho <= 0.0);
+        assert!(!ascent.accepted);
+    }
+
+    /// The case gam#2637 measured: a step realizing `+2.090e-9` against a
+    /// prediction of `+2.944e-13`, with a measured objective resolution of
+    /// `4.156e-13`. The relative floor read that prediction as unresolvable
+    /// and rejected it three times running, collapsing the radius from `1` to
+    /// `4.4e-8`. With the band in the ratio it is simply a very successful
+    /// step.
+    #[test]
+    fn a_decrease_above_the_band_against_a_tiny_prediction_is_accepted() {
+        let policy = TrustRegionPolicy::noise_tolerant(1.0e-12, 1.0e6, 4.156290748e-13);
+        let step = policy.update(1.0, 1.0, true, 2.090494888e-9, 2.944376434e-13);
+        assert!(step.accepted);
+        assert!(!step.predicted_nonpositive);
+        assert_eq!(step.decision, TrustRegionDecision::GrowAtBoundary);
+    }
+
+    /// A model that predicts no decrease still forms no ratio, band or not.
+    #[test]
+    fn a_nonpositive_prediction_rejects_whatever_the_band() {
+        let policy = TrustRegionPolicy::noise_tolerant(1.0e-12, 1.0e6, 1.0);
+        for predicted in [0.0, -1.0e-3, f64::NAN, f64::INFINITY] {
+            let step = policy.update(1.0, 1.0, false, 0.5, predicted);
+            assert!(step.predicted_nonpositive);
+            assert_eq!(step.rho, f64::NEG_INFINITY);
+            assert!(!step.accepted);
+        }
+    }
+
+    /// A band that is not a finite non-negative number is no band: the ratio
+    /// falls back to the classical one rather than to an unbounded excuse.
+    #[test]
+    fn a_non_finite_band_is_no_band() {
+        for band in [f64::NAN, f64::INFINITY, -1.0] {
+            let policy = TrustRegionPolicy::classic(10.0).with_objective_band(band);
+            let step = policy.update(1.0, 1.0, false, 0.05, 1.0);
+            assert_eq!(step.rho.to_bits(), 0.05_f64.to_bits(), "band={band}");
+            assert!(!step.accepted);
+        }
     }
 }
 
@@ -20765,7 +20972,6 @@ mod riemannian {
                     hit_boundary,
                     actual_reduction,
                     predicted_reduction,
-                    f_curr,
                 );
                 delta = update.new_radius;
                 if update.accepted {
