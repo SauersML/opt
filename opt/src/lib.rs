@@ -3382,6 +3382,64 @@ const BACKTRACKING_MAX_ATTEMPTS: usize = 50;
 /// vulnerable to the same noise floor.
 const ARC_NUMERICAL_CONV_FACTOR: f64 = 16.0;
 
+/// How far the computed cubic-model gradient at the represented step `s̃` can
+/// sit from the gradient the subproblem certified at its own step `s`, from
+/// arithmetic alone.
+///
+/// Two terms, both over the free coordinates:
+/// - representation: `∇m(s̃) − ∇m(s) = ∫₀¹ ∇²m(s + t·r)·r dt` with `r = s̃ − s`,
+///   and `‖∇²m(y)‖₂ ≤ ‖H‖₂ + 2σ‖y‖`, so it is at most
+///   `(‖H‖_F + 2σ·max(‖s‖, ‖s̃‖))·‖r‖`. Where `x + s` rounds, `r` is the
+///   point's rounding and this is the whole residual of an exact step;
+/// - evaluation: `fl(g + H·s̃ + σ‖s̃‖·s̃)` is within
+///   `γ_{n+4}·(‖g‖ + ‖H‖_F‖s̃‖ + σ‖s̃‖²)` of the exact value (Higham, *Accuracy
+///   and Stability of Numerical Algorithms*, §3.5), `γ_k = k·u/(1 − k·u)`.
+fn arc_model_gradient_band(
+    gradient: &Array1<f64>,
+    hessian: &Array2<f64>,
+    sigma: f64,
+    proposed_step: &Array1<f64>,
+    represented_step: &Array1<f64>,
+    active: &[bool],
+) -> f64 {
+    let n = gradient.len();
+    let free = |index: usize| !active.get(index).copied().unwrap_or(false);
+    let mut hessian_frobenius_sq = 0.0_f64;
+    for row in 0..n {
+        if !free(row) {
+            continue;
+        }
+        for col in 0..n {
+            if free(col) {
+                hessian_frobenius_sq += hessian[[row, col]] * hessian[[row, col]];
+            }
+        }
+    }
+    let hessian_norm = hessian_frobenius_sq.sqrt();
+    let mut gradient_sq = 0.0_f64;
+    let mut proposed_sq = 0.0_f64;
+    let mut represented_sq = 0.0_f64;
+    let mut rounding_sq = 0.0_f64;
+    for index in (0..n).filter(|&index| free(index)) {
+        gradient_sq += gradient[index] * gradient[index];
+        proposed_sq += proposed_step[index] * proposed_step[index];
+        represented_sq += represented_step[index] * represented_step[index];
+        let rounding = represented_step[index] - proposed_step[index];
+        rounding_sq += rounding * rounding;
+    }
+    let represented_norm = represented_sq.sqrt();
+    let reach = proposed_sq.sqrt().max(represented_norm);
+    let representation = (hessian_norm + 2.0 * sigma * reach) * rounding_sq.sqrt();
+    let unit_roundoff = 0.5 * f64::EPSILON;
+    let terms = (n + 4) as f64 * unit_roundoff;
+    let gamma = terms / (1.0 - terms);
+    let evaluation = gamma
+        * (gradient_sq.sqrt()
+            + hessian_norm * represented_norm
+            + sigma * represented_norm * represented_norm);
+    representation + evaluation
+}
+
 /// An error type for clear diagnostics.
 #[derive(Debug, thiserror::Error)]
 pub enum BfgsError {
@@ -7028,11 +7086,24 @@ impl ArcCore {
         let (model_delta, _, model_gradient) =
             self.arc_model_value(gradient, hessian, self.sigma, &step, Some(active));
         let model_gradient_norm = model_gradient.dot(&model_gradient).sqrt();
-        let model_gradient_target = self.theta * step_norm * step_norm;
+        // The subproblem certified its own step against `θ‖s‖²` (floored as in
+        // `solve_arc_subproblem`). What is evaluated is the represented step
+        // `s̃ = fl(x + s) − x`, and the model gradient there is only known to
+        // within the arithmetic: re-testing `s̃` against the bare target refuses
+        // an exact Newton step whose point rounds (gam#3286).
+        let model_gradient_target = (self.theta * step_norm * step_norm).max(1e-14)
+            + arc_model_gradient_band(
+                gradient,
+                hessian,
+                self.sigma,
+                proposed_step,
+                &step,
+                active,
+            );
         if !model_delta.is_finite()
             || !model_gradient_norm.is_finite()
             || model_delta > 0.0
-            || (!projection_changed && model_gradient_norm > model_gradient_target.max(1e-14))
+            || (!projection_changed && model_gradient_norm > model_gradient_target)
         {
             return None;
         }
@@ -15788,6 +15859,61 @@ mod tests {
         .with_initial_regularization(sigma)
         .with_max_regularization(sigma);
         assert_reject_floor_at_unchanged_iterate(solver.run(), &x0, "model-gradient accuracy");
+    }
+
+    /// gam#3286: an exact Newton step whose point `x + s` rounds. At `x = 5.4388`
+    /// with `H = 1e5` and `|g| = 3.9e-2` the step is `3.9e-7`, so the subproblem's
+    /// own target `θ‖s‖²` is about `1.5e-13`, while the represented step
+    /// `s̃ = fl(x + s) − x` misses `s` by up to `ulp(x)/2 ≈ 4.4e-16` and leaves a
+    /// model gradient `H·r` near `4e-11`. That residual is the point's rounding,
+    /// not an inaccurate subproblem solve, so the trial must go ahead.
+    #[test]
+    fn arc_takes_an_exact_step_whose_represented_point_rounds() {
+        let curvature = 1.0e5;
+        let x0 = array![5.4388];
+        let h0 = array![[curvature]];
+        let g0 = array![-3.9e-2];
+        let mut core = super::ArcCore::new(x0.clone());
+        core.sigma = 1.0e-3;
+        let active = [false];
+        let step = core
+            .solve_arc_subproblem(&h0, &g0, core.sigma, None, &x0)
+            .expect("the cubic subproblem has a step");
+        let represented = &(&x0 + &step) - &x0;
+        let step_norm = represented.dot(&represented).sqrt();
+        let (_, _, model_gradient) =
+            core.arc_model_value(&g0, &h0, core.sigma, &represented, Some(&active));
+        let residual = model_gradient.dot(&model_gradient).sqrt();
+        assert!(
+            residual > (core.theta * step_norm * step_norm).max(1e-14),
+            "the regime must be a rounding residual above the bare target: \
+             |s̃|={step_norm:e} residual={residual:e}"
+        );
+        assert!(
+            core.prepare_arc_trial(&x0, &step, &g0, &h0, &active).is_some(),
+            "the exact step must be trialled: residual={residual:e}"
+        );
+        let anchor = x0.clone();
+        let slope = g0.clone();
+        let h_objective = h0.clone();
+        let mut solver = super::Arc::new(
+            x0.clone(),
+            SecondOrderFn::new(move |x: &Array1<f64>| {
+                let d = x - &anchor;
+                let hd = h_objective.dot(&d);
+                (slope.dot(&d) + 0.5 * d.dot(&hd), &slope + &hd, h_objective.clone())
+            }),
+        )
+        .with_profile(Profile::Deterministic)
+        .with_tolerance(tol(1e-3));
+        let solution = solver.run().expect("ARC must certify the quadratic's minimiser");
+        let final_gradient = g0[0] + curvature * (solution.final_point[0] - x0[0]);
+        assert!(
+            final_gradient.abs() <= 1e-3,
+            "ARC must meet its gradient tolerance: |g| = {:e} at x = {}",
+            final_gradient.abs(),
+            solution.final_point[0]
+        );
     }
 
     /// Census of the all-active refusal site. The mask marks a coordinate active only
