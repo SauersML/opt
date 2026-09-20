@@ -7307,14 +7307,7 @@ impl ArcCore {
         // within the arithmetic: re-testing `s̃` against the bare target refuses
         // an exact Newton step whose point rounds (gam#3286).
         let model_gradient_target = (self.theta * step_norm * step_norm).max(1e-14)
-            + arc_model_gradient_band(
-                gradient,
-                hessian,
-                self.sigma,
-                proposed_step,
-                &step,
-                active,
-            );
+            + arc_model_gradient_band(gradient, hessian, self.sigma, proposed_step, &step, active);
         if !model_delta.is_finite()
             || !model_gradient_norm.is_finite()
             || model_delta > 0.0
@@ -16349,7 +16342,8 @@ mod tests {
              |s̃|={step_norm:e} residual={residual:e}"
         );
         assert!(
-            core.prepare_arc_trial(&x0, &step, &g0, &h0, &active).is_some(),
+            core.prepare_arc_trial(&x0, &step, &g0, &h0, &active)
+                .is_some(),
             "the exact step must be trialled: residual={residual:e}"
         );
         let anchor = x0.clone();
@@ -16360,12 +16354,18 @@ mod tests {
             SecondOrderFn::new(move |x: &Array1<f64>| {
                 let d = x - &anchor;
                 let hd = h_objective.dot(&d);
-                (slope.dot(&d) + 0.5 * d.dot(&hd), &slope + &hd, h_objective.clone())
+                (
+                    slope.dot(&d) + 0.5 * d.dot(&hd),
+                    &slope + &hd,
+                    h_objective.clone(),
+                )
             }),
         )
         .with_profile(Profile::Deterministic)
         .with_tolerance(tol(1e-3));
-        let solution = solver.run().expect("ARC must certify the quadratic's minimiser");
+        let solution = solver
+            .run()
+            .expect("ARC must certify the quadratic's minimiser");
         let final_gradient = g0[0] + curvature * (solution.final_point[0] - x0[0]);
         assert!(
             final_gradient.abs() <= 1e-3,
