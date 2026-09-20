@@ -2520,7 +2520,10 @@ impl ReducedSymmetricSpectrum {
             }
             retained += 1;
             lambda_sq += coordinate * coordinate / curvature;
-            band_lambda_sq += 2.0 * coordinate.abs() * coordinate_band / curvature
+            // `|c² − ĉ²| ≤ 2|ĉ|δc + δc²`: the square term keeps a coordinate
+            // that rounds to zero from certifying past its own band.
+            band_lambda_sq += (2.0 * coordinate.abs() + coordinate_band) * coordinate_band
+                / curvature
                 + coordinate * coordinate * curvature_resolution / (curvature * curvature);
         }
         // The quotients and their sum.
@@ -2784,6 +2787,29 @@ mod newton_decrement_tests {
         }
     }
 
+    /// gam#3230: `|c² − ĉ²| ≤ 2|ĉ|δc + δc²`. A gradient whose every coordinate
+    /// rounds to `ĉ = 0` inside a coordinate band `δc` still admits a true
+    /// decrement up to `Σ δc²/μ`; here that is at least `3·(1e-6)²/1e-3 = 3e-9`,
+    /// above the objective band `1e-9`, so the verdict cannot certify it.
+    #[test]
+    fn a_gradient_that_rounds_to_zero_is_bounded_by_its_own_band() {
+        let q = rotation();
+        let hessian = spectral(&q, [1e-3, 1e-3, 1e-3]);
+        let stationary = Array1::<f64>::zeros(3);
+        let wide = bands(1e-9, 1e-6, 1e-15);
+        match newton_decrement_verdict(&hessian, &stationary, None, &wide) {
+            DecrementVerdict::DecrementUnresolved(evidence) => {
+                assert_eq!(evidence.lambda_sq, 0.0);
+                assert!(
+                    evidence.band_lambda_sq >= 3.0 * 1e-12 / 1e-3 * (1.0 - 1e-12),
+                    "band_λ² = {:e} misses Σ δc²/μ",
+                    evidence.band_lambda_sq
+                );
+            }
+            other => panic!("a decrement the bands cannot resolve must not certify: {other:?}"),
+        }
+    }
+
     #[test]
     fn rescaling_the_objective_with_its_bands_leaves_the_verdict_unchanged() {
         let q = rotation();
@@ -3010,67 +3036,200 @@ fn reduced_negative_curvature_step(
     Ok(Some(best.0))
 }
 
+/// Exact minimiser of the quadratic model `m(s) = gᵀs + ½sᵀHs` over the free
+/// coordinates inside the ball `‖s‖ ≤ Δ` (Moré–Sorensen), returned with its
+/// predicted decrease `−m(s)`.
+///
+/// In the free-coordinate eigenbasis `H = Σ λ_i u_i u_iᵀ`, `c = Uᵀg`, the
+/// minimiser is `s(σ) = −Σ c_i/(λ_i + σ) u_i` for a shift `σ ≥ max(0, −λ_min)`
+/// with `σ(Δ − ‖s(σ)‖) = 0`. Three cases, in order:
+///
+/// * **Interior.** `σ = 0` only when `H` is positive definite on the free
+///   coordinates (`λ_min` above the spectrum's own rounding floor) and the
+///   Newton step `−H⁻¹g` lies in the ball. At an indefinite `H` the `σ = 0`
+///   point is the model's saddle — it climbs every negative-curvature
+///   direction — never its minimiser, however well it fits the radius
+///   (gam#3196).
+/// * **Hard case.** When `g` has no component on the bottom eigenspace beyond
+///   the rounding of its own projection, `‖s(σ)‖` has no pole at `−λ_min` and
+///   the secular equation may have no root. If `s(−λ_min)` (bottom
+///   coordinates dropped) is in the ball, the minimiser is
+///   `s(−λ_min) + τu_min` with `τ` taking it to the boundary: along `u_min` the
+///   model falls by `½|λ_min|τ²`, and the rounding-level coordinate still
+///   orients `τ` downhill. When the bottom curvature is itself below the
+///   rounding floor, the model is flat along `u_min` and no `τ` lowers it, so
+///   the minimum-norm minimiser `σ = 0` is returned instead.
+/// * **Boundary.** Otherwise `σ` is the root of `ψ(σ) = 1/‖s(σ)‖ − 1/Δ`, which
+///   is concave and increasing for `σ > −λ_min`. Newton's method started left
+///   of the root therefore rises monotonically to it without overshoot; the
+///   start `max(shift_min, max_i |c_i|/Δ − λ_i)` is such a point, because
+///   every mode obeys `|c_i|/(λ_i + σ*) ≤ ‖s(σ*)‖ = Δ`. It stops once `‖s(σ)‖`
+///   agrees with `Δ` to the rounding of its own evaluation, or when `f64` can
+///   no longer raise `σ`.
+///
+/// Every threshold is the spectrum's rounding floor or a Wilkinson
+/// accumulation bound; there is no tolerance constant and no iteration cap.
 fn dense_trust_region_step(
     h: &Array2<f64>,
     g: &Array1<f64>,
     delta: f64,
     active: Option<&[bool]>,
 ) -> Option<(Array1<f64>, f64)> {
-    let rhs = -g.clone();
-    let (effective_h, effective_rhs) = build_masked_subproblem_system(h, &rhs, active);
-    let solve_with_shift = |lambda: f64| dense_solve_shifted(&effective_h, &effective_rhs, lambda);
-    let predicted = |s: &Array1<f64>| {
-        let hs = h.dot(s);
-        -(g.dot(s) + 0.5 * s.dot(&hs))
+    if !(delta.is_finite() && delta > 0.0) || g.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let spectrum = ReducedSymmetricSpectrum::decompose(h, active)?;
+    let q = spectrum.free.len();
+    if q == 0 {
+        return None;
+    }
+    let lambda = &spectrum.eigenvalues;
+    let lambda_min = lambda[0];
+    let floor = spectrum.numerical_floor;
+    let mut coordinates = spectrum.gradient_coordinates(g);
+
+    let finish = |spectral_step: Array1<f64>| {
+        let step = spectrum.embed_step(&spectral_step, g.len());
+        let predicted = -(g.dot(&step) + 0.5 * step.dot(&h.dot(&step)));
+        (step.iter().all(|value| value.is_finite()) && predicted.is_finite() && predicted > 0.0)
+            .then_some((step, predicted))
     };
-
-    if let Some(s) = solve_with_shift(0.0) {
-        let s_norm = s.dot(&s).sqrt();
-        let pred = predicted(&s);
-        if s_norm.is_finite() && s_norm <= delta && pred.is_finite() && pred > 0.0 {
-            return Some((s, pred));
-        }
-    }
-
-    let mut lambda_lo = 0.0;
-    let mut lambda_hi = 1e-8f64;
-    let mut best: Option<(Array1<f64>, f64)> = None;
-    for _ in 0..80 {
-        if let Some(s) = solve_with_shift(lambda_hi) {
-            let s_norm = s.dot(&s).sqrt();
-            let pred = predicted(&s);
-            if s_norm.is_finite() && s_norm <= delta && pred.is_finite() && pred > 0.0 {
-                best = Some((s, pred));
-                break;
+    // A zero coordinate contributes nothing, and is skipped so a mode whose
+    // shifted curvature is zero (the hard case's bottom eigenspace) never
+    // forms `0/0`.
+    let shifted_step = |coordinates: &Array1<f64>, shift: f64| {
+        Array1::from_shape_fn(q, |mode| {
+            if coordinates[mode] == 0.0 {
+                0.0
+            } else {
+                -coordinates[mode] / (lambda[mode] + shift)
             }
+        })
+    };
+    let norm = |values: &Array1<f64>| scaled_norm(values.iter().copied());
+
+    if lambda_min > floor {
+        let newton = shifted_step(&coordinates, 0.0);
+        if norm(&newton) <= delta {
+            return finish(newton);
         }
-        lambda_lo = lambda_hi;
-        lambda_hi *= 2.0;
     }
-    let (mut best_step, mut best_pred) = best?;
-    for _ in 0..80 {
-        let lambda_mid = 0.5 * (lambda_lo + lambda_hi);
-        if !lambda_mid.is_finite() || (lambda_hi - lambda_lo) <= 1e-12 * lambda_hi.max(1.0) {
-            break;
-        }
-        match solve_with_shift(lambda_mid) {
-            Some(s) => {
-                let s_norm = s.dot(&s).sqrt();
-                let pred = predicted(&s);
-                if s_norm.is_finite() && s_norm <= delta && pred.is_finite() && pred > 0.0 {
-                    lambda_hi = lambda_mid;
-                    best_step = s;
-                    best_pred = pred;
-                } else {
-                    lambda_lo = lambda_mid;
+
+    let shift_min = (-lambda_min).max(0.0);
+    if lambda_min <= floor {
+        // `c_i = Σ_j U_ji g_j` is a q-term accumulation; a bottom-eigenspace
+        // coordinate inside its own rounding band carries no direction.
+        let growth = accumulation_growth(q);
+        let bottom = |mode: usize| lambda[mode] - lambda_min <= floor;
+        let bottom_is_unresolved = (0..q).filter(|&mode| bottom(mode)).all(|mode| {
+            let magnitude: f64 = spectrum
+                .eigenvectors
+                .column(mode)
+                .iter()
+                .zip(spectrum.free.iter())
+                .map(|(weight, &index)| weight.abs() * g[index].abs())
+                .sum();
+            coordinates[mode].abs() <= growth * magnitude
+        });
+        if bottom_is_unresolved {
+            let bottom_coordinate = coordinates[0];
+            for mode in 0..q {
+                if bottom(mode) {
+                    coordinates[mode] = 0.0;
                 }
             }
-            None => {
-                lambda_lo = lambda_mid;
+            let negative = lambda_min < -floor;
+            // Every mode off the bottom eigenspace has `λ_i > λ_min + floor`,
+            // so with `λ_min ≥ −floor` its unshifted curvature is positive.
+            let hard_shift = if negative { shift_min } else { 0.0 };
+            let mut hard = shifted_step(&coordinates, hard_shift);
+            let hard_norm = norm(&hard);
+            if hard_norm <= delta {
+                if negative {
+                    let reach = ((delta - hard_norm) * (delta + hard_norm)).sqrt();
+                    hard[0] = if bottom_coordinate > 0.0 {
+                        -reach
+                    } else {
+                        reach
+                    };
+                }
+                return finish(hard);
             }
         }
     }
-    Some((best_step, best_pred))
+
+    // `‖s(σ)‖` is `q` quotients `c_i/(λ_i+σ)` (one sum, one division each)
+    // accumulated into a norm; this is the rounding of its evaluation.
+    let evaluation_growth = accumulation_growth(q + 2);
+    let mut shift = (0..q)
+        .filter(|&mode| coordinates[mode] != 0.0)
+        .map(|mode| coordinates[mode].abs() / delta - lambda[mode])
+        .fold(shift_min, f64::max);
+    // A bottom coordinate too small to lift `|c|/Δ − λ_min` off `−λ_min`
+    // would put the start on its pole; one ulp right of it is still left of
+    // the root.
+    if (0..q).any(|mode| coordinates[mode] != 0.0 && lambda[mode] + shift <= 0.0) {
+        shift = shift.next_up();
+    }
+    // The root lies in `[lower, upper]`: `lower` is the last shift whose step
+    // left the ball, `upper` the last one whose step fell short of it. In
+    // exact arithmetic Newton never produces an `upper`; rounding near a pole
+    // can, and then the bracket keeps the iteration from leaving it.
+    let mut lower = shift_min;
+    let mut upper = f64::INFINITY;
+    loop {
+        let step = shifted_step(&coordinates, shift);
+        let step_norm = norm(&step);
+        if !step_norm.is_finite() {
+            return None;
+        }
+        if (step_norm - delta).abs() <= delta * evaluation_growth {
+            return finish(step * (delta / step_norm));
+        }
+        if step_norm > delta {
+            lower = shift;
+        } else {
+            upper = shift;
+        }
+        // `ψ'(σ) = Σ s_i²/(λ_i+σ) / ‖s‖³`, so the Newton update on `ψ` is
+        // `σ + (‖s‖/Δ − 1)·‖s‖²/Σ s_i²/(λ_i+σ)`.
+        let curvature_weighted: f64 = (0..q)
+            .filter(|&mode| coordinates[mode] != 0.0)
+            .map(|mode| step[mode] * step[mode] / (lambda[mode] + shift))
+            .sum();
+        let newton =
+            shift + (step_norm / delta - 1.0) * (step_norm * step_norm / curvature_weighted);
+        let next = if newton.is_finite() && newton > lower && newton < upper {
+            newton
+        } else {
+            0.5 * (lower + upper)
+        };
+        if !(next.is_finite() && next > lower && next < upper) {
+            // `σ` is resolved to one ulp yet `‖s(σ)‖` still misses `Δ` beyond
+            // its rounding: one ulp of `σ` moves `‖s‖` by more than its own
+            // evaluation error, most visibly when a mode sits near its pole
+            // (the near-hard case). Rescaling the whole step would then break
+            // `(H + σI)s = −g` in every mode by the miss. Every other mode is
+            // `s_i(σ)` to rounding, so the miss belongs to the mode that
+            // dominates `d‖s‖²/dσ = −2Σ s_i²/(λ_i+σ)`; completing that
+            // eigen-coordinate to the boundary is the hard-case `τu` move,
+            // oriented downhill by its own sign.
+            let weight = |mode: usize| step[mode] * step[mode] / (lambda[mode] + shift);
+            let pivot = (0..q)
+                .filter(|&mode| coordinates[mode] != 0.0)
+                .max_by(|&a, &b| weight(a).total_cmp(&weight(b)))?;
+            let rest = scaled_norm((0..q).filter(|&mode| mode != pivot).map(|mode| step[mode]));
+            let mut boundary = step;
+            if rest < delta {
+                let reach = ((delta - rest) * (delta + rest)).sqrt();
+                boundary[pivot] = reach.copysign(boundary[pivot]);
+            } else {
+                boundary *= delta / step_norm;
+            }
+            return finish(boundary);
+        }
+        shift = next;
+    }
 }
 
 // Adaptive CG iteration cap: full solve for small n, capped growth for large n.
@@ -14266,6 +14425,249 @@ mod tests {
         let norm = step.dot(&step).sqrt();
         assert!(norm <= 0.5 + 1e-8, "step norm should respect trust radius");
         assert!(pred > 0.0, "predicted decrease should be positive");
+    }
+
+    fn quadratic_model(h: &Array2<f64>, g: &Array1<f64>, s: &Array1<f64>) -> f64 {
+        g.dot(s) + 0.5 * s.dot(&h.dot(s))
+    }
+
+    /// The Moré–Sorensen optimality conditions, which characterise the global
+    /// minimiser of the model over the ball: `(H + σI)s = −g` for one
+    /// `σ ≥ max(0, −λ_min)` with `σ(Δ − ‖s‖) = 0`.
+    fn assert_more_sorensen(h: &Array2<f64>, g: &Array1<f64>, delta: f64, s: &Array1<f64>) {
+        let norm = s.dot(s).sqrt();
+        assert!(
+            norm <= delta * (1.0 + 1e-12),
+            "‖s‖ = {norm} exceeds Δ = {delta}"
+        );
+        let residual = h.dot(s) + g;
+        let shift = -residual.dot(s) / s.dot(s);
+        let lambda_min = super::ReducedSymmetricSpectrum::decompose(h, None)
+            .unwrap()
+            .eigenvalues[0];
+        let scale = 1.0 + h.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            shift >= -lambda_min - 1e-10 * scale,
+            "σ = {shift} leaves H + σI indefinite (λ_min = {lambda_min})"
+        );
+        assert!(shift >= -1e-10 * scale, "σ = {shift} is negative");
+        let shifted_residual = &residual + &(s * shift);
+        assert!(
+            shifted_residual
+                .iter()
+                .all(|v| v.abs() <= 1e-9 * (1.0 + g.dot(g).sqrt()) * scale),
+            "(H + σI)s + g = {shifted_residual:?} with σ = {shift}"
+        );
+        assert!(
+            shift * (delta - norm) <= 1e-9 * scale * delta.max(1.0),
+            "σ = {shift} is positive inside the ball (‖s‖ = {norm}, Δ = {delta})"
+        );
+    }
+
+    /// Brute-force minimum of a 2-D model over the closed disc `‖s‖ ≤ Δ`: a
+    /// polar grid through the interior plus a fine scan of the boundary.
+    fn brute_force_disc_minimum(h: &Array2<f64>, g: &Array1<f64>, delta: f64) -> f64 {
+        let (a, b, d) = (h[[0, 0]], h[[0, 1]], h[[1, 1]]);
+        let (g0, g1) = (g[0], g[1]);
+        let model =
+            |x: f64, y: f64| g0 * x + g1 * y + 0.5 * (a * x * x + 2.0 * b * x * y + d * y * y);
+        let mut best = 0.0_f64;
+        let radial = 120;
+        let angular = 480;
+        for k in 1..=radial {
+            let r = delta * k as f64 / radial as f64;
+            for j in 0..angular {
+                let angle = j as f64 * std::f64::consts::TAU / angular as f64;
+                best = best.min(model(r * angle.cos(), r * angle.sin()));
+            }
+        }
+        let boundary = 20_000;
+        for j in 0..boundary {
+            let angle = j as f64 * std::f64::consts::TAU / boundary as f64;
+            best = best.min(model(delta * angle.cos(), delta * angle.sin()));
+        }
+        best
+    }
+
+    #[test]
+    fn a_positive_definite_model_takes_its_interior_newton_step() {
+        let h = array![[4.0, 1.0], [1.0, 3.0]];
+        let g = array![1.0, 2.0];
+        let newton = super::dense_solve_shifted(&h, &(-&g), 0.0).unwrap();
+        let (step, pred) = super::dense_trust_region_step(&h, &g, 10.0, None).unwrap();
+        assert!((&step - &newton).iter().all(|v| v.abs() <= 1e-14));
+        assert!((pred + quadratic_model(&h, &g, &step)).abs() <= 1e-14);
+        assert_more_sorensen(&h, &g, 10.0, &step);
+        // The same model with the Newton step outside the radius is minimised
+        // on the boundary with a positive shift.
+        let delta = 0.25 * newton.dot(&newton).sqrt();
+        let (step, _) = super::dense_trust_region_step(&h, &g, delta, None).unwrap();
+        assert!((step.dot(&step).sqrt() - delta).abs() <= 1e-14 * delta);
+        assert_more_sorensen(&h, &g, delta, &step);
+        assert!(quadratic_model(&h, &g, &step) <= brute_force_disc_minimum(&h, &g, delta) + 1e-14);
+    }
+
+    #[test]
+    fn an_indefinite_model_is_minimised_on_the_boundary_not_at_its_saddle() {
+        // `−H⁻¹g = (0.1, −1)` lies well inside the ball and `m(−H⁻¹g) < 0`, but
+        // it is the model's saddle: along e₀ it climbs negative curvature.
+        let h = array![[-1.0, 0.0], [0.0, 1.0]];
+        let g = array![0.1, 1.0];
+        let delta = 10.0;
+        let saddle = array![0.1, -1.0];
+        let (step, pred) = super::dense_trust_region_step(&h, &g, delta, None).unwrap();
+        assert_more_sorensen(&h, &g, delta, &step);
+        assert!((step.dot(&step).sqrt() - delta).abs() <= 1e-12 * delta);
+        assert!(
+            step[0] < 0.0,
+            "the step climbs the negative curvature: {step:?}"
+        );
+        assert!(quadratic_model(&h, &g, &step) < quadratic_model(&h, &g, &saddle) - 1.0);
+        assert!((pred + quadratic_model(&h, &g, &step)).abs() <= 1e-12 * pred.abs());
+    }
+
+    #[test]
+    fn the_block_orthogonal_reml_replay_escapes_its_negative_curvature() {
+        // gam#3196: at ρ = [8.36, 4.42] the outer jet is g = (0.0053, −0.0725),
+        // H = diag(−0.0053, 0.0674). The unshifted step −H⁻¹g = (1.0, 1.0757)
+        // fits in the radius with a positive predicted decrease, and taking it
+        // walked ρ₀ up to a plateau at f = 9.4155 instead of the minimum
+        // f = −4.4119.
+        let h = array![[-0.0053, 0.0], [0.0, 0.0674]];
+        let g = array![0.0053, -0.0725];
+        let saddle = array![1.0, 0.0725 / 0.0674];
+        for delta in [1.5, 2.0, 4.0] {
+            let (step, _) = super::dense_trust_region_step(&h, &g, delta, None).unwrap();
+            assert_more_sorensen(&h, &g, delta, &step);
+            assert!((step.dot(&step).sqrt() - delta).abs() <= 1e-12 * delta);
+            assert!(step[0] < 0.0, "Δ = {delta}: the step climbs ρ₀: {step:?}");
+            let value = quadratic_model(&h, &g, &step);
+            assert!(value < quadratic_model(&h, &g, &saddle));
+            assert!(value <= brute_force_disc_minimum(&h, &g, delta) + 1e-15);
+        }
+    }
+
+    #[test]
+    fn a_gradient_orthogonal_to_negative_curvature_takes_the_hard_case_step() {
+        let h = array![[-1.0, 0.0], [0.0, 1.0]];
+        let delta = 2.0;
+        // s(−λ_min) = (0, −0.25), then τ along e₀ to the boundary; the model
+        // is m* = c₁s₁ + ½λ₁s₁² + ½λ_min τ².
+        let g = array![0.0, 0.5];
+        let (step, pred) = super::dense_trust_region_step(&h, &g, delta, None).unwrap();
+        assert_more_sorensen(&h, &g, delta, &step);
+        let tau_sq = delta * delta - 0.0625;
+        let expected = 0.5 * -0.25 + 0.5 * 0.0625 - 0.5 * tau_sq;
+        assert!((step[1] + 0.25).abs() <= 1e-15, "{step:?}");
+        assert!((step[0].abs() - tau_sq.sqrt()).abs() <= 1e-14, "{step:?}");
+        assert!(
+            (-pred - expected).abs() <= 1e-14,
+            "m = {}, m* = {expected}",
+            -pred
+        );
+        assert!(-pred <= brute_force_disc_minimum(&h, &g, delta) + 1e-14);
+        // A zero gradient at a strict saddle: the whole step is τ·u_min.
+        let (step, pred) =
+            super::dense_trust_region_step(&h, &array![0.0, 0.0], delta, None).unwrap();
+        assert!(
+            (step[0].abs() - delta).abs() <= 1e-14 && step[1].abs() <= 1e-14,
+            "{step:?}"
+        );
+        assert!((pred - 0.5 * delta * delta).abs() <= 1e-14);
+
+        // The same geometry in a rotated basis, where `g ⟂ u_min` holds only
+        // to the rounding of the rotation.
+        let rotation = array![[0.48, -0.60, 0.64], [0.36, 0.80, 0.48], [-0.80, 0.0, 0.60]];
+        let eigenvalues = array![-2.0, 1.0, 3.0];
+        let h = rotation
+            .dot(&Array2::from_diag(&eigenvalues))
+            .dot(&rotation.t());
+        let spectral_gradient = array![0.0, 0.4, -0.9];
+        let g = rotation.dot(&spectral_gradient);
+        let delta = 1.5;
+        let (step, pred) = super::dense_trust_region_step(&h, &g, delta, None).unwrap();
+        assert_more_sorensen(&h, &g, delta, &step);
+        assert!((step.dot(&step).sqrt() - delta).abs() <= 1e-12 * delta);
+        let interior = [0.0, -0.4 / 3.0, 0.9 / 5.0];
+        let interior_sq: f64 = interior.iter().map(|v| v * v).sum();
+        let expected = (1..3)
+            .map(|i| {
+                spectral_gradient[i] * interior[i]
+                    + 0.5 * eigenvalues[i] * interior[i] * interior[i]
+            })
+            .sum::<f64>()
+            - (delta * delta - interior_sq);
+        assert!(
+            (-pred - expected).abs() <= 1e-12,
+            "m = {}, m* = {expected}",
+            -pred
+        );
+    }
+
+    #[test]
+    fn a_flat_bottom_with_no_gradient_on_it_takes_the_minimum_norm_step() {
+        // H is positive semidefinite with a null direction that g does not
+        // touch: σ = 0 is the Moré–Sorensen shift and the model is flat along
+        // the null direction, so the minimum-norm minimiser is returned
+        // rather than an arbitrary slide to the boundary.
+        let h = array![[0.0, 0.0], [0.0, 2.0]];
+        let g = array![0.0, -1.0];
+        let (step, pred) = super::dense_trust_region_step(&h, &g, 3.0, None).unwrap();
+        assert_more_sorensen(&h, &g, 3.0, &step);
+        assert!(
+            step[0].abs() <= 1e-15 && (step[1] - 0.5).abs() <= 1e-15,
+            "{step:?}"
+        );
+        assert!((pred - 0.25).abs() <= 1e-15);
+    }
+
+    #[test]
+    fn the_dense_trust_region_step_is_the_model_minimum_over_the_ball() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut uniform = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+        };
+        for case in 0..400 {
+            let (a, b, d) = (3.0 * uniform(), 3.0 * uniform(), 3.0 * uniform());
+            let h = array![[a, b], [b, d]];
+            // Every fourth case is near-hard: g almost orthogonal to u_min.
+            let mut g = array![uniform(), uniform()];
+            if case % 4 == 3 {
+                let spectrum = super::ReducedSymmetricSpectrum::decompose(&h, None).unwrap();
+                let bottom = spectrum.eigenvectors.column(0).to_owned();
+                g = &g - &(&bottom * (g.dot(&bottom) * (1.0 - 1e-9)));
+            }
+            let delta = 0.05 + 2.0 * uniform().abs();
+            let (step, pred) = super::dense_trust_region_step(&h, &g, delta, None).unwrap();
+            assert_more_sorensen(&h, &g, delta, &step);
+            let brute = brute_force_disc_minimum(&h, &g, delta);
+            assert!(
+                -pred <= brute + 1e-12 * (1.0 + brute.abs()),
+                "case {case}: m(s) = {} above the brute-force minimum {brute} for H = {h:?}, g = {g:?}, Δ = {delta}",
+                -pred
+            );
+        }
+    }
+
+    #[test]
+    fn the_masked_dense_trust_region_step_minimises_over_the_free_coordinates() {
+        // With coordinate 1 active, the subproblem is the 2-D model on
+        // coordinates {0, 2}; the active coordinate never moves.
+        let h = array![[-1.0, 0.7, 0.3], [0.7, 5.0, -0.4], [0.3, -0.4, 0.5]];
+        let g = array![0.2, 9.0, -0.3];
+        let active = [false, true, false];
+        let delta = 1.25;
+        let (step, pred) = super::dense_trust_region_step(&h, &g, delta, Some(&active)).unwrap();
+        assert_eq!(step[1], 0.0);
+        let reduced_h = array![[h[[0, 0]], h[[0, 2]]], [h[[2, 0]], h[[2, 2]]]];
+        let reduced_g = array![g[0], g[2]];
+        let reduced_step = array![step[0], step[2]];
+        assert_more_sorensen(&reduced_h, &reduced_g, delta, &reduced_step);
+        assert!((pred + quadratic_model(&h, &g, &step)).abs() <= 1e-14);
+        assert!(-pred <= brute_force_disc_minimum(&reduced_h, &reduced_g, delta) + 1e-14);
     }
 
     #[test]
