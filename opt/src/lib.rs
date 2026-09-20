@@ -686,8 +686,8 @@ impl TrustRegionDecision {
 pub struct TrustRegionStep {
     /// The noise-tolerant ratio
     /// `(actual + r·ε_f) / (predicted + r·ε_f)` used to drive the update
-    /// (see [`TrustRegionPolicy`]), and `f64::NEG_INFINITY` when the
-    /// predicted reduction was not finite-positive.
+    /// (see [`TrustRegionPolicy`]), and `f64::NEG_INFINITY` when no ratio
+    /// could be formed (see `predicted_nonpositive`).
     pub rho: f64,
     /// The radius to use on the next iteration, already clamped to
     /// `[min_radius, max_radius]`.
@@ -695,10 +695,11 @@ pub struct TrustRegionStep {
     /// Whether the trial step should be accepted (the caller keeps the
     /// trial iterate) or rejected (the caller restores the incumbent).
     pub accepted: bool,
-    /// `true` when the model's predicted reduction was not
-    /// finite-positive, so no ratio could be formed. A caller that
-    /// detects this pre-trial can shrink and retry without evaluating a
-    /// trial point at all.
+    /// `true` when no ratio could be formed: the prediction was not
+    /// finite, or `predicted + r·ε_f ≤ 0` — the model promised an ascent
+    /// larger than the band excuses. With `ε_f = 0` this is exactly "the
+    /// prediction was not positive". A caller that detects this pre-trial
+    /// can shrink and retry without evaluating a trial point at all.
     pub predicted_nonpositive: bool,
     /// The branch of the policy that fired.
     pub decision: TrustRegionDecision,
@@ -735,7 +736,14 @@ pub struct TrustRegionStep {
 /// # Acceptance and radius rules
 ///
 /// - `rho = −inf` (and `predicted_nonpositive`) unless `predicted` is
-///   finite and positive.
+///   finite and the denominator `predicted + r·ε_f` is positive. With
+///   `ε_f = 0` that is the classical requirement `predicted > 0`. With
+///   `ε_f > 0`, a prediction in `(−r·ε_f, 0]` is a model promise no larger
+///   than the band's own resolution — the model's two `O(‖s‖²)` terms
+///   cancelling to rounding at a step too small to move the objective —
+///   so it says nothing the objective could confirm or refute, and the
+///   step is judged by the ratio on what it realized: a realized change
+///   within the band reads `rho ≈ 1`, an ascent beyond it is rejected.
 /// - The step is **accepted** iff `rho` is finite and `rho > eta_accept`.
 ///   The theory requires `0 < eta_accept ≤ eta_shrink < eta_expand < 1`:
 ///   with `eta_accept = 0` and `ε_f > 0`, a step that realized nothing
@@ -891,7 +899,9 @@ impl TrustRegionPolicy {
         actual_reduction: f64,
         predicted_reduction: f64,
     ) -> TrustRegionStep {
-        let predicted_nonpositive = !(predicted_reduction.is_finite() && predicted_reduction > 0.0);
+        let slack = noise_tolerant_slack(self.objective_band, self.eta_expand);
+        let predicted_nonpositive =
+            !(predicted_reduction.is_finite() && predicted_reduction + slack > 0.0);
         let rho = if predicted_nonpositive {
             f64::NEG_INFINITY
         } else {
@@ -966,13 +976,19 @@ fn noise_tolerant_ratio(
     objective_band: f64,
     very_successful: f64,
 ) -> f64 {
+    let slack = noise_tolerant_slack(objective_band, very_successful);
+    (actual_reduction + slack) / (predicted_reduction + slack)
+}
+
+/// The `r·ε_f` both sides of [`noise_tolerant_ratio`] carry. A band that is
+/// not a finite non-negative number is no band: `0`, the classical ratio.
+fn noise_tolerant_slack(objective_band: f64, very_successful: f64) -> f64 {
     let band = if objective_band.is_finite() && objective_band > 0.0 {
         objective_band
     } else {
         0.0
     };
-    let slack = 2.0 / (1.0 - very_successful) * band;
-    (actual_reduction + slack) / (predicted_reduction + slack)
+    2.0 / (1.0 - very_successful) * band
 }
 
 // =====================================================================
@@ -20664,16 +20680,52 @@ mod trust_region_policy_noise_band_tests {
         assert_eq!(step.decision, TrustRegionDecision::GrowAtBoundary);
     }
 
-    /// A model that predicts no decrease still forms no ratio, band or not.
+    /// A model that promises an ascent beyond what the band excuses, or no
+    /// finite value at all, forms no ratio.
     #[test]
-    fn a_nonpositive_prediction_rejects_whatever_the_band() {
-        let policy = TrustRegionPolicy::noise_tolerant(1.0e-12, 1.0e6, 1.0);
-        for predicted in [0.0, -1.0e-3, f64::NAN, f64::INFINITY] {
+    fn a_prediction_of_ascent_beyond_the_band_rejects() {
+        let band = 1.0e-3;
+        let policy = TrustRegionPolicy::noise_tolerant(1.0e-12, 1.0e6, band);
+        let r = 2.0 / (1.0 - policy.eta_expand);
+        for predicted in [-r * band, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let step = policy.update(1.0, 1.0, false, 0.5, predicted);
-            assert!(step.predicted_nonpositive);
+            assert!(step.predicted_nonpositive, "pred={predicted}");
             assert_eq!(step.rho, f64::NEG_INFINITY);
             assert!(!step.accepted);
         }
+        // Without a band a zero prediction is still no ratio (classical).
+        let classic = TrustRegionPolicy::noise_tolerant(1.0e-12, 1.0e6, 0.0);
+        let step = classic.update(1.0, 1.0, false, 0.5, 0.0);
+        assert!(step.predicted_nonpositive);
+        assert!(!step.accepted);
+    }
+
+    /// A prediction that is non-positive only at rounding — inside the band —
+    /// promises nothing the objective could confirm or refute. The step is
+    /// judged on what it realized: a change within the band reads `rho ≈ 1`
+    /// and is accepted without shrinking the region; an ascent beyond the
+    /// band is rejected.
+    #[test]
+    fn a_rounding_level_nonpositive_prediction_is_judged_on_what_it_realized() {
+        let band = 1.0e-11;
+        let policy = TrustRegionPolicy::noise_tolerant(1.0e-12, 1.0e6, band);
+        for predicted in [0.0, -1.0e-20, -1.0e-13, -0.1 * band] {
+            for actual in [-band, -1.0e-14, 0.0, 1.0e-14, band] {
+                let step = policy.update(1.0e-9, 1.0e-9, false, actual, predicted);
+                assert!(!step.predicted_nonpositive, "pred={predicted:e}");
+                assert!(
+                    (step.rho - 1.0).abs() <= 1.0 - policy.eta_expand,
+                    "pred={predicted:e} actual={actual:e}: rho={}",
+                    step.rho
+                );
+                assert!(step.accepted);
+                assert_eq!(step.decision, TrustRegionDecision::HoldInside);
+            }
+        }
+        let r = 2.0 / (1.0 - policy.eta_expand);
+        let ascent = policy.update(1.0e-9, 1.0e-9, false, -r * band, 0.0);
+        assert!(ascent.rho <= 0.0);
+        assert!(!ascent.accepted);
     }
 
     /// A band that is not a finite non-negative number is no band: the ratio
