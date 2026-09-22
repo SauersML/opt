@@ -100,7 +100,7 @@
 //! ```
 
 use faer::{Mat, Side};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Zip};
 use std::collections::VecDeque;
 use std::sync::Arc as StdArc;
 
@@ -123,17 +123,116 @@ pub mod constants {
     pub const BACKTRACK_CONTRACTION: f64 = 0.5;
     /// Default cap on backtracking trials.
     pub const MAX_BACKTRACK_HALVINGS: usize = 60;
-    /// Round-off cushion in units of `f64::EPSILON`.
-    pub const ARMIJO_ROUNDOFF_EPS_MULTIPLE: f64 = 8.0;
     /// Geometric growth factor for ridge / Levenberg-Marquardt escalation.
     pub const RIDGE_GROWTH: f64 = 10.0;
 }
 
-/// Round-off cushion added to an Armijo sufficient-decrease threshold.
-#[inline]
-#[must_use]
-pub fn armijo_roundoff_cushion(current_value: f64) -> f64 {
-    constants::ARMIJO_ROUNDOFF_EPS_MULTIPLE * f64::EPSILON * (1.0 + current_value.abs())
+/// The absolute error a computed quantity carries, as its producer declares it:
+/// `absolute + relative·|value|` (gam#3243).
+///
+/// The two parts answer different questions. `absolute` is an error the
+/// producer MEASURED and that does not scale with the value: a quadrature
+/// remainder, an inner solve's residual energy, a log-determinant's forward
+/// error. `relative` is an error proportional to the magnitude, of which every
+/// computed `f64` carries at least one unit — the representation error of the
+/// value itself.
+///
+/// This REPLACES the `τ·ε·(1 + |f|)` cushions the line search used to apply,
+/// with `τ` set to 1e2, 1e3 or 1e4 by profile. Those described neither what the
+/// evaluator can resolve nor what the objective actually carries: too loose for
+/// an objective evaluated to full precision at a large `|f|`, and too tight by
+/// orders of magnitude for one that comes out of an inner solve, a Laplace
+/// log-determinant or a quadrature. An objective that declares nothing gets
+/// [`ValueBand::representation`], the floor every computed value carries, and
+/// an objective that has measured its error declares it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ValueBand {
+    /// The part of the error that does not scale with the value.
+    pub absolute: f64,
+    /// The part proportional to `|value|`.
+    pub relative: f64,
+}
+
+impl ValueBand {
+    /// The floor every computed `f64` carries: one rounding of the value
+    /// itself, `γ₁ = u/(1 − u)` at the unit roundoff `u = ε/2`.
+    ///
+    /// This is a DERIVED floor, not a tuned cushion. It is what a value is
+    /// known to carry when its producer declares nothing, and it is the same
+    /// rule a caller applies when an evaluation forms no error evidence of its
+    /// own. It is not zero, because a computed value is not exact; it is not a
+    /// multiple of `ε` chosen by hand, because nothing chooses one.
+    #[must_use]
+    pub const fn representation() -> Self {
+        let u = f64::EPSILON / 2.0;
+        Self {
+            absolute: 0.0,
+            relative: u / (1.0 - u),
+        }
+    }
+
+    /// A band an evaluator measured, in the value's own units, with no
+    /// magnitude-proportional part.
+    #[must_use]
+    pub const fn measured(absolute: f64) -> Self {
+        Self {
+            absolute,
+            relative: 0.0,
+        }
+    }
+
+    /// A band MEASURED at one value, carried as the proportion of that value
+    /// it was: `relative = band/|value|`.
+    ///
+    /// A criterion whose error is dominated by the rounding of its own additive
+    /// channels scales with its magnitude, so a band measured at one point
+    /// transfers to another by its proportion and not by its absolute size.
+    /// The result is never below [`ValueBand::representation`]: a declaration
+    /// cannot claim an evaluation is more exact than its own representation.
+    /// A non-finite input, or a measurement at zero, declares nothing and
+    /// returns that floor.
+    #[must_use]
+    pub fn measured_at(band: f64, value: f64) -> Self {
+        let floor = Self::representation();
+        if !band.is_finite() || !value.is_finite() || value == 0.0 || band < 0.0 {
+            return floor;
+        }
+        Self {
+            absolute: 0.0,
+            relative: (band / value.abs()).max(floor.relative),
+        }
+    }
+
+    /// An exactly evaluated quantity: both parts zero, so every comparison is
+    /// the exact one.
+    #[must_use]
+    pub const fn exact() -> Self {
+        Self {
+            absolute: 0.0,
+            relative: 0.0,
+        }
+    }
+
+    /// The band at one value.
+    #[inline]
+    #[must_use]
+    pub fn at(self, value: f64) -> f64 {
+        self.absolute + self.relative * value.abs()
+    }
+
+    /// The band of the directional derivative `gᵀd`, given this band on each
+    /// component of `g`: `|δgᵀd| ≤ Σ_j band(g_j)·|d_j|`, the exact first-order
+    /// bound. It replaces `τ·ε·‖g‖·‖d‖`, which bounds the same quantity only
+    /// when the per-component errors happen to align with `d`.
+    ///
+    /// Panics on a length mismatch, as `dot` does: a gradient and a direction
+    /// of different lengths is a caller defect, not a band of zero.
+    #[must_use]
+    pub fn directional(self, gradient: &Array1<f64>, direction: &Array1<f64>) -> f64 {
+        Zip::from(gradient)
+            .and(direction)
+            .fold(0.0, |acc, &g, &d| acc + self.at(g) * d.abs())
+    }
 }
 
 /// The trust radius below which a trust region contains no point
@@ -1986,16 +2085,6 @@ pub fn bidirectional_line_search<P, E>(
 }
 
 // Numerical helpers and small utilities
-const EPS: f64 = f64::EPSILON;
-#[inline]
-fn eps_f(fk: f64, tau: f64) -> f64 {
-    tau * EPS * (1.0 + fk.abs())
-}
-#[inline]
-fn eps_g(gk: &Array1<f64>, dk: &Array1<f64>, tau: f64) -> f64 {
-    tau * EPS * gk.dot(gk).sqrt() * dk.dot(dk).sqrt()
-}
-
 #[inline]
 fn directional_derivative(g: &Array1<f64>, s: &Array1<f64>, alpha: f64, d: &Array1<f64>) -> f64 {
     if alpha > 0.0 {
@@ -3583,6 +3672,37 @@ impl LineSearchError {
     }
 }
 
+/// The last trial the relaxed Armijo test rejected (opt#17).
+///
+/// A line search that fails reports which of two different things happened:
+/// the objective did not improve along the direction, or it may have improved
+/// by less than its own evaluation error could show. Without this the two read
+/// identically as `StepSizeTooSmall` / `MaxAttempts`, and telling them apart
+/// meant reconstructing the band from the objective's source.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArmijoMiss {
+    /// `α·|gᵀd|`: the decrease the linear model predicted for the trial.
+    pub predicted_decrease: f64,
+    /// `c₁`, the sufficient-decrease fraction the test demanded of it.
+    pub c1: f64,
+    /// `f(x) − f(x + αd)` as evaluated; negative is an increase.
+    pub observed_decrease: f64,
+    /// The summed value band of the two evaluations, which the relaxed test
+    /// admitted as slack.
+    pub band: f64,
+}
+
+impl ArmijoMiss {
+    /// True when even the decrease the model predicted, net of what the test
+    /// demands, `α·|gᵀd|·(1 − c₁)`, sits inside the evaluations' band: the test
+    /// could not have resolved an improvement at this step, whatever the
+    /// function did. False means a resolvable decrease was predicted and not
+    /// observed, which is a statement about the objective or the direction.
+    pub fn within_band(&self) -> bool {
+        self.predicted_decrease * (1.0 - self.c1) <= self.band
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineSearchFailureReason {
     MaxAttempts,
@@ -3691,6 +3811,9 @@ pub enum BfgsError {
         max_attempts: usize,
         /// Why the line search failed.
         failure_reason: LineSearchFailureReason,
+        /// The last trial the Armijo test rejected, with the band it was
+        /// judged against; `None` when no trial reached that test (opt#17).
+        last_armijo_miss: Option<ArmijoMiss>,
     },
     #[error(
         "Maximum number of iterations reached without converging. The best solution found is returned."
@@ -5384,6 +5507,34 @@ pub trait ZerothOrderObjective {
 
 pub trait FirstOrderObjective: ZerothOrderObjective {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError>;
+
+    /// The error this objective's VALUE carries, as the objective declares it
+    /// (gam#3243).
+    ///
+    /// A line search compares two evaluated values; a difference smaller than
+    /// what they carry is not a decrease the evaluator resolved, and demanding
+    /// one refuses points the objective cannot tell apart. The solver reads
+    /// this once per run and applies it at every value it compares, so it is a
+    /// property of the evaluator and not of a point.
+    ///
+    /// The default is [`ValueBand::representation`], the floor every computed
+    /// `f64` carries. An objective whose value comes out of an inner solve, a
+    /// log-determinant or a quadrature knows a larger, absolute error and
+    /// should declare it: that band, not a cushion, is what makes a relaxed
+    /// Armijo test accept the step to a minimizer whose whole noise-free
+    /// decrease is smaller than the evaluation error.
+    fn value_band(&self) -> ValueBand {
+        ValueBand::representation()
+    }
+
+    /// The error each component of this objective's GRADIENT carries, as the
+    /// objective declares it. The solver turns it into the band of a
+    /// directional derivative through [`ValueBand::directional`], which is what
+    /// the curvature (Wolfe) test compares against. Default as for
+    /// [`FirstOrderObjective::value_band`].
+    fn gradient_band(&self) -> ValueBand {
+        ValueBand::representation()
+    }
 }
 
 /// Adapts an objective that naturally computes value and gradient together to
@@ -6469,7 +6620,6 @@ struct ArcCore {
     gamma3: f64,
     fallback_policy: FallbackPolicy,
     history_cap: usize,
-    subproblem_max_iterations: usize,
     initial_sample: Option<(Array1<f64>, SecondOrderSample)>,
     gradient_tolerance: Option<GradientTolerance>,
     observer: Option<Box<dyn OptimizerObserver>>,
@@ -7131,7 +7281,6 @@ impl ArcCore {
             gamma3: 2.0,
             fallback_policy: FallbackPolicy::AutoBfgs,
             history_cap: 12,
-            subproblem_max_iterations: 80,
             initial_sample: None,
             gradient_tolerance: None,
             observer: None,
@@ -7149,7 +7298,6 @@ impl ArcCore {
                 self.gamma3 = 2.0;
                 self.fallback_policy = FallbackPolicy::AutoBfgs;
                 self.history_cap = 12;
-                self.subproblem_max_iterations = 80;
             }
             Profile::Deterministic => {
                 self.theta = 1.0;
@@ -7160,7 +7308,6 @@ impl ArcCore {
                 self.gamma3 = 2.0;
                 self.fallback_policy = FallbackPolicy::Never;
                 self.history_cap = 2;
-                self.subproblem_max_iterations = 80;
             }
             Profile::Aggressive => {
                 self.theta = 1.25;
@@ -7171,7 +7318,6 @@ impl ArcCore {
                 self.gamma3 = 2.5;
                 self.fallback_policy = FallbackPolicy::AutoBfgs;
                 self.history_cap = 20;
-                self.subproblem_max_iterations = 120;
             }
         }
     }
@@ -7517,250 +7663,135 @@ impl ArcCore {
         }
         let spectrum =
             ReducedSymmetricSpectrum::decompose(h, if use_mask { Some(active) } else { None })?;
-        if spectrum.has_resolvable_negative_curvature() {
-            // Global minimizer of
-            //   g's + 1/2 s'Hs + sigma/3 ||s||^3
-            // in the reduced eigenbasis. Its KKT multiplier satisfies
-            //   (H + lambda I)s = -g,
-            //   lambda = sigma ||s||,
-            //   H + lambda I >= 0.
-            // The last condition is the missing second-order contract in the
-            // old shifted-LU iteration. At an exact strict saddle `g=0`, the
-            // first two equations alone admit the spurious zero step; the hard
-            // case below adds the required minimum-eigenvector component.
-            let spectral_gradient = spectrum.gradient_coordinates(g);
-            let minimum = spectrum.eigenvalues[0];
-            let lambda_lower = -minimum;
-            let step = if let Some((plus, minus)) = self.arc_hard_case_steps(&spectrum, g, sigma, n)
-            {
-                // The sign of a minimum eigenvector is arbitrary. At a weakly
-                // active bound one sign can point outside the box and project
-                // back to the saddle while the other is the feasible escape.
-                // Compare the actual feasible cubic models deterministically.
-                let feasible_model = |candidate: &Array1<f64>| {
-                    let raw_trial = x + candidate;
-                    let feasible_trial = self.project_point(&raw_trial);
-                    let feasible_step = &feasible_trial - x;
-                    self.arc_model_value(g, h, sigma, &feasible_step, active_opt)
-                        .0
-                };
-                if feasible_model(&minus) < feasible_model(&plus) {
-                    minus
-                } else {
-                    plus
-                }
-            } else {
-                let secular_residual = |lambda: f64| -> Option<f64> {
-                    let mut norm_sq = 0.0_f64;
-                    for index in 0..spectral_gradient.len() {
-                        let denominator = spectrum.eigenvalues[index] + lambda;
-                        if !denominator.is_finite() || denominator <= 0.0 {
-                            return Some(f64::INFINITY);
-                        }
-                        let coordinate = spectral_gradient[index] / denominator;
-                        norm_sq += coordinate * coordinate;
-                    }
-                    Some(norm_sq.sqrt() - lambda / sigma)
-                };
-                let mut span = (sigma * g_norm)
-                    .sqrt()
-                    .max(8.0 * spectrum.numerical_floor.max(f64::EPSILON) * (1.0 + lambda_lower));
-                let mut lambda_high = lambda_lower + span;
-                let mut bracketed = false;
-                for _ in 0..128 {
-                    if secular_residual(lambda_high)? <= 0.0 {
-                        bracketed = true;
-                        break;
-                    }
-                    span *= 2.0;
-                    lambda_high = lambda_lower + span;
-                }
-                if !bracketed {
-                    return None;
-                }
-                let mut lambda_low = lambda_lower;
-                for _ in 0..self.subproblem_max_iterations.max(64) {
-                    let lambda_mid = 0.5 * (lambda_low + lambda_high);
-                    if secular_residual(lambda_mid)? > 0.0 {
-                        lambda_low = lambda_mid;
-                    } else {
-                        lambda_high = lambda_mid;
-                    }
-                    if lambda_high - lambda_low <= 8.0 * f64::EPSILON * (1.0 + lambda_high.abs()) {
-                        break;
-                    }
-                }
-                let spectral_step = Array1::from_shape_fn(spectral_gradient.len(), |index| {
-                    -spectral_gradient[index] / (spectrum.eigenvalues[index] + lambda_high)
-                });
-                spectrum.embed_step(&spectral_step, n)
-            };
-            let (model_delta, step_norm, model_gradient) =
-                self.arc_model_value(g, h, sigma, &step, active_opt);
-            let model_gradient_norm = model_gradient.dot(&model_gradient).sqrt();
-            let h_scale = spectrum
-                .eigenvalues
-                .iter()
-                .map(|value| value.abs())
-                .fold(0.0_f64, f64::max);
-            let model_gradient_floor = 8.0
-                * (spectrum.eigenvalues.len() as f64).sqrt()
-                * f64::EPSILON
-                * (g_norm + h_scale * step_norm + sigma * step_norm * step_norm);
-            if model_delta.is_finite()
-                && model_delta < 0.0
-                && step_norm.is_finite()
-                && step_norm > 0.0
-                && model_gradient_norm.is_finite()
-                && model_gradient_norm <= self.theta * step_norm * step_norm + model_gradient_floor
-            {
-                return Some(step);
-            }
-            return None;
-        }
-        if g_norm <= 1e-16 {
+        let negative_curvature = spectrum.has_resolvable_negative_curvature();
+        if !negative_curvature && g_norm == 0.0 {
             return Some(Array1::<f64>::zeros(g.len()));
         }
-
-        let rhs = -g.clone();
-        let cg_base_iter = (n / 2).clamp(25, 120);
-        let direct_small_dense = prefer_dense_direct(n);
-        let (effective_h, effective_rhs) = if direct_small_dense {
-            build_masked_subproblem_system(h, &rhs, if use_mask { Some(active) } else { None })
+        // Global minimizer of
+        //   g's + 1/2 s'Hs + sigma/3 ||s||^3
+        // in the reduced eigenbasis. Its KKT multiplier satisfies
+        //   (H + lambda I)s = -g,
+        //   lambda = sigma ||s||,
+        //   H + lambda I >= 0.
+        // The last condition is the missing second-order contract in the old
+        // shifted-LU iteration. At an exact strict saddle `g=0`, the first two
+        // equations alone admit the spurious zero step; the hard case below
+        // adds the required minimum-eigenvector component.
+        //
+        // ONE ROUTE FOR EVERY SPECTRUM (opt#19). The spectrum above is formed
+        // for every call, so the secular equation `||s(lambda)|| = lambda/sigma`
+        // is solved on it whether or not the model has negative curvature. A
+        // positive-definite model used to take a separate damped fixed point,
+        // `lambda <- lambda/2 + (lambda/2)·clamp(sigma||s||/lambda, 1/4, 4)`,
+        // which converges linearly and ran out of its iteration cap about
+        // 2000·eps short of the root, so the step it returned failed
+        // `prepare_arc_trial`'s first-order test and was refused. On a
+        // positive-definite model the multiplier's lower end is 0, since
+        // `lambda = sigma||s||` cannot be negative.
+        let spectral_gradient = spectrum.gradient_coordinates(g);
+        let minimum = spectrum.eigenvalues[0];
+        let lambda_lower = if negative_curvature {
+            -minimum
         } else {
-            (Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0))
+            (-minimum).max(0.0)
         };
-        // Solve (H + lambda I)s = -g while steering lambda toward sigma*||s||.
-        // This tracks the cubic first-order stationarity condition.
-        let mut lambda = (sigma * g_norm.sqrt()).max(1e-8);
-        let mut best: Option<(f64, Array1<f64>)> = None;
-        let mut hs = Array1::<f64>::zeros(n);
-
-        for _ in 0..self.subproblem_max_iterations {
-            let mut s = if direct_small_dense {
-                match dense_solve_shifted(&effective_h, &effective_rhs, lambda) {
-                    Some(v) => v,
-                    None => {
-                        lambda = (2.0 * lambda).max(1e-8);
-                        continue;
+        let step = if let Some((plus, minus)) = self.arc_hard_case_steps(&spectrum, g, sigma, n) {
+            // The sign of a minimum eigenvector is arbitrary. At a weakly
+            // active bound one sign can point outside the box and project
+            // back to the saddle while the other is the feasible escape.
+            // Compare the actual feasible cubic models deterministically.
+            let feasible_model = |candidate: &Array1<f64>| {
+                let raw_trial = x + candidate;
+                let feasible_trial = self.project_point(&raw_trial);
+                let feasible_step = &feasible_trial - x;
+                self.arc_model_value(g, h, sigma, &feasible_step, active_opt)
+                    .0
+            };
+            if feasible_model(&minus) < feasible_model(&plus) {
+                minus
+            } else {
+                plus
+            }
+        } else {
+            let secular_residual = |lambda: f64| -> f64 {
+                let mut norm_sq = 0.0_f64;
+                for index in 0..spectral_gradient.len() {
+                    let denominator = spectrum.eigenvalues[index] + lambda;
+                    if !denominator.is_finite() || denominator <= 0.0 {
+                        return f64::INFINITY;
                     }
+                    let coordinate = spectral_gradient[index] / denominator;
+                    norm_sq += coordinate * coordinate;
                 }
-            } else if use_mask {
-                let mut s = Array1::<f64>::zeros(n);
-                let mut r = rhs.clone();
-                mask_vector_inplace(&mut r, active);
-                let mut p = r.clone();
-                let mut rtr = r.dot(&r);
-                if !rtr.is_finite() {
+                norm_sq.sqrt() - lambda / sigma
+            };
+            // `lambda = sigma||s|| <= sigma||g||/lambda` above the spectrum, so
+            // `lambda - lambda_lower <= sqrt(sigma||g||)` brackets the root
+            // unless `lambda_lower` itself dominates; doubling covers that.
+            let mut span = (sigma * g_norm)
+                .sqrt()
+                .max(8.0 * spectrum.numerical_floor.max(f64::EPSILON) * (1.0 + lambda_lower));
+            let mut lambda_high = lambda_lower + span;
+            while secular_residual(lambda_high) > 0.0 {
+                span *= 2.0;
+                lambda_high = lambda_lower + span;
+                if !lambda_high.is_finite() {
                     return None;
                 }
-                for _ in 0..cg_base_iter {
-                    masked_hv_inplace(h, &p, active, &mut hs);
-                    hs.scaled_add(lambda, &p);
-                    let denom = p.dot(&hs);
-                    if !denom.is_finite() || denom <= 1e-14 * p.dot(&p).max(1.0) {
-                        s.fill(f64::NAN);
-                        break;
-                    }
-                    let alpha = rtr / denom;
-                    if !alpha.is_finite() || alpha <= 0.0 {
-                        s.fill(f64::NAN);
-                        break;
-                    }
-                    s.scaled_add(alpha, &p);
-                    r.scaled_add(-alpha, &hs);
-                    mask_vector_inplace(&mut s, active);
-                    mask_vector_inplace(&mut r, active);
-                    let rtr_next = r.dot(&r);
-                    if !rtr_next.is_finite() {
-                        s.fill(f64::NAN);
-                        break;
-                    }
-                    if rtr_next.sqrt() <= 1e-10 * g_norm.max(1.0) {
-                        break;
-                    }
-                    let beta = rtr_next / rtr.max(1e-32);
-                    if !beta.is_finite() || beta < 0.0 {
-                        s.fill(f64::NAN);
-                        break;
-                    }
-                    p *= beta;
-                    p += &r;
-                    mask_vector_inplace(&mut p, active);
-                    rtr = rtr_next;
+            }
+            // Bisect to the arithmetic's own resolution. There is no iteration
+            // cap: the loop ends when the bracket is 8·eps wide or when the
+            // midpoint is no longer representable between its ends, and one of
+            // the two happens within the ~2^11 exponent-and-mantissa halvings a
+            // double bracket admits.
+            let mut lambda_low = lambda_lower;
+            loop {
+                let lambda_mid = 0.5 * (lambda_low + lambda_high);
+                if lambda_mid <= lambda_low || lambda_mid >= lambda_high {
+                    break;
                 }
-                s
-            } else {
-                match cg_solve_adaptive(h, &rhs, cg_base_iter, 1e-10, lambda) {
-                    Some(v) => v,
-                    None => {
-                        lambda = (2.0 * lambda).max(1e-8);
-                        continue;
-                    }
+                if secular_residual(lambda_mid) > 0.0 {
+                    lambda_low = lambda_mid;
+                } else {
+                    lambda_high = lambda_mid;
                 }
-            };
-            if use_mask {
-                mask_vector_inplace(&mut s, active);
+                if lambda_high - lambda_low <= 8.0 * f64::EPSILON * (1.0 + lambda_high.abs()) {
+                    break;
+                }
             }
-            if s.iter().any(|v| !v.is_finite()) {
-                lambda = (2.0 * lambda).max(1e-8);
-                continue;
-            }
-
-            let (m_delta, s_norm, grad_m) =
-                self.arc_model_value(g, h, sigma, &s, if use_mask { Some(active) } else { None });
-            if !m_delta.is_finite() || !s_norm.is_finite() {
-                lambda = (2.0 * lambda).max(1e-8);
-                continue;
-            }
-            let grad_norm = grad_m.dot(&grad_m).sqrt();
-            let target = self.theta * s_norm * s_norm;
-            let merit = if target > 0.0 {
-                grad_norm / target
-            } else {
-                grad_norm
-            };
-            if best.as_ref().map(|(bm, _)| merit < *bm).unwrap_or(true) {
-                best = Some((merit, s.clone()));
-            }
-
-            // ARC first-order progress:
-            // m(s) <= m(0) and ||∇m(s)|| <= theta ||s||^2.
-            // Also require near-consistency with lambda = sigma||s|| used by the
-            // cubic first-order optimality system.
-            let lambda_target = (sigma * s_norm).max(1e-12);
-            let rel_lam_gap = (lambda - lambda_target).abs() / lambda.max(1.0);
-            if m_delta <= 0.0 && grad_norm <= target.max(1e-14) && rel_lam_gap <= 0.25 {
-                return Some(s);
-            }
-
-            if m_delta > 0.0 {
-                lambda = (2.0 * lambda.max(lambda_target)).max(1e-8);
-            } else {
-                // Damped fixed-point tracking of lambda = sigma||s||.
-                // Restrict per-iteration movement to keep the sequence stable.
-                let ratio = (lambda_target / lambda.max(1e-16)).clamp(0.25, 4.0);
-                let lambda_next = lambda * ratio;
-                let mixed = 0.5 * lambda + 0.5 * lambda_next;
-                lambda = mixed.max(1e-12);
-            }
+            let spectral_step = Array1::from_shape_fn(spectral_gradient.len(), |index| {
+                -spectral_gradient[index] / (spectrum.eigenvalues[index] + lambda_high)
+            });
+            spectrum.embed_step(&spectral_step, n)
+        };
+        let (model_delta, step_norm, model_gradient) =
+            self.arc_model_value(g, h, sigma, &step, active_opt);
+        let model_gradient_norm = model_gradient.dot(&model_gradient).sqrt();
+        let h_scale = spectrum
+            .eigenvalues
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let model_gradient_floor = 8.0
+            * (spectrum.eigenvalues.len() as f64).sqrt()
+            * f64::EPSILON
+            * (g_norm + h_scale * step_norm + sigma * step_norm * step_norm);
+        if model_delta.is_finite()
+            && model_delta < 0.0
+            && step_norm.is_finite()
+            && step_norm > 0.0
+            && model_gradient_norm.is_finite()
+            && model_gradient_norm <= self.theta * step_norm * step_norm + model_gradient_floor
+        {
+            return Some(step);
         }
-
-        if let Some((_, s)) = best {
-            let (m_delta, s_norm, grad_m) =
-                self.arc_model_value(g, h, sigma, &s, if use_mask { Some(active) } else { None });
-            let grad_norm = grad_m.dot(&grad_m).sqrt();
-            let target = self.theta * s_norm * s_norm;
-            if m_delta <= 0.0 && grad_norm <= target.max(1e-14) {
-                return Some(s);
-            }
+        if negative_curvature {
+            return None;
         }
-        self.cauchy_arc_step(
-            g,
-            h,
-            sigma,
-            if use_mask { Some(active) } else { active_opt },
-        )
+        // A positive-definite model whose exact root still fails the test has
+        // no better answer than the Cauchy point, which the ARC analysis only
+        // needs for its sufficient-decrease guarantee.
+        self.cauchy_arc_step(g, h, sigma, active_opt)
     }
 
     fn run<ObjFn>(&mut self, obj_fn: &mut ObjFn) -> Result<Solution, ArcError>
@@ -8285,8 +8316,16 @@ struct BfgsCore {
     max_iterations: usize,
     c1: f64,
     c2: f64,
-    tau_f: f64,
-    tau_g: f64,
+    /// The bands the OBJECTIVE declares, resolved once per run in
+    /// [`BfgsCore::run`] from [`FirstOrderObjective::value_band`] and
+    /// [`FirstOrderObjective::gradient_band`] (gam#3243). They are not
+    /// configuration and no profile sets them: an error is a property of the
+    /// evaluator, not of how hard the caller wants the solver to try.
+    value_band: ValueBand,
+    /// The last trial [`Self::accept_armijo`] rejected, reported on a line-search
+    /// failure (opt#17). A `Cell` because the test is a read-only predicate.
+    last_armijo_miss: std::cell::Cell<Option<ArmijoMiss>>,
+    gradient_band: ValueBand,
     bounds: Option<BoxSpec>,
     flat_step_policy: FlatStepPolicy,
     /// Seed for `rng_state`, retained so `reset_run_state` can restart
@@ -8511,8 +8550,9 @@ impl BfgsCore {
             max_iterations: _,
             c1,
             c2,
-            tau_f: _,
-            tau_g: _,
+            // Re-resolved from the objective at the top of every `run`.
+            value_band: _,
+            gradient_band: _,
             bounds: _,
             flat_step_policy: _,
             rescue_policy: _,
@@ -8550,6 +8590,7 @@ impl BfgsCore {
             initial_grad_norm,
             local_mode,
             cost_stall,
+            last_armijo_miss,
         } = self;
 
         // Re-seeding the jiggle stream is what makes two identical runs
@@ -8577,6 +8618,8 @@ impl BfgsCore {
         *spd_fail_seen = false;
         *initial_grad_norm = 0.0;
         *local_mode = false;
+        // A rejection from a previous run says nothing about this one.
+        last_armijo_miss.set(None);
         // Keep the configured guard, discard its accumulated window.
         if let Some(state) = cost_stall.as_mut() {
             *state = CostStallState::new(state.config);
@@ -8639,7 +8682,8 @@ impl BfgsCore {
         let proj_changed = p_diff_norm > 1e-6 * (1.0 + p_norm);
         if proj_changed {
             // If projection materially changes the step, require descent at x_k.
-            let descent_ok = g_proj_k.dot(&s_tr) <= -eps_g(&g_proj_k, &s_tr, self.tau_g);
+            let descent_ok =
+                g_proj_k.dot(&s_tr) <= -self.gradient_band.directional(&g_proj_k, &s_tr);
             if !descent_ok {
                 self.trust_radius = (delta * 0.5).max(1e-12);
                 return None;
@@ -8673,7 +8717,7 @@ impl BfgsCore {
         self.gll.push(f_try);
         let maybe_f = self.global_best.as_ref().map(|b| b.f);
         if let Some(bf) = maybe_f {
-            if f_try < bf - eps_f(bf, self.tau_f) {
+            if f_try < bf - self.value_gap_band(bf, f_try) {
                 self.global_best = Some(ProbeBest {
                     f: f_try,
                     x: x_try.clone(),
@@ -8786,8 +8830,9 @@ impl BfgsCore {
             max_iterations: 100,
             c1: 1e-4, // Standard value for sufficient decrease
             c2: 0.9,  // Standard value for curvature condition
-            tau_f: 1e3,
-            tau_g: 1e2,
+            value_band: ValueBand::representation(),
+            last_armijo_miss: std::cell::Cell::new(None),
+            gradient_band: ValueBand::representation(),
             bounds: None,
             flat_step_policy: FlatStepPolicy::MidpointWithJiggle { scale: 1e-3 },
             rng_seed: 0xB5F0_D00D_1234_5678u64,
@@ -8833,8 +8878,6 @@ impl BfgsCore {
     fn apply_profile(&mut self, profile: Profile) {
         match profile {
             Profile::Robust => {
-                self.tau_f = 1e3;
-                self.tau_g = 1e2;
                 self.flat_step_policy = FlatStepPolicy::MidpointWithJiggle { scale: 1e-3 };
                 self.rescue_policy = RescuePolicy::CoordinateHybrid {
                     pool_mult: 4.0,
@@ -8846,8 +8889,6 @@ impl BfgsCore {
                 self.max_no_improve = 5;
             }
             Profile::Deterministic => {
-                self.tau_f = 1e2;
-                self.tau_g = 1e2;
                 self.flat_step_policy = FlatStepPolicy::Strict;
                 self.rescue_policy = RescuePolicy::Off;
                 self.stall_policy = StallPolicy::On { window: 3 };
@@ -8856,8 +8897,6 @@ impl BfgsCore {
                 self.max_no_improve = 5;
             }
             Profile::Aggressive => {
-                self.tau_f = 1e4;
-                self.tau_g = 1e3;
                 self.flat_step_policy = FlatStepPolicy::MidpointWithJiggle { scale: 1e-3 };
                 self.rescue_policy = RescuePolicy::CoordinateHybrid {
                     pool_mult: 6.0,
@@ -8871,19 +8910,44 @@ impl BfgsCore {
         }
     }
 
+    /// The slack a comparison of two evaluated criterion values must allow:
+    /// the sum of the two values' own bands (gam#3243). A difference smaller
+    /// than this is not one the evaluator resolved, in either direction.
+    #[inline]
+    fn value_gap_band(&self, a: f64, b: f64) -> f64 {
+        self.value_band.at(a) + self.value_band.at(b)
+    }
+
+    /// The relaxed Armijo condition for an objective evaluated with error
+    /// (Berahas, Byrd & Nocedal 2019; Shi, Xuan, Oztoprak & Nocedal 2022):
+    /// `f(x + αd) ≤ f(x) + c₁·α·gᵀd + 2ε_f`.
+    ///
+    /// The `2ε_f` of the literature is the error a DIFFERENCE of two
+    /// evaluations carries when both carry the same band. Each value here
+    /// carries its own, so the admitted slack is the sum of the two, which is
+    /// that same quantity written exactly and is `2ε_f` when they agree. Bands
+    /// of zero give the exact Armijo test.
     #[inline]
     fn accept_armijo(&self, f_k: f64, gk_ts: f64, f_i: f64) -> bool {
         let c1 = self.c1_adapt;
-        let epsf_k = eps_f(f_k, self.tau_f);
-        f_i <= f_k + c1 * gk_ts + epsf_k
+        let band = self.value_gap_band(f_k, f_i);
+        let accepted = f_i <= f_k + c1 * gk_ts + band;
+        if !accepted {
+            self.last_armijo_miss.set(Some(ArmijoMiss {
+                predicted_decrease: -gk_ts,
+                c1,
+                observed_decrease: f_k - f_i,
+                band,
+            }));
+        }
+        accepted
     }
 
     #[inline]
     fn accept_gll_nonmonotone(&self, fmax: f64, gk_ts: f64, f_i: f64) -> bool {
         !self.local_mode && {
             let c1 = self.c1_adapt;
-            let epsf_max = eps_f(fmax, self.tau_f);
-            f_i <= fmax + c1 * gk_ts + epsf_max
+            f_i <= fmax + c1 * gk_ts + self.value_gap_band(fmax, f_i)
         }
     }
 
@@ -9085,6 +9149,13 @@ impl BfgsCore {
         // configured solver. Start from a clean slate every time, or a
         // previous run's streaks decide this run's termination.
         self.reset_run_state();
+        // The error the OBJECTIVE declares, read once here and applied to every
+        // value and gradient this run compares (gam#3243). Reading it per run
+        // rather than per point keeps one declaration behind every comparison,
+        // so no two tests in one run judge the same evaluator by different
+        // resolutions.
+        self.value_band = obj_fn.value_band();
+        self.gradient_band = obj_fn.gradient_band();
         let n = self.x0.len();
         // Resolve `with_initial_metric` into the existing
         // `initial_b_inv` slot so the rest of the loop is unchanged.
@@ -9307,7 +9378,7 @@ impl BfgsCore {
                 let gdotd = g_proj_k.dot(&present_d_k);
                 let dnorm = present_d_k.dot(&present_d_k).sqrt();
                 let tiny_d = dnorm <= 1e-14 * (1.0 + x_k.dot(&x_k).sqrt());
-                let eps_dir = eps_g(&g_proj_k, &present_d_k, self.tau_g);
+                let eps_dir = self.gradient_band.directional(&g_proj_k, &present_d_k);
                 if gdotd >= -eps_dir || tiny_d {
                     log::warn!("[BFGS] Non-descent direction; resetting to -g and B_inv=I.");
                     b_inv = Array2::eye(n);
@@ -9451,7 +9522,7 @@ impl BfgsCore {
                                     };
                                     // Salvage best point seen during line search if any
                                     if let Some(b) = self.global_best.clone() {
-                                        let epsF = eps_f(f_k, self.tau_f);
+                                        let epsF = self.value_gap_band(f_k, b.f);
                                         let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
                                         let gb_proj = self.projected_gradient(&b.x, &b.g);
                                         let gb_norm = gb_proj.dot(&gb_proj).sqrt();
@@ -9552,7 +9623,7 @@ impl BfgsCore {
                                             },
                                         );
                                         if let Some(b) = self.global_best.as_ref()
-                                            && b.f < f_k - eps_f(f_k, self.tau_f)
+                                            && b.f < f_k - self.value_gap_band(f_k, b.f)
                                         {
                                             let gb_proj = self.projected_gradient(&b.x, &b.g);
                                             ls = Solution::gradient_based(
@@ -9581,6 +9652,7 @@ impl BfgsCore {
                                             last_solution: Box::new(ls),
                                             max_attempts,
                                             failure_reason,
+                                            last_armijo_miss: self.last_armijo_miss.get(),
                                         });
                                     }
                                     if self.ls_failures_in_row >= 2 {
@@ -9602,6 +9674,7 @@ impl BfgsCore {
                                             last_solution: Box::new(ls),
                                             max_attempts,
                                             failure_reason,
+                                            last_armijo_miss: self.last_armijo_miss.get(),
                                         });
                                     }
                                     continue;
@@ -9706,7 +9779,7 @@ impl BfgsCore {
                                         continue;
                                     }
                                     if let Some(b) = self.global_best.clone() {
-                                        let epsF = eps_f(f_k, self.tau_f);
+                                        let epsF = self.value_gap_band(f_k, b.f);
                                         let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
                                         let gb_proj = self.projected_gradient(&b.x, &b.g);
                                         let gb_norm = gb_proj.dot(&gb_proj).sqrt();
@@ -9765,7 +9838,7 @@ impl BfgsCore {
                                             },
                                         );
                                         if let Some(b) = self.global_best.as_ref()
-                                            && b.f < f_k - eps_f(f_k, self.tau_f)
+                                            && b.f < f_k - self.value_gap_band(f_k, b.f)
                                         {
                                             let b_proj = self.projected_gradient(&b.x, &b.g);
                                             ls = Solution::gradient_based(
@@ -9794,6 +9867,7 @@ impl BfgsCore {
                                             last_solution: Box::new(ls),
                                             max_attempts,
                                             failure_reason,
+                                            last_armijo_miss: self.last_armijo_miss.get(),
                                         });
                                     }
                                     if self.ls_failures_in_row >= 2 {
@@ -9815,6 +9889,7 @@ impl BfgsCore {
                                             last_solution: Box::new(ls),
                                             max_attempts,
                                             failure_reason,
+                                            last_armijo_miss: self.last_armijo_miss.get(),
                                         });
                                     }
                                     continue;
@@ -9828,7 +9903,7 @@ impl BfgsCore {
                 let mut s_override: Option<Array1<f64>> = None;
                 let mut rescued = false;
                 if self.rescue_enabled() {
-                    let epsF_iter = eps_f(f_k, self.tau_f);
+                    let epsF_iter = self.value_gap_band(f_k, f_next);
                     let flat_now = (f_next - f_k).abs() <= epsF_iter;
                     if flat_now && self.flat_accept_streak >= 2 {
                         let x_base = self.project_point(&(&x_k + &(alpha_k * &present_d_k)));
@@ -9910,7 +9985,7 @@ impl BfgsCore {
                                     let f_thresh = f_k.min(f_next) + epsF_iter;
                                     let s_trial = &x_try - &x_k;
                                     let descent_ok = g_proj_k.dot(&s_trial)
-                                        <= -eps_g(&g_proj_k, &s_trial, self.tau_g);
+                                        <= -self.gradient_band.directional(&g_proj_k, &s_trial);
                                     let f_ok = f_try <= f_thresh;
                                     let g_ok = g_try_norm <= self.grad_drop_factor * gnext_norm0;
                                     if (f_ok || g_ok) && descent_ok && f_try <= best_f {
@@ -10094,7 +10169,7 @@ impl BfgsCore {
                 }
 
                 // Update adaptive curvature slack scale and gradient drop factor based on flats
-                let f_ok_flat = (f_next - f_k).abs() <= eps_f(f_k, self.tau_f)
+                let f_ok_flat = (f_next - f_k).abs() <= self.value_gap_band(f_k, f_next)
                     || (f_next - f_k).abs() <= self.tol_f_rel * (1.0 + f_k.abs());
                 if f_ok_flat {
                     self.flat_accept_streak += 1;
@@ -10262,7 +10337,7 @@ impl BfgsCore {
 
                 // Stopping tests: small step and flat f
                 let step_ok = self.feasible_step_small(&x_k, &x_next);
-                let f_ok = (f_next - f_k).abs() <= eps_f(f_k, self.tau_f);
+                let f_ok = (f_next - f_k).abs() <= self.value_gap_band(f_k, f_next);
                 let gnext_finite = f_next.is_finite() && g_next.iter().all(|v| v.is_finite());
                 let gnext_norm = g_proj_next.dot(&g_proj_next).sqrt();
                 if step_ok && f_ok && gnext_finite && gnext_norm < effective_tol {
@@ -10302,7 +10377,7 @@ impl BfgsCore {
                     let x_inf = x_k.iter().fold(0.0, |acc, &v| f64::max(acc, v.abs()));
                     let rel_g_ok = g_inf <= effective_tol * (1.0 + x_inf);
                     let rel_f_ok =
-                        (f_k - f_last_accepted).abs() <= eps_f(f_last_accepted, self.tau_f);
+                        (f_k - f_last_accepted).abs() <= self.value_gap_band(f_last_accepted, f_k);
                     if rel_g_ok && rel_f_ok {
                         self.stall_noimprove_streak += 1;
                     } else {
@@ -10375,7 +10450,7 @@ impl BfgsCore {
                 let maybe_f = self.global_best.as_ref().map(|b| b.f);
                 match maybe_f {
                     Some(bf) => {
-                        if f_k < bf - eps_f(bf, self.tau_f) {
+                        if f_k < bf - self.value_gap_band(bf, f_k) {
                             self.global_best = Some(ProbeBest {
                                 f: f_k,
                                 x: x_k.clone(),
@@ -12553,7 +12628,7 @@ where
     let mut f_prev = f_k;
     let g_proj_k = core.projected_gradient(x_k, g_k);
     let g_k_dot_d = g_proj_k.dot(d_k); // Initial derivative along the search direction.
-    if g_k_dot_d >= -eps_g(&g_proj_k, d_k, core.tau_g) {
+    if g_k_dot_d >= -core.gradient_band.directional(&g_proj_k, d_k) {
         log::warn!(
             "[BFGS Wolfe] Non-descent direction detected (gᵀd = {:.2e} >= 0).",
             g_k_dot_d
@@ -12564,7 +12639,6 @@ where
     let max_attempts = WOLFE_MAX_ATTEMPTS;
     let mut func_evals = 0;
     let mut grad_evals = 0;
-    let epsF = eps_f(f_k, core.tau_f);
     let mut best = ProbeBest::new(x_k, f_k, g_k);
     for _ in 0..max_attempts {
         let (x_new, s, _) = core.project_with_step(x_k, d_k, alpha_i);
@@ -12607,7 +12681,7 @@ where
                     g_k,
                     0.0,
                     alpha_i.max(f64::EPSILON),
-                    core.tau_g,
+                    core.gradient_band,
                     core.grad_drop_factor,
                     &mut func_evals,
                     &mut grad_evals,
@@ -12632,8 +12706,8 @@ where
 
         // Classic Armijo + previous worsening for bracketing (Strong-Wolfe)
         let gkTs = g_proj_k.dot(&s);
-        let armijo_strict = f_i > f_k + c1 * gkTs + epsF;
-        let prev_worse = func_evals > 1 && f_i >= f_prev - epsF;
+        let armijo_strict = f_i > f_k + c1 * gkTs + core.value_gap_band(f_k, f_i);
+        let prev_worse = func_evals > 1 && f_i >= f_prev - core.value_gap_band(f_prev, f_i);
         if armijo_strict || prev_worse {
             let r = zoom(
                 core,
@@ -12707,8 +12781,8 @@ where
         }
         best.consider(&x_new, f_i, &g_i);
 
-        let armijo_strict = f_i > f_k + c1 * gkTs + epsF;
-        let prev_worse = func_evals > 1 && f_i >= f_prev - epsF;
+        let armijo_strict = f_i > f_k + c1 * gkTs + core.value_gap_band(f_k, f_i);
+        let prev_worse = func_evals > 1 && f_i >= f_prev - core.value_gap_band(f_prev, f_i);
         if armijo_strict || prev_worse {
             let g_proj_i = core.projected_gradient(&x_new, &g_i);
             let g_i_dot_d = directional_derivative(&g_proj_i, &s, alpha_i, d_k);
@@ -12750,7 +12824,7 @@ where
         } else {
             core.gll.fmax()
         };
-        let epsG = eps_g(&g_proj_k, d_k, core.tau_g);
+        let epsG = core.gradient_band.directional(&g_proj_k, d_k);
         if let Some(kind) = classify_line_search_accept(
             core,
             step_ok,
@@ -12763,7 +12837,7 @@ where
             gi_norm,
             gk_norm,
             drop_factor,
-            epsF,
+            core.value_gap_band(f_k, f_i),
             epsG,
             c2,
         ) {
@@ -12774,7 +12848,7 @@ where
             return Ok((alpha_i, f_i, g_i, func_evals, grad_evals, kind));
         }
 
-        if g_i_dot_d >= -eps_g(&g_proj_k, d_k, core.tau_g) {
+        if g_i_dot_d >= -core.gradient_band.directional(&g_proj_k, d_k) {
             // The minimum is bracketed between alpha_i and alpha_prev.
             // The current point is the best (low) endpoint.
             let r = zoom(
@@ -12827,7 +12901,7 @@ where
             g_k,
             0.0,
             alpha_i,
-            core.tau_g,
+            core.gradient_band,
             core.grad_drop_factor,
             &mut func_evals,
             &mut grad_evals,
@@ -12862,7 +12936,7 @@ where
     let g_proj_k = core.projected_gradient(x_k, g_k);
     let g_k_dot_d = g_proj_k.dot(d_k);
     // A backtracking search is only valid on a descent direction.
-    if g_k_dot_d >= -eps_g(&g_proj_k, d_k, core.tau_g) {
+    if g_k_dot_d >= -core.gradient_band.directional(&g_proj_k, d_k) {
         log::warn!(
             "[BFGS Backtracking] Search started with a non-descent direction (gᵀd = {:.2e} > 0). This step will likely fail.",
             g_k_dot_d
@@ -12872,7 +12946,6 @@ where
     let mut func_evals = 0;
     let mut grad_evals = 0;
     let mut best = ProbeBest::new(x_k, f_k, g_k);
-    let epsF = eps_f(f_k, core.tau_f);
     let mut no_change_count = 0usize;
     let mut expanded_once = false;
     let dnorm = d_k.dot(d_k).sqrt();
@@ -12928,7 +13001,7 @@ where
         let gll_accept = core.accept_gll_nonmonotone(fmax, gkTs, f_new);
         let candidate_for_gradient = armijo_accept
             || gll_accept
-            || (core.relaxed_acceptors_enabled() && f_new <= f_k + epsF);
+            || (core.relaxed_acceptors_enabled() && f_new <= f_k + core.value_gap_band(f_k, f_new));
         let mut g_new_opt = None;
         if candidate_for_gradient {
             let (f_full, g_new) =
@@ -12972,7 +13045,7 @@ where
         }
 
         let Some(g_new) = g_new_opt else {
-            if (f_new - f_k).abs() <= epsF {
+            if (f_new - f_k).abs() <= core.value_gap_band(f_k, f_new) {
                 no_change_count += 1;
             } else {
                 no_change_count = 0;
@@ -13008,7 +13081,7 @@ where
         let gk_norm = g_proj_k.dot(&g_proj_k).sqrt();
         let drop_factor = core.grad_drop_factor;
         let g_new_dot_d = directional_derivative(&g_proj_new, &s, alpha, d_k);
-        let epsG = eps_g(&g_proj_k, d_k, core.tau_g);
+        let epsG = core.gradient_band.directional(&g_proj_k, d_k);
         if let Some(kind) = classify_line_search_accept(
             core,
             step_ok,
@@ -13021,7 +13094,7 @@ where
             gnew_norm,
             gk_norm,
             drop_factor,
-            epsF,
+            core.value_gap_band(f_k, f_new),
             epsG,
             core.c2_adapt,
         ) {
@@ -13047,7 +13120,7 @@ where
             ));
         }
 
-        if (f_new - f_k).abs() <= epsF {
+        if (f_new - f_k).abs() <= core.value_gap_band(f_k, f_new) {
             no_change_count += 1;
         } else {
             no_change_count = 0;
@@ -13090,7 +13163,7 @@ where
             g_k,
             0.0,
             alpha,
-            core.tau_g,
+            core.gradient_band,
             core.grad_drop_factor,
             &mut func_evals,
             &mut grad_evals,
@@ -13142,7 +13215,6 @@ where
 {
     let max_zoom_attempts = 15;
     let min_alpha_step = 1e-12; // Prevents division by zero or degenerate steps.
-    let epsF = eps_f(f_k, core.tau_f);
     let mut best = ProbeBest::new(x_k, f_k, g_k);
     let mut lo_deriv_known = g_lo_dot_d.is_finite();
     let mut hi_deriv_known = g_hi_dot_d.is_finite();
@@ -13163,11 +13235,11 @@ where
         // endpoint invalidates derivative-based interpolation, not the bracket.
         let bracket_has_kink = kink_lo || kink_hi;
         let tiny_bracket = (alpha_hi - alpha_lo).abs() <= 1e-12;
-        let flat_f = (f_hi - f_lo).abs() <= epsF;
+        let flat_f = (f_hi - f_lo).abs() <= core.value_gap_band(f_hi, f_lo);
         let similar_slope = lo_deriv_known
             && hi_deriv_known
             && (g_hi_dot_d.abs() - g_lo_dot_d.abs()).abs()
-                <= core.curv_slack_scale * eps_g(g_proj_k, d_k, core.tau_g);
+                <= core.curv_slack_scale * core.gradient_band.directional(g_proj_k, d_k);
         // Endpoint rescue is useful only once the bracket itself is tiny.
         // Re-evaluating a known endpoint of a flat bracket cannot refine it.
         if tiny_bracket {
@@ -13227,7 +13299,7 @@ where
             let gkTs = g_proj_k.dot(&s_j);
             let gk_dot_d_eff = directional_derivative(g_proj_k, &s_j, alpha_j, d_k);
             let g_j_dot_d = directional_derivative(&g_proj_j, &s_j, alpha_j, d_k);
-            let epsG = eps_g(g_proj_k, d_k, core.tau_g);
+            let epsG = core.gradient_band.directional(g_proj_k, d_k);
             let gj_norm = g_proj_j.iter().map(|v| v * v).sum::<f64>().sqrt();
             let gk_norm = g_proj_k.iter().map(|v| v * v).sum::<f64>().sqrt();
             let drop_factor = core.grad_drop_factor;
@@ -13248,7 +13320,7 @@ where
                 gj_norm,
                 gk_norm,
                 drop_factor,
-                epsF,
+                core.value_gap_band(f_k, f_j),
                 epsG,
                 c2,
             ) {
@@ -13311,7 +13383,7 @@ where
                 let g_mid_dot_d = directional_derivative(&g_proj_mid, &s_mid, alpha_mid, d_k);
                 let gkTs = g_proj_k.dot(&s_mid);
                 let gk_dot_d_eff = directional_derivative(g_proj_k, &s_mid, alpha_mid, d_k);
-                let epsG = eps_g(g_proj_k, d_k, core.tau_g);
+                let epsG = core.gradient_band.directional(g_proj_k, d_k);
                 let gmid_norm = g_proj_mid.iter().map(|v| v * v).sum::<f64>().sqrt();
                 let gk_norm = g_proj_k.iter().map(|v| v * v).sum::<f64>().sqrt();
                 let drop_factor = core.grad_drop_factor;
@@ -13332,7 +13404,7 @@ where
                     gmid_norm,
                     gk_norm,
                     drop_factor,
-                    epsF,
+                    core.value_gap_band(f_k, f_mid),
                     epsG,
                     c2,
                 ) {
@@ -13474,9 +13546,11 @@ where
         };
         let gkTs = g_proj_k.dot(&s_j);
         let gk_dot_d_eff = directional_derivative(g_proj_k, &s_j, alpha_j, d_k);
-        let armijo_ok = f_j <= f_k + c1 * gkTs + epsF;
-        let armijo_gll_ok = f_j <= fmax + c1 * gkTs + epsF;
-        if (!armijo_ok && !armijo_gll_ok) || f_j >= f_lo - epsF {
+        // Each comparison is between two evaluated values, so its slack is the
+        // sum of those two values' bands (see `BfgsCore::value_gap_band`).
+        let armijo_ok = f_j <= f_k + c1 * gkTs + core.value_gap_band(f_k, f_j);
+        let armijo_gll_ok = f_j <= fmax + c1 * gkTs + core.value_gap_band(fmax, f_j);
+        if (!armijo_ok && !armijo_gll_ok) || f_j >= f_lo - core.value_gap_band(f_lo, f_j) {
             alpha_hi = alpha_j;
             f_hi = f_j;
             hi_deriv_known = false;
@@ -13523,9 +13597,9 @@ where
                 continue;
             }
             best.consider(&x_j, f_j, &g_j);
-            let armijo_ok = f_j <= f_k + c1 * gkTs + epsF;
-            let armijo_gll_ok = f_j <= fmax + c1 * gkTs + epsF;
-            if (!armijo_ok && !armijo_gll_ok) || f_j >= f_lo - epsF {
+            let armijo_ok = f_j <= f_k + c1 * gkTs + core.value_gap_band(f_k, f_j);
+            let armijo_gll_ok = f_j <= fmax + c1 * gkTs + core.value_gap_band(fmax, f_j);
+            if (!armijo_ok && !armijo_gll_ok) || f_j >= f_lo - core.value_gap_band(f_lo, f_j) {
                 alpha_hi = alpha_j;
                 f_hi = f_j;
                 let g_proj_j = core.projected_gradient(&x_j, &g_j);
@@ -13539,7 +13613,7 @@ where
             let gj_norm = g_proj_j.dot(&g_proj_j).sqrt();
             let gk_norm = g_proj_k.dot(g_proj_k).sqrt();
             let drop_factor = core.grad_drop_factor;
-            let epsG = eps_g(g_proj_k, d_k, core.tau_g);
+            let epsG = core.gradient_band.directional(g_proj_k, d_k);
             if let Some(kind) = classify_line_search_accept(
                 core,
                 step_ok,
@@ -13552,7 +13626,7 @@ where
                 gj_norm,
                 gk_norm,
                 drop_factor,
-                epsF,
+                core.value_gap_band(f_k, f_j),
                 epsG,
                 c2,
             ) {
@@ -13561,7 +13635,7 @@ where
 
             // The minimum is bracketed by a point with a negative derivative
             // (alpha_lo) and a point with a positive derivative (alpha_j).
-            if g_j_dot_d >= -eps_g(g_proj_k, d_k, core.tau_g) {
+            if g_j_dot_d >= -core.gradient_band.directional(g_proj_k, d_k) {
                 // The new point has a positive derivative and a lower function value,
                 // so it becomes the new best (low) point and the old low becomes high.
                 alpha_hi = alpha_lo;
@@ -13594,7 +13668,7 @@ where
         g_k,
         alpha_lo.min(alpha_hi),
         alpha_lo.max(alpha_hi),
-        core.tau_g,
+        core.gradient_band,
         core.grad_drop_factor,
         &mut func_evals,
         &mut grad_evals,
@@ -13622,7 +13696,7 @@ fn probe_alphas<ObjFn>(
     g_k: &Array1<f64>,
     a_lo: f64,
     a_hi: f64,
-    tau_g: f64,
+    gradient_band: ValueBand,
     drop_factor: f64,
     fe: &mut usize,
     ge: &mut usize,
@@ -13633,8 +13707,7 @@ where
     let cands = [0.2, 0.5, 0.8].map(|t| a_lo + t * (a_hi - a_lo));
     let g_proj_k = core.projected_gradient(x_k, g_k);
     let gk_norm = g_proj_k.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let epsF = eps_f(f_k, core.tau_f);
-    let epsG = eps_g(&g_proj_k, d_k, tau_g);
+    let epsG = gradient_band.directional(&g_proj_k, d_k);
     let mut best: Option<(f64, f64, Array1<f64>, AcceptKind)> = None;
     for &a in &cands {
         if !a.is_finite() || a <= 0.0 {
@@ -13681,7 +13754,7 @@ where
             gi_norm,
             gk_norm,
             drop_factor,
-            epsF,
+            core.value_gap_band(f_k, f),
             epsG,
             core.c2_adapt,
         ) && best.as_ref().map(|(fb, _, _, _)| f < *fb).unwrap_or(true)
@@ -13716,7 +13789,7 @@ mod tests {
         OptimizationStatus, OptimizerObserver, Problem, Profile, RidgeSchedule,
         SecondOrderObjective, SecondOrderObjectiveInto, SecondOrderProblem, SecondOrderSample,
         SecondOrderWorkspace, Solution, StationarityKind, StationarityNorm, StepInfo,
-        TerminationReason, Tolerance, ZerothOrderObjective, backtracking_line_search,
+        TerminationReason, Tolerance, ValueBand, ZerothOrderObjective, backtracking_line_search,
         escalate_ridge, newton_decrement_verdict, optimize,
     };
     use ndarray::{Array1, Array2, array};
@@ -15504,6 +15577,171 @@ mod tests {
         assert!(matches!(kind, super::AcceptKind::StrongWolfe));
     }
 
+    /// An objective that declares nothing is not treated as exact, and it is
+    /// not given a cushion either: it carries the representation error of its
+    /// own value, `γ₁·|f|` (gam#3243). Both tails are asserted -- the band of a
+    /// nonzero value is strictly positive, and it is strictly below the
+    /// `1e2·ε·(1 + |f|)` the Deterministic profile used to apply, which is the
+    /// direction the replacement is claimed to move in.
+    #[test]
+    fn an_undeclared_band_is_the_representation_floor_3243() {
+        let band = ValueBand::representation();
+        let u = f64::EPSILON / 2.0;
+        let gamma1 = u / (1.0 - u);
+        for value in [1.0_f64, -4.4e3, 2.2e4, 1.0e-8] {
+            let at = band.at(value);
+            assert!(at > 0.0, "a computed value is not exact: {value}");
+            assert_eq!(at, gamma1 * value.abs());
+            let retired_cushion = 1.0e2 * f64::EPSILON * (1.0 + value.abs());
+            assert!(
+                at < retired_cushion,
+                "the floor must be tighter than the retired cushion at {value}: \
+                 {at} vs {retired_cushion}"
+            );
+        }
+        assert_eq!(ValueBand::exact().at(1.0e300), 0.0);
+        assert_eq!(ValueBand::measured(3.0).at(-5.0), 3.0);
+        // A measured band carried by proportion, and never below the floor.
+        let carried = ValueBand::measured_at(1.429e-3, -4.4e3);
+        assert!((carried.at(-4.4e3) - 1.429e-3).abs() <= 1.0e-18);
+        assert!((carried.at(-8.8e3) - 2.858e-3).abs() <= 1.0e-17);
+        assert_eq!(
+            ValueBand::measured_at(0.0, 1.0),
+            ValueBand::representation()
+        );
+        assert_eq!(
+            ValueBand::measured_at(f64::NAN, 1.0),
+            ValueBand::representation()
+        );
+        assert_eq!(
+            ValueBand::measured_at(1.0, 0.0),
+            ValueBand::representation()
+        );
+    }
+
+    /// The directional band is the exact first-order bound on the error of
+    /// `gᵀd`: it must hold for EVERY perturbation the component bands admit,
+    /// and it must be attained by the worst one, or it is either wrong or
+    /// loose. The retired `τ·ε·‖g‖·‖d‖` is neither.
+    #[test]
+    fn the_directional_band_bounds_every_admitted_gradient_error_3243() {
+        let band = ValueBand::measured(1.0e-6);
+        let g = array![3.0, -4.0, 0.5];
+        let d = array![1.0, 2.0, -3.0];
+        let bound = band.directional(&g, &d);
+        // Σ_j band·|d_j| with a purely absolute band.
+        assert!((bound - 1.0e-6 * (1.0 + 2.0 + 3.0)).abs() <= 1.0e-18);
+        // Attained: each component at its band, signed with d. The band is per
+        // component, so the extreme perturbation is `sign(d_j)·band`, not a
+        // multiple of `|d_j|` (that would count `|d_j|` twice).
+        let worst = array![1.0e-6, 1.0e-6, -1.0e-6];
+        let attained = (0..3).map(|j| worst[j] * d[j]).sum::<f64>();
+        assert!((attained - bound).abs() <= 1.0e-18, "{attained} vs {bound}");
+        // Bounds every admitted perturbation, including ones that cancel.
+        for signs in [[1.0, 1.0, 1.0], [1.0, -1.0, 1.0], [-1.0, -1.0, -1.0]] {
+            let delta: f64 = (0..3).map(|j| signs[j] * 1.0e-6 * d[j]).sum();
+            assert!(delta.abs() <= bound + 1.0e-18, "{delta} exceeds {bound}");
+        }
+    }
+
+    /// gam#3243's own repro, and the reason the cushion had to go. `V = ½x²`
+    /// is evaluated with an error of `ε = 1e-10`: `+ε` inside `|x| < √(2ε)` and
+    /// `−ε` outside, gradient exact, started at `x₀ = 1.2·√(2ε)`.
+    ///
+    /// The first quasi-Newton step goes to `x = 0`, the exact minimizer, and
+    /// REALIZES `−0.56·ε`: the whole noise-free decrease is `1.44ε` and `2ε` of
+    /// evaluation error sits on top of it. Under the retired
+    /// `1e2·ε_machine·(1 + |f|) ≈ 2.2e−14` cushion that step and every
+    /// backtrack into the basin were rejected and the run ended in
+    /// `StepSizeTooSmall` with no point. With the evaluator's own band
+    /// declared, the relaxed Armijo test admits `−0.56ε ≥ −2ε` and the run
+    /// returns the minimizer.
+    #[test]
+    fn a_declared_band_accepts_the_step_into_a_band_offset_basin_3243() {
+        const NOISE: f64 = 1.0e-10;
+
+        struct BandedBasin;
+        impl ZerothOrderObjective for BandedBasin {
+            fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+                Ok(banded_basin_value(x[0]))
+            }
+        }
+        impl FirstOrderObjective for BandedBasin {
+            fn eval_grad(
+                &mut self,
+                x: &Array1<f64>,
+            ) -> Result<FirstOrderSample, ObjectiveEvalError> {
+                Ok(FirstOrderSample {
+                    value: banded_basin_value(x[0]),
+                    gradient: array![x[0]],
+                })
+            }
+            fn value_band(&self) -> ValueBand {
+                // The evaluator's error is exactly NOISE, in the value's units,
+                // and does not scale with the value.
+                ValueBand::measured(NOISE)
+            }
+        }
+        fn banded_basin_value(x: f64) -> f64 {
+            let exact = 0.5 * x * x;
+            if x.abs() < (2.0 * NOISE).sqrt() {
+                exact + NOISE
+            } else {
+                exact - NOISE
+            }
+        }
+
+        let x0 = array![1.2 * (2.0 * NOISE).sqrt()];
+        let solution = Bfgs::new(x0.clone(), BandedBasin)
+            .with_tolerance(Tolerance::new(1.0e-12).expect("tolerance"))
+            .with_max_iterations(MaxIterations::new(200).expect("iterations"))
+            .run()
+            .expect("the relaxed Armijo test admits the step into the basin");
+        assert!(
+            solution.final_point[0].abs() <= x0[0],
+            "the run must not end further from the minimizer than it started: {} vs {}",
+            solution.final_point[0],
+            x0[0]
+        );
+    }
+
+    /// opt#17 item 1: a rejected Armijo trial records whether the test could
+    /// have resolved an improvement at all. Both verdicts are exercised, and an
+    /// accepted trial leaves the record alone, so the value a line-search
+    /// failure reports is the last rejection's.
+    #[test]
+    fn a_rejected_armijo_trial_says_whether_its_band_could_see_the_decrease_17() {
+        let mut core = super::BfgsCore::new(array![0.0]);
+        core.value_band = ValueBand::measured(1.0e-10);
+        let band = core.value_gap_band(1.0, 1.0);
+        assert!(band > 0.0, "the fixture needs a nonzero band: {band:e}");
+
+        // A predicted decrease far inside the band, and an observed increase of
+        // twice the band: rejected, and the test could not have seen anything.
+        let f_k = 1.0;
+        let tiny = 1.0e-3 * band;
+        let f_trial = f_k + 2.0 * band;
+        assert!(!core.accept_armijo(f_k, -tiny, f_trial));
+        let miss = core.last_armijo_miss.get().expect("a rejection is recorded");
+        assert!(miss.within_band(), "a sub-band prediction is band-limited: {miss:?}");
+        assert_eq!(miss.observed_decrease, f_k - f_trial);
+
+        // A predicted decrease whose required fraction `c1·α|gᵀd|` is a thousand
+        // bands deep, and that did not happen: the test could see it, so this is
+        // a statement about the objective. (A depth of a thousand bands in
+        // `α|gᵀd|` alone is not enough: with `c1` near 1e-4 the demanded share
+        // would still sit inside the band and the relaxed test would accept.)
+        let deep = 1.0e3 * band / core.c1_adapt;
+        assert!(!core.accept_armijo(f_k, -deep, f_k));
+        let miss = core.last_armijo_miss.get().expect("a rejection is recorded");
+        assert!(!miss.within_band(), "a resolvable prediction is not band-limited: {miss:?}");
+        assert_eq!(miss.predicted_decrease, deep);
+
+        // An accepted trial does not overwrite the last rejection.
+        assert!(core.accept_armijo(f_k, -deep, f_k - deep));
+        assert_eq!(core.last_armijo_miss.get(), Some(miss));
+    }
+
     #[test]
     fn probe_alphas_respects_armijo() {
         let x_k = array![1.0];
@@ -15512,7 +15750,7 @@ mod tests {
         let d_k = array![2.0]; // ascent direction
         let mut core = super::BfgsCore::new(x_k.clone());
         let mut oracle = super::FirstOrderCache::new(x_k.len());
-        let tau_g = core.tau_g;
+        let gradient_band = core.gradient_band;
         let drop_factor = core.grad_drop_factor;
         let mut fe = 0usize;
         let mut ge = 0usize;
@@ -15526,7 +15764,7 @@ mod tests {
             &g_k,
             0.0,
             1.0,
-            tau_g,
+            gradient_band,
             drop_factor,
             &mut fe,
             &mut ge,
@@ -16451,13 +16689,20 @@ mod tests {
         assert_reject_floor_at_unchanged_iterate(solver.run(), &x0, "step underflow");
     }
 
-    /// Refusal site: `prepare_arc_trial`'s model-gradient accuracy test, the path
-    /// parity1561 measured in gam #2817 (20000 silent passes at `sigma_max`). At a
-    /// 1e6-scale model and `sigma = 1e30` the step is about 1e-12, above the 1e-16
-    /// floor, but the subproblem's roundoff residual exceeds `theta·|s|²` (floored at
-    /// 1e-14), so every trial is refused before it is evaluated.
+    /// opt#19: at a 1e6-scale positive-definite model and `sigma = 1e30` the cubic
+    /// step is about 1e-12. The damped fixed point that used to solve this case
+    /// stopped about 2000·eps short of the secular root, left a model gradient 72
+    /// times its own rounding, and `prepare_arc_trial` refused every trial, so the
+    /// run ended at the trust-region reject floor although the model's minimizer
+    /// is well defined (parity1561 measured the refusal in gam #2817). The secular
+    /// solve on the spectrum now reaches the arithmetic's resolution, so the step
+    /// passes the first-order test it is re-tested against and the run moves.
+    ///
+    /// The control is the same model solved with its multiplier off by the old
+    /// solver's relative error: that step must FAIL the test, or the fixture could
+    /// not tell an accurate solve from the one it replaced.
     #[test]
-    fn arc_reports_the_reject_floor_when_the_model_gradient_test_refuses_at_the_ceiling() {
+    fn arc_solves_the_positive_definite_cubic_subproblem_to_its_rounding_at_the_ceiling() {
         let scale = 1.0e6;
         let h0 = array![[2.0, 0.3, 0.1], [0.3, 1.5, 0.2], [0.1, 0.2, 1.0]] * scale;
         let center = array![0.5, -0.35, 0.2];
@@ -16474,17 +16719,43 @@ mod tests {
         let (model_delta, _, model_gradient) =
             core.arc_model_value(&g0, &h0, sigma, &step, Some(&active));
         let residual = model_gradient.dot(&model_gradient).sqrt();
-        assert!(
-            step_norm > 1e-16
-                && model_delta <= 0.0
-                && residual > (core.theta * step_norm * step_norm).max(1e-14),
-            "the regime must be the model-gradient accuracy refusal: |s|={step_norm:e} \
-             delta={model_delta:e} residual={residual:e}"
+        let g_norm = g0.dot(&g0).sqrt();
+        let h_scale = 2.4 * scale;
+        let rounding = 8.0
+            * 3.0_f64.sqrt()
+            * f64::EPSILON
+            * (g_norm + h_scale * step_norm + sigma * step_norm * step_norm);
+        eprintln!(
+            "[opt#19] |s|={step_norm:.6e} sigma|s|={:.6e} residual={residual:.6e} \
+             rounding={rounding:.6e} delta={model_delta:.6e}",
+            sigma * step_norm
         );
         assert!(
-            core.prepare_arc_trial(&x0, &step, &g0, &h0, &active)
-                .is_none()
+            step_norm > 1e-16 && model_delta < 0.0,
+            "the regime must be a small descent step: |s|={step_norm:e} delta={model_delta:e}"
         );
+        assert!(
+            residual <= core.theta * step_norm * step_norm + rounding,
+            "the secular solve must reach its rounding: residual {residual:e} against {rounding:e}"
+        );
+        assert!(
+            core.prepare_arc_trial(&x0, &step, &g0, &h0, &active).is_some(),
+            "an accurately solved step must pass the trial's first-order re-test"
+        );
+
+        // Control: the multiplier the old fixed point reached, 4.4e-13 relative off.
+        let lambda_star = sigma * step_norm;
+        let off = super::dense_solve_shifted(&h0, &(-&g0), lambda_star * (1.0 + 4.4e-13))
+            .expect("the shifted system is positive definite");
+        let (_, off_norm, off_gradient) =
+            core.arc_model_value(&g0, &h0, sigma, &off, Some(&active));
+        let off_residual = off_gradient.dot(&off_gradient).sqrt();
+        assert!(
+            off_residual > core.theta * off_norm * off_norm + rounding,
+            "control: a multiplier 2000·eps off must fail the test, or this fixture cannot \
+             see the defect (residual {off_residual:e}, rounding {rounding:e})"
+        );
+
         let h_objective = h0.clone();
         let mut solver = super::Arc::new(
             x0.clone(),
@@ -16496,10 +16767,15 @@ mod tests {
         )
         .with_profile(Profile::Deterministic)
         .with_tolerance(tol(1e-8))
-        .with_max_iterations(iters(usize::MAX))
+        .with_max_iterations(iters(3))
         .with_initial_regularization(sigma)
         .with_max_regularization(sigma);
-        assert_reject_floor_at_unchanged_iterate(solver.run(), &x0, "model-gradient accuracy");
+        let moved = match solver.run() {
+            Ok(solution) => solution.final_point,
+            Err(ArcError::MaxIterationsReached { last_solution }) => last_solution.final_point,
+            Err(other) => panic!("the ceiling run must step, not refuse: {other:?}"),
+        };
+        assert_ne!(moved, x0, "three accepted steps must leave the start");
     }
 
     /// gam#3286: an exact Newton step whose point `x + s` rounds. At `x = 5.4388`
@@ -17036,6 +17312,7 @@ mod tests {
                 )),
                 max_attempts,
                 failure_reason,
+                last_armijo_miss: None,
             }
         );
         assert!(
