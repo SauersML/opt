@@ -21148,6 +21148,13 @@ mod riemannian {
         pub residual: f64,
         /// The bound `residual` was compared against.
         pub tolerance: f64,
+        /// The trust radius the next iteration would use. With `point` and
+        /// `stationarity_reference` it is the whole state a resumed solve needs:
+        /// restarting at the configured `Δ₀` instead would relearn the step scale.
+        pub radius: f64,
+        /// The gradient norm the certificate was scaled by (the first run's, carried
+        /// by a resume), so a resumed solve decides its certificate on the same scale.
+        pub stationarity_reference: f64,
     }
 
     impl RiemannianTrustRegionTermination {
@@ -21327,6 +21334,8 @@ mod riemannian {
                 iterations,
                 residual: relative_stationarity(grad_final_norm, grad0),
                 tolerance: self.grad_tol,
+                radius: delta,
+                stationarity_reference: grad0,
             })
         }
 
@@ -21676,6 +21685,38 @@ mod riemannian {
             for (got, want) in termination.point.iter().zip([0.0, 1.0, -1.0]) {
                 assert!((got - want).abs() < 1.0e-6, "got {got}, want {want}");
             }
+        }
+
+        /// The termination is the whole resumable state: three iterations, then a
+        /// solve resumed from the reported point, radius and stationarity
+        /// reference for five more, reach bit for bit the iterate and certificate
+        /// of eight uninterrupted iterations.
+        #[test]
+        fn a_resume_from_the_termination_continues_the_same_solve() {
+            let objective = || Quadratic {
+                a: array![[4.0, 1.0, 0.0], [1.0, 3.0, 1.0], [0.0, 1.0, 2.0]],
+                b: array![1.0, 2.0, -1.0],
+                curvature: true,
+                hessian_calls: 0,
+            };
+            let start = array![5.0, -3.0, 2.0];
+            let straight = RiemannianTrustRegion { radius: 0.25, ..solver(8) }
+                .minimize(&euclidean(3), &mut objective(), start.view())
+                .expect("the trust region runs");
+            let first = RiemannianTrustRegion { radius: 0.25, ..solver(3) }
+                .minimize(&euclidean(3), &mut objective(), start.view())
+                .expect("the trust region runs");
+            let resumed = RiemannianTrustRegion {
+                radius: first.radius,
+                stationarity_reference: Some(first.stationarity_reference),
+                ..solver(5)
+            }
+            .minimize(&euclidean(3), &mut objective(), first.point.view())
+            .expect("the trust region runs");
+            assert_eq!(resumed.point, straight.point);
+            assert_eq!(resumed.radius.to_bits(), straight.radius.to_bits());
+            assert_eq!(resumed.residual.to_bits(), straight.residual.to_bits());
+            assert_eq!(resumed.stationarity_reference.to_bits(), straight.stationarity_reference.to_bits());
         }
 
         #[test]
