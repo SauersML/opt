@@ -21019,14 +21019,14 @@ mod trust_region_policy_noise_band_tests {
 }
 
 pub use riemannian::{
-    RiemannianGeometry, RiemannianObjective, RiemannianTrustRegion, RiemannianTrustRegionError,
-    RiemannianTrustRegionTermination, relative_stationarity,
+    ModelError, RiemannianGeometry, RiemannianObjective, RiemannianTrustRegion,
+    RiemannianTrustRegionError, RiemannianTrustRegionTermination, relative_stationarity,
 };
 
 /// A trust-region method on an embedded Riemannian manifold, solved in the
 /// tangent spaces under the manifold metric.
 mod riemannian {
-    use super::{TrustRegionPolicy, accumulation_growth};
+    use super::accumulation_growth;
     use ndarray::{Array1, ArrayView1};
 
     /// Linear factor of the Steihaug truncated-CG forcing sequence: the inner CG
@@ -21035,10 +21035,6 @@ mod riemannian {
     /// optimum, while `η·‖r₀‖` caps wasted inner work far from it (Nocedal &
     /// Wright, *Numerical Optimization*, §7.1, eq. 7.3).
     const STEIHAUG_CG_FORCING_FACTOR: f64 = 1.0e-2;
-
-    /// Fraction of the radius at which an interior truncated-CG step counts as
-    /// having reached the boundary for radius control.
-    const BOUNDARY_FRACTION: f64 = 0.9;
 
     /// The geometry a [`RiemannianTrustRegion`] runs on: an embedded manifold in
     /// its ambient coordinates.
@@ -21109,8 +21105,10 @@ mod riemannian {
         InitialPointLength { expected: usize, got: usize },
         #[error("trust-region radius must be finite and positive")]
         InvalidRadius,
-        #[error("trust-region maximum radius must be finite and positive")]
-        InvalidMaxRadius,
+        #[error("trust-region value band must be finite and non-negative")]
+        InvalidValueBand,
+        #[error("trust-region model error rate must be finite and positive")]
+        InvalidModelErrorRate,
         #[error("trust-region gradient tolerance must be finite and non-negative")]
         InvalidGradientTolerance,
         #[error("trust-region stationarity reference must be finite and non-negative")]
@@ -21155,6 +21153,45 @@ mod riemannian {
         /// The gradient norm the certificate was scaled by (the first run's, carried
         /// by a resume), so a resumed solve decides its certificate on the same scale.
         pub stationarity_reference: f64,
+        /// The model's measured error rate at the last trial (see
+        /// [`RiemannianTrustRegion`]), carried by a resume so the next radius comes from
+        /// what the run already measured. `None` before any trial.
+        pub model_error: Option<ModelError>,
+        /// Whether the run ended because no step the measured bound allows can
+        /// promise a decrease above the objective's value band: no resolvable
+        /// progress is left at this point.
+        pub resolution_limited: bool,
+    }
+
+    /// How fast the trust region's model was measured to go wrong along a step.
+    ///
+    /// With the Riemannian Hessian and a second-order retraction the model is
+    /// quadratic and its error along a step `s` is at most `(L/6)‖s‖³` for `L` a
+    /// Lipschitz constant of the Hessian; with the first-order model it is at most
+    /// `(L/2)‖s‖²` for `L` one of the gradient. A trial measures the error as the gap
+    /// between the predicted and the actual decrease, and `rate` is the `L` that
+    /// gap implies: `6·|gap| / ‖s‖³` or `2·|gap| / ‖s‖²`, with the gap floored at the
+    /// objective's value band (a smaller gap cannot be told from rounding).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct ModelError {
+        pub rate: f64,
+        /// Whether `rate` bounds the quadratic (Hessian) model's error, else the
+        /// linear one's.
+        pub quadratic_model: bool,
+    }
+
+    impl ModelError {
+        /// The radius maximizing the decrease the model plus its measured error bound
+        /// guarantees along the gradient, at gradient norm `g` and curvature `kappa`
+        /// along the gradient: the positive root of `g − κ r − (L/2) r² = 0` for the
+        /// cubic bound, or `g / L` for the quadratic one.
+        fn radius(&self, g: f64, kappa: f64) -> f64 {
+            if self.quadratic_model {
+                2.0 * g / (kappa + (kappa * kappa + 2.0 * self.rate * g).sqrt())
+            } else {
+                g / self.rate
+            }
+        }
     }
 
     impl RiemannianTrustRegionTermination {
@@ -21180,16 +21217,26 @@ mod riemannian {
     /// retraction the step is Steihaug truncated CG in the metric (stopping at
     /// negative curvature or the boundary); otherwise it is the Cauchy point, the
     /// exact minimizer along steepest descent inside the region, whose linear
-    /// model is first-order correct along any retraction. The ratio
-    /// `ρ = (f(x) − f(x⁺)) / (m(0) − m(η))` drives acceptance and the radius
-    /// through [`TrustRegionPolicy::classic`], and only accepted steps are
-    /// retracted onto the manifold.
+    /// model is first-order correct along any retraction.
+    ///
+    /// No step-control constant is declared. Each trial measures how fast the model
+    /// goes wrong ([`ModelError`]): the model plus that error bound is an upper model
+    /// of `f`, and the next radius maximizes the decrease it guarantees along the
+    /// gradient ([`ModelError::radius`]), so growth and shrinkage both follow from
+    /// the measurement. A step is accepted when it decreases `f` by more than the
+    /// objective's value band, the smallest decrease its arithmetic can resolve;
+    /// the run ends when even the bounded step cannot promise that much.
     #[derive(Debug, Clone, PartialEq)]
     pub struct RiemannianTrustRegion {
-        /// Initial trust-region radius Δ₀.
+        /// The radius of the first trial, used until the model's error has been
+        /// measured (or carried in through `model_error`).
         pub radius: f64,
-        /// Hard cap Δmax on the radius across all iterations.
-        pub max_radius: f64,
+        /// Relative rounding of the objective's values, declared by the caller from
+        /// its own arithmetic (for `n` accumulated terms at unit roundoff `u`,
+        /// `√n·u`): decreases below `value_band·|f|` are not resolved.
+        pub value_band: f64,
+        /// A measured model error to start from (a resume passes its run's).
+        pub model_error: Option<ModelError>,
         /// Iteration budget.
         pub max_iter: usize,
         /// Bound on the relative stationarity certificate.
@@ -21224,7 +21271,6 @@ mod riemannian {
             G: RiemannianGeometry + ?Sized,
             O: RiemannianObjective<G::Error> + ?Sized,
         {
-            let policy = TrustRegionPolicy::classic(self.max_radius);
             let mut x = initial.to_owned();
             let ambient = geometry.ambient_dim();
             if x.len() != ambient {
@@ -21236,8 +21282,11 @@ mod riemannian {
             if !self.radius.is_finite() || self.radius <= 0.0 {
                 return Err(RiemannianTrustRegionError::InvalidRadius);
             }
-            if !self.max_radius.is_finite() || self.max_radius <= 0.0 {
-                return Err(RiemannianTrustRegionError::InvalidMaxRadius);
+            if !self.value_band.is_finite() || self.value_band < 0.0 {
+                return Err(RiemannianTrustRegionError::InvalidValueBand);
+            }
+            if self.model_error.is_some_and(|e| !e.rate.is_finite() || e.rate <= 0.0) {
+                return Err(RiemannianTrustRegionError::InvalidModelErrorRate);
             }
             if !self.grad_tol.is_finite() || self.grad_tol < 0.0 {
                 return Err(RiemannianTrustRegionError::InvalidGradientTolerance);
@@ -21249,10 +21298,9 @@ mod riemannian {
                 return Err(RiemannianTrustRegionError::InvalidStationarityReference);
             }
 
-            // Establish `0 < Δ_k ≤ Δmax` before the first step. Expansion caps at
-            // `max_radius` and contraction only shrinks, so the invariant then
-            // holds for every iterate and `max_radius` caps every step.
-            let mut delta = self.radius.min(self.max_radius);
+            let mut delta = self.radius;
+            let mut model_error = self.model_error;
+            let mut resolution_limited = false;
             // The initial gradient norm: the shift-invariant scale of the relative
             // stationarity test, unless the caller carries one across a resume.
             let mut grad0_norm: Option<f64> = self.stationarity_reference;
@@ -21275,17 +21323,41 @@ mod riemannian {
                     break;
                 }
 
-                let (step, predicted_reduction, hit_boundary) =
-                    self.solve_subproblem(geometry, objective, x.view(), grad.view(), delta)?;
+                // The curved model is the second-order model of `f` along the trial path
+                // only for a second-order retraction, so only then is the curvature
+                // probed; the linear term is retraction-independent, so the Cauchy model
+                // stays first-order correct along any retraction.
+                let curvature = if geometry.retraction_is_second_order() {
+                    objective
+                        .hessian_vector_product(x.view(), grad.view())
+                        .map_err(RiemannianTrustRegionError::Callback)?
+                } else {
+                    None
+                };
+                let quadratic_model = curvature.is_some();
+                if let Some(error) = model_error.filter(|e| e.quadratic_model == quadratic_model) {
+                    let kappa = match &curvature {
+                        Some(hg) if grad_norm > 0.0 => {
+                            metric_inner(geometry, x.view(), grad.view(), hg.view())? / (grad_norm * grad_norm)
+                        }
+                        _ => 0.0,
+                    };
+                    delta = error.radius(grad_norm, kappa);
+                }
 
-                // A model offering no descent (e.g. a vanishing step): shrink and
-                // retry from the same point rather than dividing by ~0 in ρ.
-                if predicted_reduction.is_nan() || predicted_reduction <= 0.0 {
-                    delta *= policy.shrink_factor;
-                    if delta <= self.grad_tol * self.grad_tol {
-                        break;
-                    }
-                    continue;
+                let (step, predicted_reduction) = match &curvature {
+                    Some(hg) => steihaug(geometry, objective, x.view(), grad.view(), hg.view(), delta)?,
+                    None => cauchy_point(geometry, x.view(), grad.view(), delta)?,
+                };
+                let resolution = self.value_band * f_curr.abs();
+                // A model offering no descent, or a bounded step promising less than the
+                // value band resolves: no resolvable progress is left here.
+                if predicted_reduction.is_nan()
+                    || predicted_reduction <= 0.0
+                    || (model_error.is_some() && predicted_reduction <= resolution)
+                {
+                    resolution_limited = true;
+                    break;
                 }
 
                 let trial_x = geometry
@@ -21295,29 +21367,31 @@ mod riemannian {
                     .value_gradient(trial_x.view())
                     .map_err(RiemannianTrustRegionError::Callback)?
                     .0;
-                let actual_reduction = f_curr - f_trial;
-                // The step's length in the metric the boundary test used. A
-                // non-finite trial value reaches the policy as a non-finite
-                // reduction, which cannot clear its acceptance ratio.
                 let step_norm = metric_inner(geometry, x.view(), step.view(), step.view())?
                     .max(0.0)
                     .sqrt();
-                let update = policy.update(
-                    delta,
-                    step_norm,
-                    hit_boundary,
-                    actual_reduction,
-                    predicted_reduction,
-                );
-                delta = update.new_radius;
-                if update.accepted {
+                if !f_trial.is_finite() {
+                    // The step left the objective's domain, whose boundary lies within
+                    // it: the next trial bisects that interval, the step that halves the
+                    // worst case when nothing else is known about where the boundary is.
+                    delta = 0.5 * step_norm;
+                    model_error = None;
+                    continue;
+                }
+                let actual_reduction = f_curr - f_trial;
+                let band = self.value_band * f_curr.abs().max(f_trial.abs());
+                let gap = (predicted_reduction - actual_reduction).abs().max(band);
+                model_error = (step_norm > 0.0).then(|| ModelError {
+                    rate: if quadratic_model { 6.0 * gap / step_norm.powi(3) } else { 2.0 * gap / (step_norm * step_norm) },
+                    quadratic_model,
+                }).filter(|e| e.rate.is_finite() && e.rate > 0.0);
+                if actual_reduction > band {
                     x = trial_x;
                 }
             }
 
-            // Budget exhaustion or a collapsed radius is not success merely because
-            // the last iterate is finite: decide the certificate at the terminal
-            // point.
+            // Budget exhaustion or no resolvable progress is not success merely because
+            // the last iterate is finite: decide the certificate at the terminal point.
             let (f_final, grad_e_final) = objective
                 .value_gradient(x.view())
                 .map_err(RiemannianTrustRegionError::Callback)?;
@@ -21336,84 +21410,76 @@ mod riemannian {
                 tolerance: self.grad_tol,
                 radius: delta,
                 stationarity_reference: grad0,
+                model_error,
+                resolution_limited,
             })
         }
+    }
 
-        /// Solve `min_{‖η‖_g ≤ Δ} m(η)`, returning `(η, m(0) − m(η), hit_boundary)`.
-        fn solve_subproblem<G, O>(
-            &self,
-            geometry: &G,
-            objective: &mut O,
-            x: ArrayView1<'_, f64>,
-            grad: ArrayView1<'_, f64>,
-            delta: f64,
-        ) -> Result<(Array1<f64>, f64, bool), RiemannianTrustRegionError<G::Error>>
-        where
-            G: RiemannianGeometry + ?Sized,
-            O: RiemannianObjective<G::Error> + ?Sized,
-        {
-            // Probe once for curvature.
-            let has_hessian = objective
-                .hessian_vector_product(x, grad)
-                .map_err(RiemannianTrustRegionError::Callback)?
-                .is_some();
-            // The curved model is the second-order model of `f` along the trial path
-            // only for a second-order retraction; the linear term is
-            // retraction-independent, so the Cauchy model stays first-order correct
-            // along any retraction.
-            if !has_hessian || !geometry.retraction_is_second_order() {
-                return cauchy_point(geometry, x, grad, delta);
-            }
-
-            // Steihaug truncated CG in the metric inner product:
-            // min m(η) = g_x(grad, η) + ½ g_x(η, Hη) within ‖η‖_g ≤ Δ.
-            let n = grad.len();
-            let mut z = Array1::<f64>::zeros(n);
-            let mut r = grad.to_owned();
-            let mut p = -&r;
-            let r0_norm = metric_norm(geometry, x, r.view())?;
-            let tol = (STEIHAUG_CG_FORCING_FACTOR * r0_norm).min(r0_norm * r0_norm);
-            let max_cg = 2 * n + 1;
-            for _ in 0..max_cg {
-                let hp = objective
+    /// Steihaug truncated CG in the metric inner product for
+    /// `min_{‖η‖_g ≤ Δ} m(η) = g_x(grad, η) + ½ g_x(η, Hη)`, returning `(η, m(0) − m(η))`.
+    /// `hg` is the Hessian along the gradient, already probed: the first CG direction is
+    /// `−grad`, so it is that direction's product.
+    fn steihaug<G, O>(
+        geometry: &G,
+        objective: &mut O,
+        x: ArrayView1<'_, f64>,
+        grad: ArrayView1<'_, f64>,
+        hg: ArrayView1<'_, f64>,
+        delta: f64,
+    ) -> Result<(Array1<f64>, f64), RiemannianTrustRegionError<G::Error>>
+    where
+        G: RiemannianGeometry + ?Sized,
+        O: RiemannianObjective<G::Error> + ?Sized,
+    {
+        let n = grad.len();
+        let mut z = Array1::<f64>::zeros(n);
+        let mut r = grad.to_owned();
+        let mut p = -&r;
+        let r0_norm = metric_norm(geometry, x, r.view())?;
+        let tol = (STEIHAUG_CG_FORCING_FACTOR * r0_norm).min(r0_norm * r0_norm);
+        let max_cg = 2 * n + 1;
+        let mut first = Some(-&hg.to_owned());
+        for _ in 0..max_cg {
+            let hp = match first.take() {
+                Some(hp) => hp,
+                None => objective
                     .hessian_vector_product(x, p.view())
                     .map_err(RiemannianTrustRegionError::Callback)?
-                    .ok_or(RiemannianTrustRegionError::CurvatureWithdrawnMidSubproblem)?;
-                let php = metric_inner(geometry, x, p.view(), hp.view())?;
-                if php <= 0.0 {
-                    // Negative curvature: go to the boundary along p.
-                    let tau = boundary_tau(geometry, x, z.view(), p.view(), delta)?;
-                    let eta = &z + &(&p * tau);
-                    let reduction = model_reduction(geometry, objective, x, grad, eta.view())?;
-                    return Ok((eta, reduction, true));
-                }
-                let rr = metric_inner(geometry, x, r.view(), r.view())?;
-                let alpha = rr / php;
-                let z_next = &z + &(&p * alpha);
-                if metric_norm(geometry, x, z_next.view())? >= delta {
-                    // The step crossed the boundary: stop on it.
-                    let tau = boundary_tau(geometry, x, z.view(), p.view(), delta)?;
-                    let eta = &z + &(&p * tau);
-                    let reduction = model_reduction(geometry, objective, x, grad, eta.view())?;
-                    return Ok((eta, reduction, true));
-                }
-                z = z_next;
-                let r_next = &r + &(&hp * alpha);
-                let r_next_norm = metric_norm(geometry, x, r_next.view())?;
-                if r_next_norm <= tol {
-                    let reduction = model_reduction(geometry, objective, x, grad, z.view())?;
-                    let hit = metric_norm(geometry, x, z.view())? >= BOUNDARY_FRACTION * delta;
-                    return Ok((z, reduction, hit));
-                }
-                let rr_next = metric_inner(geometry, x, r_next.view(), r_next.view())?;
-                let beta = rr_next / rr;
-                p = &(-&r_next) + &(&p * beta);
-                r = r_next;
+                    .ok_or(RiemannianTrustRegionError::CurvatureWithdrawnMidSubproblem)?,
+            };
+            let php = metric_inner(geometry, x, p.view(), hp.view())?;
+            if php <= 0.0 {
+                // Negative curvature: go to the boundary along p.
+                let tau = boundary_tau(geometry, x, z.view(), p.view(), delta)?;
+                let eta = &z + &(&p * tau);
+                let reduction = model_reduction(geometry, objective, x, grad, eta.view())?;
+                return Ok((eta, reduction));
             }
-            let reduction = model_reduction(geometry, objective, x, grad, z.view())?;
-            let hit = metric_norm(geometry, x, z.view())? >= BOUNDARY_FRACTION * delta;
-            Ok((z, reduction, hit))
+            let rr = metric_inner(geometry, x, r.view(), r.view())?;
+            let alpha = rr / php;
+            let z_next = &z + &(&p * alpha);
+            if metric_norm(geometry, x, z_next.view())? >= delta {
+                // The step crossed the boundary: stop on it.
+                let tau = boundary_tau(geometry, x, z.view(), p.view(), delta)?;
+                let eta = &z + &(&p * tau);
+                let reduction = model_reduction(geometry, objective, x, grad, eta.view())?;
+                return Ok((eta, reduction));
+            }
+            z = z_next;
+            let r_next = &r + &(&hp * alpha);
+            let r_next_norm = metric_norm(geometry, x, r_next.view())?;
+            if r_next_norm <= tol {
+                let reduction = model_reduction(geometry, objective, x, grad, z.view())?;
+                return Ok((z, reduction));
+            }
+            let rr_next = metric_inner(geometry, x, r_next.view(), r_next.view())?;
+            let beta = rr_next / rr;
+            p = &(-&r_next) + &(&p * beta);
+            r = r_next;
         }
+        let reduction = model_reduction(geometry, objective, x, grad, z.view())?;
+        Ok((z, reduction))
     }
 
     /// Cauchy point: the exact minimizer of the model along `−grad` inside the
@@ -21425,15 +21491,15 @@ mod riemannian {
         x: ArrayView1<'_, f64>,
         grad: ArrayView1<'_, f64>,
         delta: f64,
-    ) -> Result<(Array1<f64>, f64, bool), RiemannianTrustRegionError<G::Error>> {
+    ) -> Result<(Array1<f64>, f64), RiemannianTrustRegionError<G::Error>> {
         let grad_norm = metric_norm(geometry, x, grad)?;
         if grad_norm <= 0.0 {
-            return Ok((Array1::<f64>::zeros(grad.len()), 0.0, false));
+            return Ok((Array1::<f64>::zeros(grad.len()), 0.0));
         }
         let tau = delta / grad_norm;
         let step = &grad.to_owned() * (-tau);
         let predicted = tau * grad_norm * grad_norm;
-        Ok((step, predicted, true))
+        Ok((step, predicted))
     }
 
     /// Largest `τ ≥ 0` with `‖z + τ p‖_g = Δ`, from
@@ -21660,9 +21726,11 @@ mod riemannian {
         }
 
         fn solver(max_iter: usize) -> RiemannianTrustRegion {
+            // Exact small problems: every strict decrease is resolved.
             RiemannianTrustRegion {
                 radius: 1.0,
-                max_radius: 1.0e6,
+                value_band: 0.0,
+                model_error: None,
                 max_iter,
                 grad_tol: 1.0e-12,
                 stationarity_reference: None,
@@ -21688,8 +21756,8 @@ mod riemannian {
         }
 
         /// The termination is the whole resumable state: three iterations, then a
-        /// solve resumed from the reported point, radius and stationarity
-        /// reference for five more, reach bit for bit the iterate and certificate
+        /// solve resumed from the reported point, radius, measured model error and
+        /// stationarity reference for five more, reach bit for bit the iterate and certificate
         /// of eight uninterrupted iterations.
         #[test]
         fn a_resume_from_the_termination_continues_the_same_solve() {
@@ -21708,6 +21776,7 @@ mod riemannian {
                 .expect("the trust region runs");
             let resumed = RiemannianTrustRegion {
                 radius: first.radius,
+                model_error: first.model_error,
                 stationarity_reference: Some(first.stationarity_reference),
                 ..solver(5)
             }
@@ -21810,6 +21879,41 @@ mod riemannian {
                 .minimize(&euclidean(1), &mut square(true), array![1.0].view())
                 .expect_err("a zero radius admits no step");
             assert!(matches!(error, RiemannianTrustRegionError::InvalidRadius));
+        }
+
+        /// `f(x) = x⁴ + x²`, whose quadratic model is wrong away from the minimum, from
+        /// `x = 3` with a first radius far too large and the value band of float64: the
+        /// measured model error shrinks the radius to steps that decrease `f`, and the
+        /// solve certifies at the minimum with no step constant declared.
+        #[test]
+        fn a_quartic_is_minimized_with_radii_from_the_measured_model_error() {
+            struct Quartic;
+            impl RiemannianObjective<String> for Quartic {
+                fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> Result<(f64, Array1<f64>), String> {
+                    let x = point[0];
+                    Ok((x.powi(4) + x * x, array![4.0 * x.powi(3) + 2.0 * x]))
+                }
+                fn hessian_vector_product(
+                    &mut self,
+                    point: ArrayView1<'_, f64>,
+                    tangent: ArrayView1<'_, f64>,
+                ) -> Result<Option<Array1<f64>>, String> {
+                    let x = point[0];
+                    Ok(Some(array![(12.0 * x * x + 2.0) * tangent[0]]))
+                }
+            }
+            let termination = RiemannianTrustRegion {
+                radius: 100.0,
+                value_band: f64::EPSILON,
+                grad_tol: 1.0e-6,
+                ..solver(200)
+            }
+            .minimize(&euclidean(1), &mut Quartic, array![3.0].view())
+            .expect("the trust region runs");
+            assert!(termination.certifies(), "{termination:?}");
+            // The certificate is relative to the first gradient (114): |f'(x)| = |4x³ + 2x|
+            // at most 1.14e-4 puts x within 5.7e-5 of the minimum.
+            assert!(termination.point[0].abs() < 5.7e-5, "{termination:?}");
         }
     }
 }
