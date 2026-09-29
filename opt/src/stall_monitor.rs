@@ -2,10 +2,24 @@
 //!
 //! [`StallMonitor`] owns the part of a stalled-search decision that belongs to
 //! the optimizer and to no particular objective: the monotone incumbent, the
-//! no-improvement window over trusted samples, the window of refused trials, the
-//! escape granted when a filled window's incumbent still carries resolvable
-//! descent, the bit-identity replay cut that ends escapes, the progress licence
-//! that ends a stall buying nothing, and the window evidence a stall reports.
+//! stall rule that judges each step on its own resolution, the escape granted
+//! when a stall's incumbent still carries resolvable descent, the bit-identity
+//! replay cut that ends escapes, the progress licence that ends a stall buying
+//! nothing, and the evidence a stall reports.
+//!
+//! # The stall rule
+//!
+//! Two computed values imply `V_b > V_j` exactly when `V̂_b − V̂_j` exceeds the sum
+//! of their resolutions ([`resolvably_below`]). So a step buys resolved progress
+//! iff its decrease exceeds `R_b + R_j`. A step that buys none is **stalled** when
+//! its model's predicted decrease is not resolvable either; otherwise the model
+//! promised a decrease the function did not deliver, which the solver acts on
+//! (its ratio test or its curvature update), and the step is **adapting** and
+//! reaches no verdict. One stalled step reaches the verdict: its model decrease
+//! bounds the solver's Cauchy decrease, so either the gradient is at resolution
+//! relative to the curvature, or rejected trials drove the step length down at
+//! this point, and the next step comes from the same model at the same scale. No
+//! window of stalled steps is counted.
 //!
 //! The caller decides what it observes and when. A consumer that drives a solver
 //! through an objective bridge observes at the bridge (every evaluation, every
@@ -13,6 +27,7 @@
 //! the consumer's, not the solver's. What the monitor cannot know is supplied:
 //!
 //! * the stationarity band at a criterion value, as a closure;
+//! * each value's resolution, and the predicted decrease of the step behind it;
 //! * whether a sample is trustworthy (for example, whether an inner solve behind
 //!   it converged);
 //! * the incumbent's curvature verdict, and an opaque payload that travels with
@@ -20,28 +35,64 @@
 //!
 //! Every stop the monitor decides is published as a [`StallExit`] that the
 //! caller reads through [`StallMonitor::exit`]; [`StallMonitor::exit_revision`]
-//! counts writes, so a caller that mirrors the exit elsewhere copies it only
-//! when the monitor changed it.
+//! counts publishes, so a caller that mirrors the exit elsewhere copies it only
+//! when the monitor published a new one.
 
 use ndarray::Array1;
 use std::collections::VecDeque;
 
+/// Whether `value`, computed to within `resolution`, is resolvably below
+/// `reference`, computed to within `reference_resolution`.
+///
+/// Two computed values imply the exact ones are ordered exactly when they are
+/// further apart than the sum of their resolutions: that is sufficient, since
+/// `V_r − V_x ≥ V̂_r − V̂_x − R_r − R_x`, and necessary, since otherwise
+/// `V_r = V̂_r − R_r` and `V_x = V̂_x + R_x` fit the data with `V_r ≤ V_x`. A value
+/// that is not a number is never below anything.
+#[must_use]
+pub fn resolvably_below(
+    reference: f64,
+    reference_resolution: f64,
+    value: f64,
+    resolution: f64,
+) -> bool {
+    reference - value > reference_resolution + resolution
+}
+
+/// One evaluated sample offered to a [`StallMonitor`].
+#[derive(Debug, Clone, Copy)]
+pub struct StallSample<'a> {
+    pub point: &'a Array1<f64>,
+    pub value: f64,
+    /// The resolution `value` was computed to.
+    pub resolution: f64,
+    /// Projected gradient norm at `point`.
+    pub grad_norm: f64,
+    /// Whether the value and gradient are trustworthy (for example, whether the
+    /// inner solve behind them converged). An untrusted sample never becomes
+    /// the incumbent and reaches no verdict.
+    pub trusted: bool,
+    /// The sample's curvature verdict: `Some(false)` is a strict saddle.
+    pub curvature_psd: Option<bool>,
+}
+
 /// What folding one observation into a [`StallMonitor`] decided.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StallVerdict {
-    /// The window has not filled, or an escape was granted at a strict saddle.
+    /// The search made resolved progress or is adapting, or an escape was
+    /// granted at a strict saddle.
     Continue,
-    /// A filled window whose incumbent is inside the band at its value.
+    /// A stall whose incumbent is inside the band at its value.
     Converged,
-    /// A filled window whose incumbent is above the band, with no escape left:
-    /// the escape would replay the previous one from a bit-identical incumbent,
-    /// or the window held only unescapable refusals.
+    /// A stall whose incumbent is above the band, with no escape left: the escape
+    /// would replay the previous one from a bit-identical incumbent, or the run of
+    /// refusals held only unescapable ones.
     Floor {
         /// Projected gradient norm at the incumbent.
         residual_grad_norm: f64,
     },
-    /// A filled window whose incumbent is above the band: the window reopens so
-    /// the search can take the descent the residual says is available.
+    /// A stall whose incumbent is above the band: the search continues so it can
+    /// take the descent the residual says is available.
     Escape {
         /// Projected gradient norm at the incumbent.
         residual_grad_norm: f64,
@@ -50,10 +101,10 @@ pub enum StallVerdict {
     },
 }
 
-/// A filled window made only of unescapable refusals, reported with a stop.
+/// A run of refusals made only of unescapable ones, reported with a stop.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UnescapableRefusalWindow {
-    /// Refused trials in the window.
+    /// Unescapable refusals in the run.
     pub refused_trials: usize,
     /// The band at the incumbent's value.
     pub band: f64,
@@ -68,31 +119,32 @@ pub struct StallExit {
     pub grad_norm: f64,
     /// Trusted samples folded in when the exit was written.
     pub accepted: usize,
-    /// `true` only when a filled window's incumbent met the band. A running
-    /// best-so-far snapshot is never a convergence claim.
+    /// `true` only when a stall's incumbent met the band. A running best-so-far
+    /// snapshot is never a convergence claim.
     pub converged: bool,
-    /// `(noise floor σ̂, probe radius Δ)` over the window; see
-    /// [`StallMonitor::window_probe_scale`]. Evidence only.
+    /// `(noise floor σ̂, probe radius Δ)` over the samples since the last
+    /// resolved progress; see [`StallMonitor::window_probe_scale`]. Evidence only.
     pub probe_scale: Option<(f64, f64)>,
-    /// Set when the stopping window held only unescapable refusals.
+    /// Set when the stop was a run of unescapable refusals.
     pub unescapable_window: Option<UnescapableRefusalWindow>,
+    /// Refused trials proposed from this incumbent whose model promised at most
+    /// its resolution; see [`StallMonitor::wall_refusals`].
+    pub wall_refusals: usize,
 }
 
 /// The search state an escape was granted from, in raw bits: the whole
-/// incumbent, and the trial points the window that filled had observed. Only
+/// incumbent, and the trial points observed since the escape before it. Only
 /// bit identity supports the claim a replay cut makes: a deterministic
 /// procedure replayed from an identical state returns an identical result. Raw
 /// bits keep the comparison total, and both of its possible errors (distinct
 /// NaN payloads, `-0.0` against `0.0`) grant the escape rather than cut it.
 ///
-/// The incumbent alone is not the search's state. A window of trials that do not
-/// improve it leaves it bit-identical while the solver's own state moves: a
-/// rejected cubic trial raises ARC's regularization, so the next window proposes
-/// shorter steps to new points. The trials the window observed are the part of
-/// that state the monitor can see, so a replay is a window that observed the
-/// same points, in the same order, from the same incumbent (gam 0282f2b560: a
-/// saddle whose window had just evaluated three fresh trials was cut as a
-/// replay).
+/// The incumbent alone is not the search's state. Trials that do not improve it
+/// leave it bit-identical while the solver's own state moves: a rejected cubic
+/// trial raises ARC's regularization, so the next steps go to new points. The
+/// trials observed are the part of that state the monitor can see, so a replay
+/// is a run that observed the same points, in the same order, from the same
+/// incumbent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IncumbentBits {
     point: Vec<u64>,
@@ -119,30 +171,16 @@ fn point_bits(point: &Array1<f64>) -> Vec<u64> {
         .collect()
 }
 
-/// The solver state behind one accepted step, kept over the window so a caller
-/// can derive the window from what the solver was doing (#2817).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StallStep {
-    /// Step's L2 norm.
-    pub step_norm: f64,
-    /// The cubic regularization `σ` the step was solved with (ARC).
-    pub regularization: Option<f64>,
-    /// The accepted line-search step length `α` (BFGS).
-    pub line_search_step: Option<f64>,
-}
-
-/// Monotone incumbent, no-improvement window, refused-trial window, escapes,
-/// replay cut and progress licence for an outer search. See the module docs.
+/// Monotone incumbent, per-step stall rule, escapes, replay cut and progress
+/// licence for an outer search. See the module docs.
 pub struct StallMonitor<C> {
-    /// A trusted sample counts as no improvement when
-    /// `best - value <= rel_tol · (1 + |best|)`.
-    rel_tol: f64,
-    window: usize,
     band: Box<dyn Fn(f64) -> f64 + Send>,
-    /// Set once a replay cut proved that reopening the window replays the
-    /// previous one. No licence continues past a proven replay.
+    /// Set once a replay cut proved that continuing replays the previous
+    /// escape. No licence continues past a proven replay.
     replay_proven: bool,
     best_value: f64,
+    /// The resolution `best_value` was computed to.
+    best_resolution: f64,
     best_point: Option<Array1<f64>>,
     best_grad_norm: f64,
     /// The incumbent's curvature verdict: `Some(false)` is a strict saddle.
@@ -150,64 +188,61 @@ pub struct StallMonitor<C> {
     best_payload: Option<C>,
     staged_payload: Option<C>,
     strict_saddle_refusal: bool,
-    no_improve_streak: usize,
+    /// Consecutive refused trials since the last finite observation. Evidence a
+    /// stop reports, not a rule.
     refused_streak: usize,
     /// How many of the current refused streak were unescapable refusals.
     unescapable_streak: usize,
+    /// Refused trials proposed since the incumbent was adopted whose step's model
+    /// promised at most the incumbent's resolution. Each proves the objective's
+    /// domain ends, along that trial's direction, within a step whose predicted
+    /// decrease no evaluation could resolve, so the incumbent is pinned at a
+    /// domain wall. Only a new incumbent clears it.
+    wall_refusals: usize,
     accepted: usize,
-    /// Consecutive escapes since the last resolved improvement. A diagnostic:
-    /// escapes are bounded by the replay cut and by the caller's budget.
+    /// Consecutive escapes since the last resolved progress. A diagnostic:
+    /// escapes are bounded by the replay cut and the progress licence.
     pub stuck_escapes: usize,
     incumbent_at_last_escape: Option<IncumbentBits>,
-    /// Every trial point observed without improving the incumbent since the
-    /// window last opened, at the latest improvement or escape grant: the half of
-    /// the replay identity the incumbent cannot carry (see [`IncumbentBits`]).
+    /// Every trial point observed without resolved progress since the latest
+    /// progress or escape grant: the half of the replay identity the incumbent
+    /// cannot carry (see [`IncumbentBits`]).
     window_trials: Vec<Vec<u64>>,
-    continuation_incumbent: Option<(f64, f64)>,
+    /// `(value, projected gradient norm, resolution)` of the incumbent when the
+    /// previous stall was licensed to continue.
+    continuation_incumbent: Option<(f64, f64, f64)>,
+    /// The trusted samples since the last resolved progress, newest last.
     recent: VecDeque<(Array1<f64>, f64)>,
-    /// The solver state of the latest `window` accepted steps, oldest first.
-    recent_steps: VecDeque<StallStep>,
     exit: Option<StallExit>,
     exit_revision: u64,
 }
 
 impl<C: Clone> StallMonitor<C> {
-    /// A monitor with improvement floor `rel_tol` over `window` samples, judging
-    /// stationarity by `band(value)`.
-    pub fn new(rel_tol: f64, window: usize, band: impl Fn(f64) -> f64 + Send + 'static) -> Self {
+    /// A monitor judging stationarity by `band(value)`.
+    pub fn new(band: impl Fn(f64) -> f64 + Send + 'static) -> Self {
         Self {
-            rel_tol,
-            window,
             band: Box::new(band),
             replay_proven: false,
             best_value: f64::INFINITY,
+            best_resolution: 0.0,
             best_point: None,
             best_grad_norm: f64::INFINITY,
             best_curvature_psd: None,
             best_payload: None,
             staged_payload: None,
             strict_saddle_refusal: false,
-            no_improve_streak: 0,
             refused_streak: 0,
             unescapable_streak: 0,
+            wall_refusals: 0,
             accepted: 0,
             stuck_escapes: 0,
             incumbent_at_last_escape: None,
             window_trials: Vec::new(),
             continuation_incumbent: None,
             recent: VecDeque::new(),
-            recent_steps: VecDeque::new(),
             exit: None,
             exit_revision: 0,
         }
-    }
-
-    pub fn rel_tol(&self) -> f64 {
-        self.rel_tol
-    }
-
-    pub fn window(&self) -> usize {
-        self.window
     }
 
     /// The stationarity band at criterion value `value`.
@@ -215,27 +250,13 @@ impl<C: Clone> StallMonitor<C> {
         (self.band)(value)
     }
 
-    /// Record the solver state of one accepted step, keeping the latest
-    /// `window` of them. It decides nothing; it is the evidence a caller derives
-    /// a window from.
-    pub fn observe_step(&mut self, step: &crate::StepInfo) {
-        self.recent_steps.push_back(StallStep {
-            step_norm: step.step_norm,
-            regularization: step.regularization,
-            line_search_step: step.line_search_step,
-        });
-        while self.recent_steps.len() > self.window {
-            self.recent_steps.pop_front();
-        }
-    }
-
-    /// The solver state of the latest `window` accepted steps, oldest first.
-    pub fn recent_steps(&self) -> impl ExactSizeIterator<Item = &StallStep> {
-        self.recent_steps.iter()
-    }
-
     pub fn best_value(&self) -> f64 {
         self.best_value
+    }
+
+    /// The resolution [`Self::best_value`] was computed to.
+    pub fn best_resolution(&self) -> f64 {
+        self.best_resolution
     }
 
     pub fn best_point(&self) -> Option<&Array1<f64>> {
@@ -266,6 +287,11 @@ impl<C: Clone> StallMonitor<C> {
         self.unescapable_streak
     }
 
+    /// Refused trials at a domain wall since the incumbent was adopted.
+    pub fn wall_refusals(&self) -> usize {
+        self.wall_refusals
+    }
+
     pub fn replay_proven(&self) -> bool {
         self.replay_proven
     }
@@ -275,7 +301,8 @@ impl<C: Clone> StallMonitor<C> {
         self.exit.as_ref()
     }
 
-    /// Incremented on every write to [`Self::exit`].
+    /// Incremented on every publish of [`Self::exit`] and every revocation of its
+    /// convergence; not by the wall-refusal count stamped onto it.
     pub fn exit_revision(&self) -> u64 {
         self.exit_revision
     }
@@ -321,8 +348,7 @@ impl<C: Clone> StallMonitor<C> {
     }
 
     /// Grant one escape unless it would replay the previous one from a
-    /// bit-identical incumbent. A granted escape reopens the no-improvement
-    /// window.
+    /// bit-identical search state.
     fn grant_escape_unless_replay(&mut self, incumbent: IncumbentBits) -> bool {
         if self.incumbent_at_last_escape.as_ref() == Some(&incumbent) {
             return false;
@@ -330,7 +356,6 @@ impl<C: Clone> StallMonitor<C> {
         self.stuck_escapes = self.stuck_escapes.saturating_add(1);
         self.incumbent_at_last_escape = Some(incumbent);
         self.window_trials.clear();
-        self.no_improve_streak = 0;
         true
     }
 
@@ -339,21 +364,35 @@ impl<C: Clone> StallMonitor<C> {
         IncumbentBits::new(point, value, grad_norm, &self.window_trials)
     }
 
-    /// Record a trial that did not improve the incumbent as part of the open
-    /// window's replay identity.
     fn record_window_trial(&mut self, point: &Array1<f64>) {
         self.window_trials.push(point_bits(point));
     }
 
-    /// Whether a filled window at a non-stationary stall may be followed by
-    /// another one.
+    fn restart_recent(&mut self, point: &Array1<f64>, value: f64) {
+        self.recent.clear();
+        self.recent.push_back((point.clone(), value));
+    }
+
+    /// Adopt `sample` as the incumbent. Clears the wall evidence, which belongs
+    /// to the incumbent it was gathered at.
+    fn adopt(&mut self, sample: &StallSample<'_>, payload: Option<C>) {
+        self.best_value = sample.value;
+        self.best_resolution = sample.resolution;
+        self.best_point = Some(sample.point.clone());
+        self.best_grad_norm = sample.grad_norm;
+        self.best_curvature_psd = sample.curvature_psd;
+        self.best_payload = payload;
+        self.wall_refusals = 0;
+    }
+
+    /// Whether a stall at a non-stationary incumbent may be followed by another.
     ///
-    /// A window is licensed when, since the previous licensed window, the search
-    /// bought resolved descent (the incumbent improved by more than
-    /// `rel_tol · (1 + |V|)`) or stationarity (the incumbent's projected gradient
-    /// contracted), or when the incumbent is a strict saddle, whose negative
-    /// curvature is descent the search can still take. The first window is
-    /// always licensed. A proven replay is never licensed.
+    /// A stall is licensed when, since the previous licensed one, the search bought
+    /// resolved descent (the incumbent is [`resolvably_below`] the previous one) or
+    /// stationarity (the incumbent's projected gradient contracted), or when the
+    /// incumbent is a strict saddle, whose negative curvature is descent the search
+    /// can still take. The first stall is always licensed. A proven replay is never
+    /// licensed.
     ///
     /// Termination needs no count: the criterion is bounded below, so resolved
     /// descent is bought finitely often, and every contraction strictly lowers a
@@ -365,30 +404,34 @@ impl<C: Clone> StallMonitor<C> {
         }
         let licensed = match self.continuation_incumbent {
             None => true,
-            Some((previous_value, previous_grad_norm)) => {
-                let resolution = self.rel_tol * (1.0 + self.best_value.abs());
-                previous_value - self.best_value > resolution
-                    || self.best_grad_norm < previous_grad_norm
+            Some((previous_value, previous_grad_norm, previous_resolution)) => {
+                resolvably_below(
+                    previous_value,
+                    previous_resolution,
+                    self.best_value,
+                    self.best_resolution,
+                ) || self.best_grad_norm < previous_grad_norm
                     || self.best_curvature_psd == Some(false)
             }
         };
         if licensed {
-            self.continuation_incumbent = Some((self.best_value, self.best_grad_norm));
+            self.continuation_incumbent =
+                Some((self.best_value, self.best_grad_norm, self.best_resolution));
         }
         licensed
     }
 
-    /// The incumbent to stop at when a filled window is not licensed to
-    /// continue; `None` while continuing is licensed.
+    /// The incumbent to stop at when a stall is not licensed to continue; `None`
+    /// while continuing is licensed.
     pub fn unprogressing_stop(&mut self) -> Option<StallExit> {
         if self.license_continuation() {
             return None;
         }
         let point = self.best_point.clone()?;
         log::debug!(
-            "[STALL] stopping at an unprogressing stall: the window filled again at value={:.6e} \
-             |Pg|={:.3e} after {} trusted sample(s), with no resolved descent and no contraction \
-             of the projected gradient since the last one",
+            "[STALL] stopping at an unprogressing stall: the search stalled again at \
+             value={:.6e} |Pg|={:.3e} after {} trusted sample(s), with no resolved descent and \
+             no contraction of the projected gradient since the last one",
             self.best_value,
             self.best_grad_norm,
             self.accepted,
@@ -401,25 +444,18 @@ impl<C: Clone> StallMonitor<C> {
             converged: false,
             probe_scale: None,
             unescapable_window: None,
+            wall_refusals: self.wall_refusals,
         })
     }
 
-    fn record_recent(&mut self, point: &Array1<f64>, value: f64) {
-        self.recent.push_back((point.clone(), value));
-        while self.recent.len() > self.window + 1 {
-            self.recent.pop_front();
-        }
-    }
-
-    /// The window's evidence about the criterion's scatter, licensing nothing.
+    /// The evidence about the criterion's scatter since the last resolved
+    /// progress, licensing nothing.
     ///
     /// `σ̂ = median_i |f_i − f_{i−1}|`, floored at the value's rounding
-    /// `ε·(1 + |f_best|)`, and `Δ = max_i ‖x_i − x_{i−1}‖₂`, the radius the
-    /// trusted samples probed. A window that filled on microscopic steps and one
-    /// that filled on a flat surface differ in `Δ`. `σ̂/Δ` bounds the gradient
-    /// only along the directions the steps spanned, so it is reported and never
-    /// widens a band. `None` with fewer than three differences or a degenerate
-    /// radius.
+    /// `ε·(1 + |f_best|)`, and `Δ = max_i ‖x_i − x_{i−1}‖₂`, the radius the trusted
+    /// samples probed. `σ̂/Δ` bounds the gradient only along the directions the
+    /// steps spanned, so it is reported and never widens a band. `None` with fewer
+    /// than three differences or a degenerate radius.
     pub fn window_probe_scale(&self) -> Option<(f64, f64)> {
         if self.recent.len() < 4 {
             return None;
@@ -461,87 +497,69 @@ impl<C: Clone> StallMonitor<C> {
 
     /// Fold the seed. A finite seed becomes the incumbent and is published as a
     /// non-converged snapshot, so a budget exit always has a feasible best.
-    pub fn observe_seed(
-        &mut self,
-        point: &Array1<f64>,
-        value: f64,
-        grad_norm: f64,
-        curvature_psd: Option<bool>,
-    ) {
+    pub fn observe_seed(&mut self, sample: StallSample<'_>) {
         let staged_payload = self.staged_payload.take();
-        if !value.is_finite() {
+        if !sample.value.is_finite() {
             return;
         }
-        self.best_value = value;
-        self.best_point = Some(point.clone());
-        self.best_grad_norm = grad_norm;
-        self.best_curvature_psd = curvature_psd;
-        self.best_payload = staged_payload;
-        self.no_improve_streak = 0;
+        self.adopt(&sample, staged_payload);
         self.refused_streak = 0;
         self.window_trials.clear();
         self.accepted = self.accepted.saturating_add(1);
-        self.record_recent(point, value);
+        self.restart_recent(sample.point, sample.value);
         self.publish_best_so_far();
     }
 
-    /// Fold one sample `(x, value, projected gradient norm)`.
+    /// Fold one accepted sample, reached by a step whose own model predicted
+    /// `predicted_decrease`: the cubic or quadratic model's for ARC and a trust
+    /// region, the linear model's `−gᵀs` for a line search.
     ///
-    /// An untrusted sample never becomes the incumbent and never counts toward a
-    /// window: it resets both streaks. A trusted sample that improves on the
-    /// incumbent by more than the floor resets the window and ends an escape
-    /// streak. A sample inside the band at its own value counts as no
-    /// improvement whatever its raw decrease (drift pinned at a bound is not
-    /// feasible descent). The first finite trusted sample is the first
-    /// incumbent and never counts toward a window.
+    /// Returns `Continue` while the search makes resolved progress or adapts (see
+    /// the module docs), and otherwise decides the stall at the incumbent. A
+    /// sample inside the band at its own value is stalled whatever its decrease:
+    /// progress pinned at a bound is not feasible descent. The first finite
+    /// trusted sample is the first incumbent and reaches no verdict.
     ///
-    /// A filled window at a strict-saddle incumbent grants an escape (flagged
-    /// for [`Self::take_strict_saddle_refusal`]) unless it would replay the
-    /// previous one; otherwise the window is published.
-    pub fn observe(
-        &mut self,
-        point: &Array1<f64>,
-        value: f64,
-        grad_norm: f64,
-        trusted: bool,
-        curvature_psd: Option<bool>,
-    ) -> StallVerdict {
+    /// A stall at a strict-saddle incumbent grants an escape (flagged for
+    /// [`Self::take_strict_saddle_refusal`]) unless it would replay the previous
+    /// one.
+    pub fn observe(&mut self, sample: StallSample<'_>, predicted_decrease: f64) -> StallVerdict {
         let staged_payload = self.staged_payload.take();
+        let point = sample.point;
+        let (value, resolution, grad_norm) = (sample.value, sample.resolution, sample.grad_norm);
         if !value.is_finite() {
-            self.no_improve_streak = 0;
             self.record_window_trial(point);
             return StallVerdict::Continue;
         }
-        if !trusted {
+        if !sample.trusted {
             self.refused_streak = 0;
-            self.no_improve_streak = 0;
             self.record_window_trial(point);
             return StallVerdict::Continue;
         }
         self.refused_streak = 0;
         self.accepted = self.accepted.saturating_add(1);
-        self.record_recent(point, value);
-        let improvement = self.best_value - value;
-        let floor = self.rel_tol * (1.0 + self.best_value.abs());
+        let first = !self.best_value.is_finite();
+        let resolution_pair = self.best_resolution + resolution;
+        let resolved = resolvably_below(self.best_value, self.best_resolution, value, resolution);
         if value < self.best_value {
-            self.best_value = value;
-            self.best_point = Some(point.clone());
-            self.best_grad_norm = grad_norm;
-            self.best_curvature_psd = curvature_psd;
-            self.best_payload = staged_payload;
+            self.adopt(&sample, staged_payload);
             self.publish_best_so_far();
         }
+        if first {
+            self.restart_recent(point, value);
+            return StallVerdict::Continue;
+        }
         let stationary_at_value = grad_norm.is_finite() && grad_norm <= self.band(value);
-        if floor.is_finite() && (improvement <= floor || stationary_at_value) {
-            self.no_improve_streak = self.no_improve_streak.saturating_add(1);
-            self.record_window_trial(point);
-        } else {
-            self.no_improve_streak = 0;
+        if !stationary_at_value && resolved {
             self.window_trials.clear();
             self.stuck_escapes = 0;
             self.incumbent_at_last_escape = None;
+            self.restart_recent(point, value);
+            return StallVerdict::Continue;
         }
-        if self.no_improve_streak < self.window {
+        self.recent.push_back((point.clone(), value));
+        self.record_window_trial(point);
+        if !stationary_at_value && predicted_decrease > resolution_pair {
             return StallVerdict::Continue;
         }
         if self.best_curvature_psd == Some(false) {
@@ -550,9 +568,9 @@ impl<C: Clone> StallMonitor<C> {
             let incumbent = self.escape_state(&best_point, best_value, best_grad_norm);
             if self.grant_escape_unless_replay(incumbent) {
                 log::debug!(
-                    "[STALL] window filled at a strict-saddle incumbent (value={:.6e}): refusing \
-                     to stop there and returning control to the solver to take the negative \
-                     curvature (escape {})",
+                    "[STALL] stall at a strict-saddle incumbent (value={:.6e}): refusing to stop \
+                     there and returning control to the solver to take the negative curvature \
+                     (escape {})",
                     self.best_value,
                     self.stuck_escapes,
                 );
@@ -561,11 +579,10 @@ impl<C: Clone> StallMonitor<C> {
             }
             self.replay_proven = true;
             log::debug!(
-                "[STALL] strict-saddle refusal cut at escape {}: the previous refusal reopened a \
-                 full {}-sample window that observed the same trials from a bit-identical incumbent \
-                 (best={:.9e}, |g|={:.3e}); halting",
+                "[STALL] strict-saddle refusal cut at escape {}: the previous refusal was followed \
+                 by the same trials from a bit-identical incumbent (best={:.9e}, |g|={:.3e}); \
+                 halting",
                 self.stuck_escapes,
-                self.window,
                 best_value,
                 best_grad_norm,
             );
@@ -575,42 +592,69 @@ impl<C: Clone> StallMonitor<C> {
 
     /// Fold one finite trial the solver's ratio test rejected.
     ///
-    /// The iterate did not move, so this is not a step: the incumbent, the
-    /// trusted-sample count and the no-improvement streak are untouched. What
-    /// the trial does change: its finite value ends a run of refused trials,
-    /// which are consecutive trials that did not evaluate, and it is a point the
-    /// open window observed, so it belongs to the replay identity (see
-    /// [`IncumbentBits`]). The payload staged for it is dropped, since it never
-    /// becomes the incumbent.
+    /// The iterate did not move, so this is not a step and reaches no verdict:
+    /// the incumbent and the trusted-sample count are untouched. Its finite value
+    /// ends a run of refused trials, and it is a point the search observed, so it
+    /// belongs to the replay identity. The payload staged for it is dropped.
     pub fn observe_rejected_trial(&mut self, point: &Array1<f64>) {
         self.staged_payload = None;
         self.refused_streak = 0;
         self.record_window_trial(point);
     }
 
-    /// Fold one trial refused before it produced a finite criterion value.
+    /// A feasible trial the solver did not accept ends a refusal run. It grants
+    /// no progress and is not a step.
+    pub fn observe_feasible_probe(&mut self) {
+        self.refused_streak = 0;
+        self.unescapable_streak = 0;
+    }
+
+    /// Whether a refused trial whose step's model predicted `predicted_decrease`
+    /// stalls. A refused trial has no value, so only the predicted half of the
+    /// stall rule can be taken, and it can, since the model decrease is known
+    /// before the trial is evaluated: a model that promised at most the incumbent's
+    /// resolution could not have shown resolved progress even had the trial
+    /// evaluated exactly. A decrease that is not a number decides nothing.
+    fn refusal_stalls(&self, predicted_decrease: f64) -> bool {
+        predicted_decrease <= self.best_resolution
+    }
+
+    /// Count one wall refusal on the incumbent and stamp it onto the published
+    /// exit, which a budget stop recovers its checkpoint from. It publishes
+    /// nothing new, so [`Self::exit_revision`] does not move.
+    fn record_wall_refusal(&mut self) {
+        self.wall_refusals = self.wall_refusals.saturating_add(1);
+        if let Some(exit) = self.exit.as_mut() {
+            exit.wall_refusals = self.wall_refusals;
+        }
+    }
+
+    /// Fold one trial refused before it produced a finite criterion value,
+    /// proposed by a step whose model predicted `predicted_decrease`.
     ///
-    /// A window of `window` consecutive refusals after a finite incumbent is the
-    /// same "no further progress" signal as a no-improvement window and is
-    /// decided the same way at the incumbent. Before any incumbent there is
-    /// nothing to stop at. At a strict-saddle incumbent the refused run says
-    /// only that the solver's current step left the domain, so both streaks
-    /// reset and the search continues.
-    pub fn observe_refused(&mut self, point: &Array1<f64>) -> StallVerdict {
+    /// A refusal that stalls ([`Self::refusal_stalls`]) is decided at the
+    /// incumbent exactly as a stalled step is; one that does not reaches no
+    /// verdict, however many come. Before any incumbent there is nothing to stop
+    /// at. At a strict-saddle incumbent the refusal says only that the solver's
+    /// current step left the domain, so the search continues.
+    pub fn observe_refused(
+        &mut self,
+        point: &Array1<f64>,
+        predicted_decrease: f64,
+    ) -> StallVerdict {
         if self.best_point.is_none() || !self.best_value.is_finite() {
             return StallVerdict::Continue;
         }
         self.refused_streak = self.refused_streak.saturating_add(1);
         self.unescapable_streak = 0;
         self.record_window_trial(point);
-        if self.refused_streak < self.window {
+        if !self.refusal_stalls(predicted_decrease) {
             return StallVerdict::Continue;
         }
+        self.record_wall_refusal();
         if self.best_curvature_psd == Some(false) {
-            self.refused_streak = 0;
-            self.no_improve_streak = 0;
             log::debug!(
-                "[STALL] refused-trial run reached a strict-saddle incumbent; refusing the stall \
+                "[STALL] refused trial stalled at a strict-saddle incumbent; refusing the stall \
                  and returning control to the solver"
             );
             return StallVerdict::Continue;
@@ -619,16 +663,27 @@ impl<C: Clone> StallMonitor<C> {
         self.publish_stall(point, best_value, best_grad_norm)
     }
 
-    /// Fold one refused trial that no escape can get past.
+    /// Fold one trial that evaluated to `value` (to within `resolution`) on a part
+    /// of the domain this search cannot move onto, proposed by a step whose model
+    /// predicted `predicted_decrease`.
     ///
-    /// It shares [`Self::observe_refused`]'s streak and window. A filled window
-    /// that also holds an ordinary refusal is decided exactly as that one is. A
-    /// window made only of unescapable refusals at an incumbent outside the band
-    /// publishes the incumbent, not converged, with the window's evidence, and
-    /// grants no escape: an escape reopens the window for descent the solver may
-    /// still reach, and these trials say continuing only proposes more of them.
-    /// Inside the band it is published as an ordinary stall.
-    pub fn observe_unescapable_refusal(&mut self, point: &Array1<f64>) -> StallVerdict {
+    /// It shares [`Self::observe_refused`]'s streak. It stops the search at once,
+    /// with no escape, when its value is resolvably below the incumbent's: that is
+    /// descent this search cannot take and a caller that can move there can.
+    /// Otherwise the other part of the domain is only a wall, and the trial is
+    /// judged by its model decrease as any refusal is. A stalled run that also
+    /// holds an ordinary refusal is decided exactly as that one is. A stalled run
+    /// made only of these trials, at an incumbent outside the band, publishes the
+    /// incumbent, not converged, and grants no escape: an escape continues for
+    /// descent the solver may still reach, and these trials say continuing only
+    /// proposes more of them. Inside the band it is published as an ordinary stall.
+    pub fn observe_unescapable_refusal(
+        &mut self,
+        point: &Array1<f64>,
+        value: f64,
+        resolution: f64,
+        predicted_decrease: f64,
+    ) -> StallVerdict {
         if self.best_point.is_none() || !self.best_value.is_finite() {
             return StallVerdict::Continue;
         }
@@ -638,12 +693,17 @@ impl<C: Clone> StallMonitor<C> {
             1 => 1,
             _ => self.unescapable_streak.saturating_add(1),
         };
-        if self.refused_streak < self.window {
-            return StallVerdict::Continue;
-        }
-        if self.unescapable_streak < self.refused_streak {
-            let (best_value, best_grad_norm) = (self.best_value, self.best_grad_norm);
-            return self.publish_stall(point, best_value, best_grad_norm);
+        let lower_elsewhere =
+            resolvably_below(self.best_value, self.best_resolution, value, resolution);
+        if !lower_elsewhere {
+            if !self.refusal_stalls(predicted_decrease) {
+                return StallVerdict::Continue;
+            }
+            self.record_wall_refusal();
+            if self.unescapable_streak < self.refused_streak {
+                let (best_value, best_grad_norm) = (self.best_value, self.best_grad_norm);
+                return self.publish_stall(point, best_value, best_grad_norm);
+            }
         }
         let (best_point, best_value, best_grad_norm) =
             self.best_iterate_or(point, self.best_value, self.best_grad_norm);
@@ -652,8 +712,8 @@ impl<C: Clone> StallMonitor<C> {
             return self.publish_stall(point, best_value, best_grad_norm);
         }
         let probe_scale = self.window_probe_scale();
-        let refused_trials = self.unescapable_streak;
-        let accepted = self.accepted;
+        let (refused_trials, accepted, wall_refusals) =
+            (self.unescapable_streak, self.accepted, self.wall_refusals);
         self.publish(StallExit {
             point: best_point,
             value: best_value,
@@ -665,6 +725,7 @@ impl<C: Clone> StallMonitor<C> {
                 refused_trials,
                 band,
             }),
+            wall_refusals,
         });
         StallVerdict::Floor {
             residual_grad_norm: best_grad_norm,
@@ -676,47 +737,42 @@ impl<C: Clone> StallMonitor<C> {
     ///
     /// `grad_norm` must be the bound-projected residual at the sample, so the
     /// published verdict certifies only a sample stationary in its feasible
-    /// subspace. An untrusted sample, or one whose value exceeds the incumbent
-    /// by more than the floor (a spurious corner of the box), is folded as an
-    /// ordinary sample instead, so the better incumbent is kept.
+    /// subspace. An untrusted sample, or one resolvably above the incumbent (a
+    /// spurious corner of the box), is folded as an ordinary sample instead, so
+    /// the better incumbent is kept.
     pub fn observe_constrained_stationary(
         &mut self,
-        point: &Array1<f64>,
-        value: f64,
-        grad_norm: f64,
-        trusted: bool,
-        curvature_psd: Option<bool>,
+        sample: StallSample<'_>,
+        predicted_decrease: f64,
     ) -> StallVerdict {
-        if !value.is_finite() {
+        if !sample.value.is_finite() {
             return StallVerdict::Continue;
         }
-        if !trusted {
-            return self.observe(point, value, grad_norm, trusted, curvature_psd);
-        }
         let regresses = self.best_value.is_finite()
-            && value > self.best_value + self.rel_tol * (1.0 + self.best_value.abs());
-        if regresses {
-            return self.observe(point, value, grad_norm, trusted, curvature_psd);
+            && resolvably_below(
+                sample.value,
+                sample.resolution,
+                self.best_value,
+                self.best_resolution,
+            );
+        if !sample.trusted || regresses {
+            return self.observe(sample, predicted_decrease);
         }
+        let payload = self.staged_payload.take();
         self.refused_streak = 0;
         self.accepted = self.accepted.saturating_add(1);
-        self.best_value = value;
-        self.best_point = Some(point.clone());
-        self.best_grad_norm = grad_norm;
-        self.best_curvature_psd = curvature_psd;
-        self.best_payload = self.staged_payload.take();
-        self.no_improve_streak = self.window;
-        self.publish_stall(point, value, grad_norm)
+        self.adopt(&sample, payload);
+        self.publish_stall(sample.point, sample.value, sample.grad_norm)
     }
 
-    /// Publish the incumbent and decide a filled window's verdict.
+    /// Publish the incumbent and decide a stall's verdict.
     fn publish_stall(&mut self, point: &Array1<f64>, value: f64, grad_norm: f64) -> StallVerdict {
         let (best_point, best_value, best_grad_norm) =
             self.best_iterate_or(point, value, grad_norm);
         let band = self.band(best_value);
         let probe_scale = self.window_probe_scale();
         let converged = best_grad_norm.is_finite() && best_grad_norm <= band;
-        let accepted = self.accepted;
+        let (accepted, wall_refusals) = (self.accepted, self.wall_refusals);
         if converged {
             self.publish(StallExit {
                 point: best_point,
@@ -726,6 +782,7 @@ impl<C: Clone> StallMonitor<C> {
                 converged,
                 probe_scale,
                 unescapable_window: None,
+                wall_refusals,
             });
             return StallVerdict::Converged;
         }
@@ -741,12 +798,9 @@ impl<C: Clone> StallMonitor<C> {
         if non_stationary && self.incumbent_at_last_escape.as_ref() == Some(&incumbent) {
             self.replay_proven = true;
             log::debug!(
-                "[STALL] escape streak cut at {}: escape {} reopened a full {}-sample window that \
-                 observed the same trials from a bit-identical incumbent (best={:.9e}, |g|={:.3e}); \
-                 halting",
+                "[STALL] escape streak cut at {}: the escape was followed by the same trials from \
+                 a bit-identical incumbent (best={:.9e}, |g|={:.3e}); halting",
                 self.stuck_escapes,
-                self.stuck_escapes,
-                self.window,
                 best_value,
                 best_grad_norm,
             );
@@ -759,6 +813,7 @@ impl<C: Clone> StallMonitor<C> {
             converged,
             probe_scale,
             unescapable_window: None,
+            wall_refusals,
         });
         StallVerdict::Floor {
             residual_grad_norm: best_grad_norm,
@@ -774,7 +829,12 @@ impl<C: Clone> StallMonitor<C> {
         if !self.best_value.is_finite() {
             return;
         }
-        let (value, grad_norm, accepted) = (self.best_value, self.best_grad_norm, self.accepted);
+        let (value, grad_norm, accepted, wall_refusals) = (
+            self.best_value,
+            self.best_grad_norm,
+            self.accepted,
+            self.wall_refusals,
+        );
         self.publish(StallExit {
             point,
             value,
@@ -783,18 +843,12 @@ impl<C: Clone> StallMonitor<C> {
             converged: false,
             probe_scale: None,
             unescapable_window: None,
+            wall_refusals,
         });
     }
 
-    /// Defer a filled window to a caller that owns a stronger acceptance test:
-    /// reopen the no-improvement window and revoke any convergence the exit
-    /// claims, keeping the incumbent and the window evidence.
-    pub fn defer_filled_window(&mut self) {
-        self.no_improve_streak = 0;
-        self.revoke_published_convergence();
-    }
-
-    /// Mark the published exit not converged.
+    /// Mark the published exit not converged, keeping the incumbent and the
+    /// evidence, for a caller that owns a stronger acceptance test.
     pub fn revoke_published_convergence(&mut self) {
         if let Some(exit) = self.exit.as_mut() {
             exit.converged = false;
@@ -805,319 +859,186 @@ impl<C: Clone> StallMonitor<C> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StallMonitor, StallVerdict};
+    use super::{StallMonitor, StallSample, StallVerdict, resolvably_below};
     use ndarray::{Array1, array};
 
     const BAND: f64 = 1e-2;
+    const RESOLUTION: f64 = 1e-9;
 
-    fn monitor(window: usize) -> StallMonitor<()> {
-        StallMonitor::new(1e-6, window, |_| BAND)
+    fn monitor() -> StallMonitor<()> {
+        StallMonitor::new(|_| BAND)
     }
 
-    fn point(x: f64) -> Array1<f64> {
-        array![x]
+    fn sample(point: &Array1<f64>, value: f64, grad_norm: f64) -> StallSample<'_> {
+        StallSample {
+            point,
+            value,
+            resolution: RESOLUTION,
+            grad_norm,
+            trusted: true,
+            curvature_psd: None,
+        }
     }
 
     #[test]
-    fn the_first_sample_is_the_incumbent_and_the_window_counts_after_it() {
-        let mut stall = monitor(2);
+    fn two_values_are_ordered_exactly_past_the_sum_of_their_resolutions() {
+        assert!(resolvably_below(1.0, 0.1, 0.7, 0.1));
+        assert!(!resolvably_below(1.0, 0.1, 0.8, 0.1));
+        assert!(!resolvably_below(1.0, 0.1, f64::NAN, 0.1));
+    }
+
+    /// One stalled step reaches the verdict: no window is counted.
+    #[test]
+    fn one_stalled_step_decides_at_the_incumbent() {
+        let mut stall = monitor();
+        let (a, b) = (array![0.0], array![0.1]);
         assert_eq!(
-            stall.observe(&point(0.0), 1.0, 0.0, true, None),
+            stall.observe(sample(&a, 1.0, 0.0), 0.0),
             StallVerdict::Continue
         );
         assert_eq!(
-            stall.observe(&point(0.1), 1.0, 0.0, true, None),
-            StallVerdict::Continue
-        );
-        assert_eq!(
-            stall.observe(&point(0.2), 1.0, 0.0, true, None),
+            stall.observe(sample(&b, 1.0, 0.0), 0.0),
             StallVerdict::Converged
         );
         let exit = stall.exit().expect("published");
         assert!(exit.converged);
-        assert_eq!(exit.point, point(0.0));
+        assert_eq!(exit.point, a);
+    }
+
+    /// A step that buys no resolved progress while its model promised a resolvable
+    /// decrease is the solver adapting, and reaches no verdict.
+    #[test]
+    fn an_adapting_step_reaches_no_verdict() {
+        let mut stall = monitor();
+        let (a, b) = (array![0.0], array![0.1]);
+        stall.observe(sample(&a, 1.0, 1.0), 0.0);
+        assert_eq!(
+            stall.observe(sample(&b, 1.0, 1.0), 1e-3),
+            StallVerdict::Continue
+        );
+        assert!(stall.exit().is_some_and(|exit| !exit.converged));
     }
 
     #[test]
-    fn an_untrusted_sample_is_never_the_incumbent_and_resets_the_window() {
-        let mut stall = monitor(2);
-        stall.observe(&point(0.0), 1.0, 0.0, true, None);
-        stall.observe(&point(0.1), 1.0, 0.0, true, None);
+    fn resolved_progress_continues_and_an_untrusted_sample_is_never_the_incumbent() {
+        let mut stall = monitor();
+        let (a, b, c) = (array![0.0], array![0.1], array![0.2]);
+        stall.observe(sample(&a, 1.0, 1.0), 0.0);
         assert_eq!(
-            stall.observe(&point(0.2), 0.5, 0.0, false, None),
+            stall.observe(sample(&b, 0.5, 1.0), 0.0),
             StallVerdict::Continue
         );
-        assert_eq!(stall.best_value(), 1.0);
-        // Without the untrusted sample the next trusted one would fill the window.
-        // It reset the streak, so two more trusted samples are needed.
-        assert_eq!(
-            stall.observe(&point(0.3), 1.0, 0.0, true, None),
-            StallVerdict::Continue
-        );
-        assert_eq!(
-            stall.observe(&point(0.4), 1.0, 0.0, true, None),
-            StallVerdict::Converged
-        );
+        let untrusted = StallSample {
+            trusted: false,
+            ..sample(&c, 0.1, 1.0)
+        };
+        assert_eq!(stall.observe(untrusted, 0.0), StallVerdict::Continue);
+        assert_eq!(stall.best_value(), 0.5);
+        assert_eq!(stall.best_point(), Some(&b));
     }
 
     #[test]
-    fn an_escape_is_cut_only_when_it_replays_the_same_window_from_a_bit_identical_incumbent() {
-        let mut stall = monitor(2);
-        stall.observe(&point(0.0), 1.0, 1.0, true, None);
-        stall.observe(&point(0.1), 1.0, 1.0, true, None);
+    fn an_escape_is_cut_only_when_it_replays_the_same_trials_from_a_bit_identical_incumbent() {
+        let mut stall = monitor();
+        let (a, b, c) = (array![0.0], array![0.1], array![0.2]);
+        stall.observe(sample(&a, 1.0, 1.0), 0.0);
         assert!(matches!(
-            stall.observe(&point(0.2), 1.0, 1.0, true, None),
+            stall.observe(sample(&b, 1.0, 1.0), 0.0),
             StallVerdict::Escape { .. }
         ));
         assert_eq!(stall.stuck_escapes, 1);
-        // The reopened window observes the same trials from the same incumbent:
-        // a deterministic procedure replayed from an identical state.
-        stall.observe(&point(0.1), 1.0, 1.0, true, None);
         assert!(matches!(
-            stall.observe(&point(0.2), 1.0, 1.0, true, None),
+            stall.observe(sample(&b, 1.0, 1.0), 0.0),
             StallVerdict::Floor { .. }
         ));
         assert!(stall.replay_proven());
         assert!(!stall.exit().expect("published").converged);
 
-        // Positive control: a reopened window that observes trials the previous
-        // one never saw is a search in a different state, however still its
-        // incumbent, and earns another escape instead of the cut.
-        let mut exploring = monitor(2);
-        exploring.observe(&point(0.0), 1.0, 1.0, true, None);
-        exploring.observe(&point(0.1), 1.0, 1.0, true, None);
+        // A run that observes a trial the previous one never saw is a search in a
+        // different state, however still its incumbent, and earns another escape.
+        let mut exploring = monitor();
+        exploring.observe(sample(&a, 1.0, 1.0), 0.0);
+        exploring.observe(sample(&b, 1.0, 1.0), 0.0);
         assert!(matches!(
-            exploring.observe(&point(0.2), 1.0, 1.0, true, None),
-            StallVerdict::Escape { .. }
-        ));
-        exploring.observe(&point(0.3), 1.0, 1.0, true, None);
-        assert!(matches!(
-            exploring.observe(&point(0.4), 1.0, 1.0, true, None),
+            exploring.observe(sample(&c, 1.0, 1.0), 0.0),
             StallVerdict::Escape { .. }
         ));
         assert_eq!(exploring.stuck_escapes, 2);
         assert!(!exploring.replay_proven());
-
-        // Positive control: an incumbent that moved between the windows (a lower
-        // value by less than the floor) earns another escape instead of the cut.
-        let mut moving = monitor(2);
-        moving.observe(&point(0.0), 1.0, 1.0, true, None);
-        moving.observe(&point(0.1), 1.0, 1.0, true, None);
-        assert!(matches!(
-            moving.observe(&point(0.2), 1.0, 1.0, true, None),
-            StallVerdict::Escape { .. }
-        ));
-        moving.observe(&point(0.3), 1.0 - 1e-9, 1.0, true, None);
-        assert!(matches!(
-            moving.observe(&point(0.4), 1.0 - 1e-9, 1.0, true, None),
-            StallVerdict::Escape { .. }
-        ));
-        assert!(!moving.replay_proven());
     }
 
     #[test]
-    fn a_strict_saddle_incumbent_escapes_until_the_escape_replays() {
-        let mut stall = monitor(2);
-        stall.observe(&point(0.0), 1.0, 0.0, true, Some(false));
-        stall.observe(&point(0.1), 1.0, 0.0, true, Some(false));
+    fn a_strict_saddle_stall_grants_an_escape_flagged_for_the_caller() {
+        let mut stall = monitor();
+        let (a, b) = (array![0.0], array![0.1]);
+        let saddle = StallSample {
+            curvature_psd: Some(false),
+            ..sample(&a, 1.0, 0.0)
+        };
+        stall.observe(saddle, 0.0);
         assert_eq!(
-            stall.observe(&point(0.2), 1.0, 0.0, true, Some(false)),
+            stall.observe(sample(&b, 1.0, 0.0), 0.0),
             StallVerdict::Continue
         );
         assert!(stall.take_strict_saddle_refusal());
         assert!(!stall.take_strict_saddle_refusal());
-        // A window on new trials is the search still exploring the saddle, so it
-        // escapes again.
-        stall.observe(&point(0.3), 1.0, 0.0, true, Some(false));
-        assert_eq!(
-            stall.observe(&point(0.4), 1.0, 0.0, true, Some(false)),
-            StallVerdict::Continue
-        );
-        assert!(stall.take_strict_saddle_refusal());
-        assert!(!stall.replay_proven());
-        // The same trials again from the same incumbent are the replay.
-        stall.observe(&point(0.3), 1.0, 0.0, true, Some(false));
-        assert_eq!(
-            stall.observe(&point(0.4), 1.0, 0.0, true, Some(false)),
-            StallVerdict::Converged
-        );
-        assert!(stall.replay_proven());
-
-        // Positive control: the same trajectory at a PSD incumbent stops at the first
-        // filled window.
-        let mut minimum = monitor(2);
-        minimum.observe(&point(0.0), 1.0, 0.0, true, Some(true));
-        minimum.observe(&point(0.1), 1.0, 0.0, true, Some(true));
-        assert_eq!(
-            minimum.observe(&point(0.2), 1.0, 0.0, true, Some(true)),
-            StallVerdict::Converged
-        );
     }
 
+    /// A refused trial whose model promised at most the incumbent's resolution is a
+    /// domain wall: it stalls, and it is counted on the incumbent. One whose model
+    /// promised more reaches no verdict.
     #[test]
-    fn a_rejected_trial_joins_the_replay_identity_and_nothing_else() {
-        let mut stall = monitor(2);
-        stall.observe(&point(0.0), 1.0, 1.0, true, None);
-        stall.observe(&point(0.1), 1.0, 1.0, true, None);
-        assert!(matches!(
-            stall.observe(&point(0.2), 1.0, 1.0, true, None),
-            StallVerdict::Escape { .. }
-        ));
-        let accepted = stall.accepted();
-        // A rejected trial between the windows: not a step, but a point the
-        // search observed, so the window that follows is not a replay.
-        stall.observe_rejected_trial(&point(0.9));
-        assert_eq!(stall.accepted(), accepted, "a rejected trial is not a step");
-        assert_eq!(
-            stall.observe(&point(0.1), 1.0, 1.0, true, None),
-            StallVerdict::Continue,
-            "a rejected trial does not count toward the window"
-        );
-        assert!(matches!(
-            stall.observe(&point(0.2), 1.0, 1.0, true, None),
-            StallVerdict::Escape { .. }
-        ));
-        assert!(!stall.replay_proven());
-
-        // Its finite value ends a run of refused trials.
-        let mut refused = monitor(2);
-        refused.observe_seed(&point(0.0), 1.0, 0.0, None);
-        refused.observe_refused(&point(9.0));
-        refused.observe_rejected_trial(&point(9.5));
-        assert_eq!(refused.refused_streak(), 0);
-        assert_eq!(refused.observe_refused(&point(9.0)), StallVerdict::Continue);
+    fn a_refusal_stalls_only_when_its_model_promised_no_resolvable_decrease() {
+        let mut stall = monitor();
+        let (a, b) = (array![0.0], array![0.1]);
+        stall.observe(sample(&a, 1.0, 0.0), 0.0);
+        assert_eq!(stall.observe_refused(&b, 1e-3), StallVerdict::Continue);
+        assert_eq!(stall.wall_refusals(), 0);
+        assert_eq!(stall.observe_refused(&b, 0.0), StallVerdict::Converged);
+        assert_eq!(stall.wall_refusals(), 1);
+        assert_eq!(stall.exit().expect("published").wall_refusals, 1);
     }
 
+    /// A trial lower on a part of the domain the search cannot move onto stops the
+    /// search at once, with no escape.
     #[test]
-    fn a_refused_window_halts_at_the_incumbent_and_not_before_one() {
-        let mut none = monitor(2);
-        assert_eq!(none.observe_refused(&point(9.0)), StallVerdict::Continue);
-        assert_eq!(none.observe_refused(&point(9.0)), StallVerdict::Continue);
-        assert!(none.exit().is_none());
-
-        let mut stall = monitor(2);
-        stall.observe_seed(&point(0.0), 1.0, 0.0, None);
-        assert_eq!(stall.observe_refused(&point(9.0)), StallVerdict::Continue);
-        assert_eq!(stall.observe_refused(&point(9.0)), StallVerdict::Converged);
-        assert_eq!(stall.exit().expect("published").point, point(0.0));
-
-        // Positive control: at a strict-saddle incumbent the refused run continues.
-        let mut saddle = monitor(2);
-        saddle.observe_seed(&point(0.0), 1.0, 0.0, Some(false));
-        saddle.observe_refused(&point(9.0));
-        assert_eq!(saddle.observe_refused(&point(9.0)), StallVerdict::Continue);
-        assert_eq!(saddle.refused_streak(), 0);
-    }
-
-    #[test]
-    fn an_all_unescapable_window_stops_without_an_escape_and_a_mixed_one_escapes() {
-        let mut pinned = monitor(3);
-        pinned.observe_seed(&point(0.0), 1.0, 1.0, None);
-        pinned.observe_unescapable_refusal(&point(1.0));
-        pinned.observe_unescapable_refusal(&point(1.0));
-        assert!(matches!(
-            pinned.observe_unescapable_refusal(&point(1.0)),
-            StallVerdict::Floor { .. }
-        ));
-        assert_eq!(pinned.stuck_escapes, 0);
-        let exit = pinned.exit().expect("published");
+    fn an_unescapable_trial_below_the_incumbent_stops_without_an_escape() {
+        let mut stall = monitor();
+        let (a, b) = (array![0.0], array![0.1]);
+        stall.observe(sample(&a, 1.0, 1.0), 0.0);
+        let verdict = stall.observe_unescapable_refusal(&b, 0.5, RESOLUTION, 1.0);
+        assert!(matches!(verdict, StallVerdict::Floor { .. }), "{verdict:?}");
+        let exit = stall.exit().expect("published");
         assert!(!exit.converged);
-        let window = exit.unescapable_window.expect("unescapable evidence");
-        assert_eq!(window.refused_trials, 3);
-        assert_eq!(window.band, BAND);
+        assert_eq!(exit.unescapable_window.expect("window").refused_trials, 1);
+        assert_eq!(stall.stuck_escapes, 0);
+    }
 
-        // Positive control: one ordinary refusal in the window keeps the escape.
-        let mut mixed = monitor(3);
-        mixed.observe_seed(&point(0.0), 1.0, 1.0, None);
-        mixed.observe_refused(&point(1.0));
-        mixed.observe_unescapable_refusal(&point(1.0));
+    /// The licence continues only while the search buys resolved descent, a
+    /// smaller projected gradient, or sits at a strict saddle.
+    #[test]
+    fn a_stall_that_bought_nothing_since_the_last_is_not_licensed() {
+        let mut stall = monitor();
+        let a = array![0.0];
+        stall.observe(sample(&a, 1.0, 1.0), 0.0);
+        assert!(stall.license_continuation());
+        assert!(stall.unprogressing_stop().is_some());
+    }
+
+    #[test]
+    fn a_constrained_stationary_sample_is_adopted_unless_it_regresses_the_incumbent() {
+        let mut stall = monitor();
+        let (a, b, c) = (array![0.0], array![0.1], array![0.2]);
+        stall.observe(sample(&a, 1.0, 1.0), 0.0);
         assert!(matches!(
-            mixed.observe_unescapable_refusal(&point(1.0)),
+            stall.observe_constrained_stationary(sample(&b, 2.0, 0.0), 0.0),
             StallVerdict::Escape { .. }
         ));
-        assert_eq!(mixed.stuck_escapes, 1);
-        assert!(mixed.exit().expect("snapshot").unescapable_window.is_none());
-    }
-
-    #[test]
-    fn the_licence_continues_only_on_descent_contraction_or_a_saddle() {
-        let mut stall = monitor(2);
-        stall.observe_seed(&point(0.0), 1.0, 1.0, None);
-        assert!(stall.license_continuation());
-        assert!(!stall.license_continuation());
-        assert!(stall.unprogressing_stop().is_some());
-
-        let mut contracting = monitor(2);
-        contracting.observe_seed(&point(0.0), 1.0, 1.0, None);
-        assert!(contracting.license_continuation());
-        contracting.observe(&point(0.1), 1.0 - 1e-9, 0.5, true, None);
-        assert!(contracting.license_continuation());
-
-        let mut saddle = monitor(2);
-        saddle.observe_seed(&point(0.0), 1.0, 1.0, Some(false));
-        assert!(saddle.license_continuation());
-        assert!(saddle.license_continuation());
-    }
-
-    #[test]
-    fn the_probe_scale_reports_the_median_difference_and_the_largest_step() {
-        let mut stall = monitor(4);
-        stall.observe_seed(&point(0.0), 10.0, 1.0, None);
-        stall.observe(&point(0.5), 10.0, 1.0, true, None);
-        assert!(stall.window_probe_scale().is_none());
-        stall.observe(&point(0.7), 10.0 + 3e-3, 1.0, true, None);
-        stall.observe(&point(0.8), 10.0 + 1e-3, 1.0, true, None);
-        let (noise, radius) = stall.window_probe_scale().expect("three differences");
-        assert!((noise - 2e-3).abs() < 1e-12);
-        assert!((radius - 0.5).abs() < 1e-12);
-    }
-
-    #[test]
-    fn a_regressing_constrained_stationary_sample_keeps_the_incumbent() {
-        let mut stall = monitor(3);
-        stall.observe_seed(&point(0.0), 1.0, 1.0, None);
-        assert!(matches!(
-            stall.observe_constrained_stationary(&point(5.0), 2.0, 0.0, true, None),
-            StallVerdict::Continue
-        ));
-        assert_eq!(stall.best_point(), Some(&point(0.0)));
-
-        // Positive control: a non-regressing one is adopted and published converged.
+        assert_eq!(stall.best_point(), Some(&a));
         assert_eq!(
-            stall.observe_constrained_stationary(&point(5.0), 1.0, 0.0, true, None),
+            stall.observe_constrained_stationary(sample(&c, 1.0, 0.0), 0.0),
             StallVerdict::Converged
         );
-        assert_eq!(stall.exit().expect("published").point, point(5.0));
-    }
-
-    #[test]
-    fn the_window_keeps_the_latest_steps_solver_state() {
-        let step = |sigma: f64, alpha: f64| crate::StepInfo {
-            iter: 0,
-            step_norm: alpha,
-            predicted_decrease: f64::NAN,
-            actual_decrease: 0.0,
-            trust_radius: None,
-            regularization: Some(sigma),
-            line_search_step: Some(alpha),
-        };
-        let mut stall = monitor(2);
-        stall.observe_step(&step(1.0, 0.5));
-        stall.observe_step(&step(2.0, 0.25));
-        // Positive control: before a third step, the oldest is still held.
-        assert_eq!(
-            stall
-                .recent_steps()
-                .next()
-                .and_then(|kept| kept.regularization),
-            Some(1.0)
-        );
-        stall.observe_step(&step(4.0, 0.125));
-        let kept: Vec<_> = stall.recent_steps().copied().collect();
-        assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].regularization, Some(2.0));
-        assert_eq!(kept[1].regularization, Some(4.0));
-        assert_eq!(kept[1].line_search_step, Some(0.125));
-        assert_eq!(kept[1].step_norm, 0.125);
+        assert_eq!(stall.best_point(), Some(&c));
     }
 }
