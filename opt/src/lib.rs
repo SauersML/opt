@@ -108,9 +108,10 @@ mod second_order;
 mod stall_monitor;
 pub use second_order::{
     NegativeCurvatureClaim, NegativeCurvatureDecline, NegativeCurvatureQuery,
-    NegativeCurvatureVerdict, adjudicate_negative_curvature, certificate_curvature_shift, hessian_is_psd_at_resolution,
-    max_feasible_step_along, negative_curvature_claim, newton_predicted_decrease,
-    newton_predicted_decrease_at_resolution, unresolvable_curvature_magnitude,
+    NegativeCurvatureVerdict, adjudicate_negative_curvature, certificate_curvature_shift,
+    hessian_is_psd_at_resolution, max_feasible_step_along, negative_curvature_claim,
+    newton_predicted_decrease, newton_predicted_decrease_at_resolution,
+    unresolvable_curvature_magnitude,
 };
 pub use stall_monitor::{
     StallExit, StallMonitor, StallStep, StallVerdict, UnescapableRefusalWindow,
@@ -15723,8 +15724,14 @@ mod tests {
         let tiny = 1.0e-3 * band;
         let f_trial = f_k + 2.0 * band;
         assert!(!core.accept_armijo(f_k, -tiny, f_trial));
-        let miss = core.last_armijo_miss.get().expect("a rejection is recorded");
-        assert!(miss.within_band(), "a sub-band prediction is band-limited: {miss:?}");
+        let miss = core
+            .last_armijo_miss
+            .get()
+            .expect("a rejection is recorded");
+        assert!(
+            miss.within_band(),
+            "a sub-band prediction is band-limited: {miss:?}"
+        );
         assert_eq!(miss.observed_decrease, f_k - f_trial);
 
         // A predicted decrease whose required fraction `c1·α|gᵀd|` is a thousand
@@ -15734,8 +15741,14 @@ mod tests {
         // would still sit inside the band and the relaxed test would accept.)
         let deep = 1.0e3 * band / core.c1_adapt;
         assert!(!core.accept_armijo(f_k, -deep, f_k));
-        let miss = core.last_armijo_miss.get().expect("a rejection is recorded");
-        assert!(!miss.within_band(), "a resolvable prediction is not band-limited: {miss:?}");
+        let miss = core
+            .last_armijo_miss
+            .get()
+            .expect("a rejection is recorded");
+        assert!(
+            !miss.within_band(),
+            "a resolvable prediction is not band-limited: {miss:?}"
+        );
         assert_eq!(miss.predicted_decrease, deep);
 
         // An accepted trial does not overwrite the last rejection.
@@ -16740,7 +16753,8 @@ mod tests {
             "the secular solve must reach its rounding: residual {residual:e} against {rounding:e}"
         );
         assert!(
-            core.prepare_arc_trial(&x0, &step, &g0, &h0, &active).is_some(),
+            core.prepare_arc_trial(&x0, &step, &g0, &h0, &active)
+                .is_some(),
             "an accurately solved step must pass the trial's first-order re-test"
         );
 
@@ -21286,7 +21300,10 @@ mod riemannian {
             if !self.value_band.is_finite() || self.value_band < 0.0 {
                 return Err(RiemannianTrustRegionError::InvalidValueBand);
             }
-            if self.model_error.is_some_and(|e| !e.rate.is_finite() || e.rate <= 0.0) {
+            if self
+                .model_error
+                .is_some_and(|e| !e.rate.is_finite() || e.rate <= 0.0)
+            {
                 return Err(RiemannianTrustRegionError::InvalidModelErrorRate);
             }
             if !self.grad_tol.is_finite() || self.grad_tol < 0.0 {
@@ -21339,7 +21356,8 @@ mod riemannian {
                 if let Some(error) = model_error.filter(|e| e.quadratic_model == quadratic_model) {
                     let kappa = match &curvature {
                         Some(hg) if grad_norm > 0.0 => {
-                            metric_inner(geometry, x.view(), grad.view(), hg.view())? / (grad_norm * grad_norm)
+                            metric_inner(geometry, x.view(), grad.view(), hg.view())?
+                                / (grad_norm * grad_norm)
                         }
                         _ => 0.0,
                     };
@@ -21347,7 +21365,9 @@ mod riemannian {
                 }
 
                 let (step, predicted_reduction) = match &curvature {
-                    Some(hg) => steihaug(geometry, objective, x.view(), grad.view(), hg.view(), delta)?,
+                    Some(hg) => {
+                        steihaug(geometry, objective, x.view(), grad.view(), hg.view(), delta)?
+                    }
                     None => cauchy_point(geometry, x.view(), grad.view(), delta)?,
                 };
                 let resolution = self.value_band * f_curr.abs();
@@ -21382,10 +21402,16 @@ mod riemannian {
                 let actual_reduction = f_curr - f_trial;
                 let band = self.value_band * f_curr.abs().max(f_trial.abs());
                 let gap = (predicted_reduction - actual_reduction).abs().max(band);
-                model_error = (step_norm > 0.0).then(|| ModelError {
-                    rate: if quadratic_model { 6.0 * gap / step_norm.powi(3) } else { 2.0 * gap / (step_norm * step_norm) },
-                    quadratic_model,
-                }).filter(|e| e.rate.is_finite() && e.rate > 0.0);
+                model_error = (step_norm > 0.0)
+                    .then(|| ModelError {
+                        rate: if quadratic_model {
+                            6.0 * gap / step_norm.powi(3)
+                        } else {
+                            2.0 * gap / (step_norm * step_norm)
+                        },
+                        quadratic_model,
+                    })
+                    .filter(|e| e.rate.is_finite() && e.rate > 0.0);
                 if actual_reduction > band {
                     x = trial_x;
                 }
@@ -21769,12 +21795,18 @@ mod riemannian {
                 hessian_calls: 0,
             };
             let start = array![5.0, -3.0, 2.0];
-            let straight = RiemannianTrustRegion { radius: 0.25, ..solver(8) }
-                .minimize(&euclidean(3), &mut objective(), start.view())
-                .expect("the trust region runs");
-            let first = RiemannianTrustRegion { radius: 0.25, ..solver(3) }
-                .minimize(&euclidean(3), &mut objective(), start.view())
-                .expect("the trust region runs");
+            let straight = RiemannianTrustRegion {
+                radius: 0.25,
+                ..solver(8)
+            }
+            .minimize(&euclidean(3), &mut objective(), start.view())
+            .expect("the trust region runs");
+            let first = RiemannianTrustRegion {
+                radius: 0.25,
+                ..solver(3)
+            }
+            .minimize(&euclidean(3), &mut objective(), start.view())
+            .expect("the trust region runs");
             let resumed = RiemannianTrustRegion {
                 radius: first.radius,
                 model_error: first.model_error,
@@ -21786,7 +21818,10 @@ mod riemannian {
             assert_eq!(resumed.point, straight.point);
             assert_eq!(resumed.radius.to_bits(), straight.radius.to_bits());
             assert_eq!(resumed.residual.to_bits(), straight.residual.to_bits());
-            assert_eq!(resumed.stationarity_reference.to_bits(), straight.stationarity_reference.to_bits());
+            assert_eq!(
+                resumed.stationarity_reference.to_bits(),
+                straight.stationarity_reference.to_bits()
+            );
         }
 
         #[test]
@@ -21890,7 +21925,10 @@ mod riemannian {
         fn a_quartic_is_minimized_with_radii_from_the_measured_model_error() {
             struct Quartic;
             impl RiemannianObjective<String> for Quartic {
-                fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> Result<(f64, Array1<f64>), String> {
+                fn value_gradient(
+                    &mut self,
+                    point: ArrayView1<'_, f64>,
+                ) -> Result<(f64, Array1<f64>), String> {
                     let x = point[0];
                     Ok((x.powi(4) + x * x, array![4.0 * x.powi(3) + 2.0 * x]))
                 }

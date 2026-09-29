@@ -361,7 +361,10 @@ pub enum NegativeCurvatureVerdict {
     },
     /// The claim's falsifiable range is empty: even the largest step predicts a
     /// decrease at or below the resolution, so no trial was evaluated.
-    Unresolvable { lambda_min: f64, predicted_at_largest: f64 },
+    Unresolvable {
+        lambda_min: f64,
+        predicted_at_largest: f64,
+    },
     Declined(NegativeCurvatureDecline),
 }
 
@@ -444,7 +447,11 @@ pub fn adjudicate_negative_curvature<E>(
         return Verdict::Declined(NegativeCurvatureDecline::UnusableDirection { lambda_min, norm });
     }
     let direction = query.basis.dot(&sub_direction.mapv(|value| value / norm));
-    let primary_sign = if query.gradient.dot(&direction) > 0.0 { -1.0 } else { 1.0 };
+    let primary_sign = if query.gradient.dot(&direction) > 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
 
     let roundoff_floor = 16.0 * f64::EPSILON * query.baseline_cost.abs().max(1.0);
     let floor = if query.objective_resolution.is_finite() && query.objective_resolution > 0.0 {
@@ -475,7 +482,11 @@ pub fn adjudicate_negative_curvature<E>(
         alpha *= 0.5;
     }
     let point_at = |ray: &Array1<f64>, alpha: f64| {
-        project_to_box(&(point + &ray.mapv(|value| alpha * value)), query.lower, query.upper)
+        project_to_box(
+            &(point + &ray.mapv(|value| alpha * value)),
+            query.lower,
+            query.upper,
+        )
     };
     let same_point = |trial: &Array1<f64>| {
         trial
@@ -581,9 +592,7 @@ mod tests {
     };
     use ndarray::{Array1, array};
 
-    use super::{
-        NegativeCurvatureQuery, NegativeCurvatureVerdict, adjudicate_negative_curvature,
-    };
+    use super::{NegativeCurvatureQuery, NegativeCurvatureVerdict, adjudicate_negative_curvature};
 
     fn query<'a>(
         point: &'a Array1<f64>,
@@ -622,8 +631,14 @@ mod tests {
             &query(&point, &gradient, &basis, &reduced, &lower, &upper, 0.0),
             f,
         );
-        let NegativeCurvatureVerdict::Descended { point, cost, step, on_box_face, confirmed_step, .. } =
-            verdict
+        let NegativeCurvatureVerdict::Descended {
+            point,
+            cost,
+            step,
+            on_box_face,
+            confirmed_step,
+            ..
+        } = verdict
         else {
             panic!("the saddle must descend, got {verdict:?}");
         };
@@ -649,12 +664,20 @@ mod tests {
             &query(&point, &gradient, &basis, &reduced, &lower, &upper, 0.0),
             |x: &Array1<f64>| -> Result<f64, ()> { Ok(x[0] * x[0]) },
         );
-        let NegativeCurvatureVerdict::Contradicted { smallest_step, probed, .. } = verdict else {
+        let NegativeCurvatureVerdict::Contradicted {
+            smallest_step,
+            probed,
+            ..
+        } = verdict
+        else {
             panic!("a convex objective must contradict the claim, got {verdict:?}");
         };
         let alpha_min = (2.0 * 1e-10 / 2.0_f64).sqrt();
         assert!(smallest_step <= alpha_min && smallest_step > 0.5 * alpha_min);
-        assert_eq!(probed, 2 * (1.0 / smallest_step).log2().round() as usize + 2);
+        assert_eq!(
+            probed,
+            2 * (1.0 / smallest_step).log2().round() as usize + 2
+        );
     }
 
     /// A claim whose largest step predicts no more than the resolution evaluates
@@ -674,7 +697,10 @@ mod tests {
             calls += 1;
             Ok(0.0)
         });
-        assert!(matches!(verdict, NegativeCurvatureVerdict::Unresolvable { .. }), "{verdict:?}");
+        assert!(
+            matches!(verdict, NegativeCurvatureVerdict::Unresolvable { .. }),
+            "{verdict:?}"
+        );
         assert_eq!(calls, 0);
     }
 
