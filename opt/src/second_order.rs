@@ -438,7 +438,7 @@ pub fn adjudicate_negative_curvature<E>(
     }
     let lambda_min = values[(min_index, 0)];
     let margin = f64::EPSILON.sqrt() * query.diagonal_scale.abs().max(1.0);
-    if !(lambda_min < -margin) {
+    if lambda_min.is_nan() || lambda_min >= -margin {
         return Verdict::Declined(NegativeCurvatureDecline::WithinRoundoff { lambda_min, margin });
     }
     let sub_direction = Array1::from_shape_fn(m, |row| vectors[(row, min_index)]);
