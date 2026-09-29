@@ -8,7 +8,10 @@
 //! verdict here is taken at one owner of the shift that measurement implies,
 //! [`certificate_curvature_shift`].
 
+use faer::{Mat, Side};
 use ndarray::{Array1, Array2};
+
+use crate::project_to_box;
 
 /// The shift a definiteness verdict on `hessian` is taken at: the larger of the
 /// measured resolution and the arithmetic shift `√ε·max(max|H_ii|, 1)`.
@@ -274,6 +277,301 @@ pub fn max_feasible_step_along(
     alpha.max(0.0)
 }
 
+/// A claim that a Hessian carries negative curvature at a point, stated on the
+/// subspace the caller's certificate judged ([`adjudicate_negative_curvature`]).
+#[derive(Clone, Copy, Debug)]
+pub struct NegativeCurvatureQuery<'a> {
+    /// The point, inside the box.
+    pub point: &'a Array1<f64>,
+    /// The objective's gradient there.
+    pub gradient: &'a Array1<f64>,
+    /// `n × m` orthonormal columns spanning the searched directions. Coordinates
+    /// held fixed (railed at a bound, or a direction the objective is invariant
+    /// along) are zero in every column.
+    pub basis: &'a Array2<f64>,
+    /// The Hessian compressed to the basis, `basisᵀ H basis` (`m × m`).
+    pub reduced_hessian: &'a Array2<f64>,
+    /// The largest `|H_kk|` over the searched coordinates: the scale of the
+    /// assembly roundoff `√ε·max(1, scale)` a negative eigenvalue must clear.
+    pub diagonal_scale: f64,
+    pub lower: &'a Array1<f64>,
+    pub upper: &'a Array1<f64>,
+    /// The objective at `point`.
+    pub baseline_cost: f64,
+    /// The objective's resolution: a decrease at or below it is not resolved.
+    pub objective_resolution: f64,
+    /// The largest step the claim is tested at along the unit eigenvector.
+    pub largest_step: f64,
+}
+
+/// Why [`adjudicate_negative_curvature`] established nothing about the point.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NegativeCurvatureDecline {
+    /// The reduced Hessian is not a square finite matrix matching the basis.
+    Malformed,
+    /// The subspace is empty: nothing is left to search.
+    EmptySubspace,
+    /// The reduced Hessian's eigendecomposition failed.
+    Eigendecomposition(String),
+    /// The most negative eigenvalue does not clear the roundoff margin.
+    WithinRoundoff { lambda_min: f64, margin: f64 },
+    /// The eigenvector's norm is not a finite positive number.
+    UnusableDirection { lambda_min: f64, norm: f64 },
+    /// No trial was evaluable: each was clamped back onto the point, failed, or
+    /// returned a non-finite value, so nothing was measured.
+    NoEvaluableTrial {
+        lambda_min: f64,
+        margin: f64,
+        clamped_onto_point: usize,
+        failed: usize,
+        non_finite: usize,
+        steps: usize,
+    },
+}
+
+/// What the objective said about a claim of negative curvature
+/// ([`adjudicate_negative_curvature`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum NegativeCurvatureVerdict {
+    /// A feasible point along the eigenvector lowers the objective by more than its
+    /// resolution: the point is a saddle, and this is the descent off it.
+    Descended {
+        point: Array1<f64>,
+        cost: f64,
+        lambda_min: f64,
+        /// The ladder step that confirmed the descent.
+        confirmed_step: f64,
+        /// The step taken after doubling while the objective kept improving.
+        step: f64,
+        doublings: usize,
+        /// Whether the step reached the box along the ray.
+        on_box_face: bool,
+    },
+    /// Every evaluable step in the claim's whole falsifiable range, both signs,
+    /// failed to lower the objective past its resolution.
+    Contradicted {
+        lambda_min: f64,
+        probed: usize,
+        smallest_step: f64,
+        /// `½|λ_min|·α_min²`, the claim's prediction at the smallest step.
+        predicted_at_smallest: f64,
+        best_seen_cost: f64,
+        /// The decrease floor the trials had to clear.
+        decrease_floor: f64,
+    },
+    /// The claim's falsifiable range is empty: even the largest step predicts a
+    /// decrease at or below the resolution, so no trial was evaluated.
+    Unresolvable { lambda_min: f64, predicted_at_largest: f64 },
+    Declined(NegativeCurvatureDecline),
+}
+
+/// Test a Hessian's claim of negative curvature at a first-order stationary point
+/// against the objective itself.
+///
+/// Along the unit eigenvector `v` of the most negative eigenvalue `λ_min` of the
+/// reduced Hessian, the quadratic model predicts `V(x ± αv) − V(x) ≈ ½λ_min α²`.
+/// The decrease floor is the objective's resolution, but never below the
+/// arithmetic's `16ε·max(|V|, 1)`: a decrease under it is not a decrease under any
+/// reading. The claim predicts something the objective can represent only while
+/// `½|λ_min|α² > floor`, so its falsifiable range runs from `largest_step` down to
+/// `α_min = √(2·floor/|λ_min|)` ([`negative_curvature_claim`]); an empty range is
+/// [`NegativeCurvatureVerdict::Unresolvable`] before any evaluation.
+///
+/// The ladder halves from `largest_step` to `α_min` (or to `ε`, where halving
+/// stops moving the point), first with the sign that makes the linear term
+/// non-positive, then the other, each trial projected onto the box. The first
+/// trial that clears the floor confirms the saddle. A confirmed step is then
+/// doubled while the objective keeps improving past the floor, up to the box
+/// intersection along the ray: the model has no interior minimizer along negative
+/// curvature, so the step length has to come from the objective and the box. The
+/// incumbent is re-evaluated before the doubling so every comparison in it comes
+/// from one state of an objective whose evaluation carries state. The doubling
+/// ends at the box face, at the first trial that does not improve, or where the
+/// step overflows, so it needs no count.
+///
+/// The last evaluation is at a trial point; a caller whose objective carries state
+/// restores it.
+pub fn adjudicate_negative_curvature<E>(
+    query: &NegativeCurvatureQuery<'_>,
+    mut cost: impl FnMut(&Array1<f64>) -> Result<f64, E>,
+) -> NegativeCurvatureVerdict {
+    use NegativeCurvatureVerdict as Verdict;
+    let point = query.point;
+    let n = point.len();
+    let m = query.basis.ncols();
+    let reduced = query.reduced_hessian;
+    if query.basis.nrows() != n
+        || reduced.nrows() != m
+        || reduced.ncols() != m
+        || query.gradient.len() != n
+        || reduced.iter().any(|value| !value.is_finite())
+    {
+        return Verdict::Declined(NegativeCurvatureDecline::Malformed);
+    }
+    if m == 0 {
+        return Verdict::Declined(NegativeCurvatureDecline::EmptySubspace);
+    }
+    if !(query.largest_step.is_finite() && query.largest_step > 0.0) {
+        return Verdict::Declined(NegativeCurvatureDecline::Malformed);
+    }
+    let symmetric = Mat::<f64>::from_fn(m, m, |row, col| {
+        0.5 * (reduced[[row, col]] + reduced[[col, row]])
+    });
+    let eigen = match symmetric.self_adjoint_eigen(Side::Lower) {
+        Ok(eigen) => eigen,
+        Err(error) => {
+            return Verdict::Declined(NegativeCurvatureDecline::Eigendecomposition(format!(
+                "{error:?}"
+            )));
+        }
+    };
+    let values = eigen.S().column_vector().as_mat();
+    let vectors = eigen.U();
+    let mut min_index = 0usize;
+    for index in 1..m {
+        if values[(index, 0)] < values[(min_index, 0)] {
+            min_index = index;
+        }
+    }
+    let lambda_min = values[(min_index, 0)];
+    let margin = f64::EPSILON.sqrt() * query.diagonal_scale.abs().max(1.0);
+    if !(lambda_min < -margin) {
+        return Verdict::Declined(NegativeCurvatureDecline::WithinRoundoff { lambda_min, margin });
+    }
+    let sub_direction = Array1::from_shape_fn(m, |row| vectors[(row, min_index)]);
+    let norm = sub_direction.dot(&sub_direction).sqrt();
+    if !(norm.is_finite() && norm > 0.0) {
+        return Verdict::Declined(NegativeCurvatureDecline::UnusableDirection { lambda_min, norm });
+    }
+    let direction = query.basis.dot(&sub_direction.mapv(|value| value / norm));
+    let primary_sign = if query.gradient.dot(&direction) > 0.0 { -1.0 } else { 1.0 };
+
+    let roundoff_floor = 16.0 * f64::EPSILON * query.baseline_cost.abs().max(1.0);
+    let floor = if query.objective_resolution.is_finite() && query.objective_resolution > 0.0 {
+        query.objective_resolution.max(roundoff_floor)
+    } else {
+        roundoff_floor
+    };
+    let largest = query.largest_step;
+    let alpha_min = match negative_curvature_claim(lambda_min, largest, floor) {
+        Some(NegativeCurvatureClaim::Resolvable { alpha_min }) => alpha_min,
+        Some(NegativeCurvatureClaim::Unresolvable {
+            predicted_at_largest,
+        }) => {
+            return Verdict::Unresolvable {
+                lambda_min,
+                predicted_at_largest,
+            };
+        }
+        None => return Verdict::Declined(NegativeCurvatureDecline::Malformed),
+    };
+    let mut steps = Vec::new();
+    let mut alpha = largest;
+    loop {
+        steps.push(alpha);
+        if alpha <= alpha_min || alpha <= f64::EPSILON {
+            break;
+        }
+        alpha *= 0.5;
+    }
+    let point_at = |ray: &Array1<f64>, alpha: f64| {
+        project_to_box(&(point + &ray.mapv(|value| alpha * value)), query.lower, query.upper)
+    };
+    let same_point = |trial: &Array1<f64>| {
+        trial
+            .iter()
+            .zip(point.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    };
+    let (mut probed, mut clamped, mut failed, mut non_finite) = (0usize, 0usize, 0usize, 0usize);
+    let mut best_seen = f64::INFINITY;
+    let mut confirmed: Option<(Array1<f64>, f64, f64)> = None;
+    'signs: for sign in [primary_sign, -primary_sign] {
+        let ray = direction.mapv(|value| sign * value);
+        for &alpha in &steps {
+            let trial = point_at(&ray, alpha);
+            if same_point(&trial) {
+                clamped += 1;
+                continue;
+            }
+            match cost(&trial) {
+                Ok(value) if value.is_finite() => {
+                    probed += 1;
+                    best_seen = best_seen.min(value);
+                    if value < query.baseline_cost - floor {
+                        confirmed = Some((ray, alpha, value));
+                        break 'signs;
+                    }
+                }
+                Ok(_) => non_finite += 1,
+                Err(_) => failed += 1,
+            }
+        }
+    }
+    let smallest_step = *steps.last().unwrap_or(&largest);
+    let Some((ray, confirmed_step, confirmed_cost)) = confirmed else {
+        if probed == 0 {
+            return Verdict::Declined(NegativeCurvatureDecline::NoEvaluableTrial {
+                lambda_min,
+                margin,
+                clamped_onto_point: clamped,
+                failed,
+                non_finite,
+                steps: steps.len(),
+            });
+        }
+        return Verdict::Contradicted {
+            lambda_min,
+            probed,
+            smallest_step,
+            predicted_at_smallest: 0.5 * lambda_min.abs() * smallest_step * smallest_step,
+            best_seen_cost: best_seen,
+            decrease_floor: floor,
+        };
+    };
+
+    let alpha_box = max_feasible_step_along(point, &ray, query.lower, query.upper);
+    let mut best_point = point_at(&ray, confirmed_step);
+    let mut best_cost = confirmed_cost;
+    let mut step = confirmed_step;
+    let mut doublings = 0usize;
+    if confirmed_step < alpha_box {
+        if let Ok(value) = cost(&best_point)
+            && value.is_finite()
+        {
+            best_cost = value;
+        }
+        loop {
+            let next = (2.0 * step).min(alpha_box);
+            if !(next.is_finite() && next > step) {
+                break;
+            }
+            let trial = point_at(&ray, next);
+            if same_point(&trial) {
+                break;
+            }
+            match cost(&trial) {
+                Ok(value) if value.is_finite() && value < best_cost - floor => {
+                    best_point = trial;
+                    best_cost = value;
+                    step = next;
+                    doublings += 1;
+                }
+                _ => break,
+            }
+        }
+    }
+    Verdict::Descended {
+        point: best_point,
+        cost: best_cost,
+        lambda_min,
+        confirmed_step,
+        step,
+        doublings,
+        on_box_face: alpha_box.is_finite() && step >= alpha_box,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -282,6 +580,122 @@ mod tests {
         newton_predicted_decrease_at_resolution, unresolvable_curvature_magnitude,
     };
     use ndarray::{Array1, array};
+
+    use super::{
+        NegativeCurvatureQuery, NegativeCurvatureVerdict, adjudicate_negative_curvature,
+    };
+
+    fn query<'a>(
+        point: &'a Array1<f64>,
+        gradient: &'a Array1<f64>,
+        basis: &'a ndarray::Array2<f64>,
+        reduced: &'a ndarray::Array2<f64>,
+        lower: &'a Array1<f64>,
+        upper: &'a Array1<f64>,
+        baseline_cost: f64,
+    ) -> NegativeCurvatureQuery<'a> {
+        NegativeCurvatureQuery {
+            point,
+            gradient,
+            basis,
+            reduced_hessian: reduced,
+            diagonal_scale: 2.0,
+            lower,
+            upper,
+            baseline_cost,
+            objective_resolution: 1e-10,
+            largest_step: 1.0,
+        }
+    }
+
+    /// `f = x² − y²` at the origin: the saddle descends along `y`, and the doubling
+    /// runs to the box face at `|y| = 8`.
+    #[test]
+    fn a_saddle_descends_to_the_box_face_2900() {
+        let point = array![0.0, 0.0];
+        let gradient = array![0.0, 0.0];
+        let basis = ndarray::Array2::<f64>::eye(2);
+        let reduced = array![[2.0, 0.0], [0.0, -2.0]];
+        let (lower, upper) = (array![-8.0, -8.0], array![8.0, 8.0]);
+        let f = |x: &Array1<f64>| -> Result<f64, ()> { Ok(x[0] * x[0] - x[1] * x[1]) };
+        let verdict = adjudicate_negative_curvature(
+            &query(&point, &gradient, &basis, &reduced, &lower, &upper, 0.0),
+            f,
+        );
+        let NegativeCurvatureVerdict::Descended { point, cost, step, on_box_face, confirmed_step, .. } =
+            verdict
+        else {
+            panic!("the saddle must descend, got {verdict:?}");
+        };
+        assert_eq!(confirmed_step, 1.0);
+        assert_eq!(step, 8.0);
+        assert!(on_box_face);
+        assert_eq!(point[0], 0.0);
+        assert_eq!(point[1].abs(), 8.0);
+        assert_eq!(cost, -64.0);
+    }
+
+    /// A matrix that reports negative curvature where the objective is convex is
+    /// contradicted over the whole falsifiable range, down to
+    /// `α_min = √(2·floor/|λ_min|)`.
+    #[test]
+    fn a_curvature_the_objective_does_not_have_is_contradicted_2900() {
+        let point = array![0.0];
+        let gradient = array![0.0];
+        let basis = ndarray::Array2::<f64>::eye(1);
+        let reduced = array![[-2.0]];
+        let (lower, upper) = (array![-10.0], array![10.0]);
+        let verdict = adjudicate_negative_curvature(
+            &query(&point, &gradient, &basis, &reduced, &lower, &upper, 0.0),
+            |x: &Array1<f64>| -> Result<f64, ()> { Ok(x[0] * x[0]) },
+        );
+        let NegativeCurvatureVerdict::Contradicted { smallest_step, probed, .. } = verdict else {
+            panic!("a convex objective must contradict the claim, got {verdict:?}");
+        };
+        let alpha_min = (2.0 * 1e-10 / 2.0_f64).sqrt();
+        assert!(smallest_step <= alpha_min && smallest_step > 0.5 * alpha_min);
+        assert_eq!(probed, 2 * (1.0 / smallest_step).log2().round() as usize + 2);
+    }
+
+    /// A claim whose largest step predicts no more than the resolution evaluates
+    /// nothing.
+    #[test]
+    fn an_unresolvable_claim_evaluates_nothing_2900() {
+        let point = array![0.0];
+        let gradient = array![0.0];
+        let basis = ndarray::Array2::<f64>::eye(1);
+        let reduced = array![[-1e-3]];
+        let (lower, upper) = (array![-1.0], array![1.0]);
+        let mut q = query(&point, &gradient, &basis, &reduced, &lower, &upper, 0.0);
+        q.objective_resolution = 1e-3;
+        q.diagonal_scale = 0.0;
+        let mut calls = 0;
+        let verdict = adjudicate_negative_curvature(&q, |_: &Array1<f64>| -> Result<f64, ()> {
+            calls += 1;
+            Ok(0.0)
+        });
+        assert!(matches!(verdict, NegativeCurvatureVerdict::Unresolvable { .. }), "{verdict:?}");
+        assert_eq!(calls, 0);
+    }
+
+    /// Held coordinates are zero in the basis, so the descent never moves them.
+    #[test]
+    fn the_descent_stays_in_the_judged_subspace_2900() {
+        let point = array![0.5, 0.0];
+        let gradient = array![0.0, 0.0];
+        let basis = array![[0.0], [1.0]];
+        let reduced = array![[-2.0]];
+        let (lower, upper) = (array![0.5, -1.0], array![0.5, 1.0]);
+        let verdict = adjudicate_negative_curvature(
+            &query(&point, &gradient, &basis, &reduced, &lower, &upper, 0.25),
+            |x: &Array1<f64>| -> Result<f64, ()> { Ok(x[0] * x[0] - x[1] * x[1]) },
+        );
+        let NegativeCurvatureVerdict::Descended { point, .. } = verdict else {
+            panic!("got {verdict:?}");
+        };
+        assert_eq!(point[0], 0.5);
+        assert_eq!(point[1].abs(), 1.0);
+    }
 
     #[test]
     fn the_shift_is_the_larger_of_the_measurement_and_the_arithmetic_band() {
