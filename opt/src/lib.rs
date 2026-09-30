@@ -10125,8 +10125,16 @@ impl BfgsCore {
                 // returns the best-so-far iterate; the stationarity verdict
                 // decides `CostStallConverged` (success) vs `CostStallFloor`.
                 let resolution_next = self.value_band.at(f_next);
-                if let Some(cost_stall) = self.cost_stall.as_mut() {
-                    let g_proj_norm = g_proj_next.dot(&g_proj_next).sqrt();
+                let g_proj_norm_next = g_proj_next.dot(&g_proj_next).sqrt();
+                // A point that already meets the solver's own gradient tolerance exits
+                // through that test at the next iteration's top; the cost stall only
+                // adds an exit where the gradient test cannot fire.
+                if let Some(cost_stall) = self
+                    .cost_stall
+                    .as_mut()
+                    .filter(|_| g_proj_norm_next.is_nan() || g_proj_norm_next >= effective_tol)
+                {
+                    let g_proj_norm = g_proj_norm_next;
                     let predicted_decrease = -g_k.dot(&s_k);
                     let halt = cost_stall.observe(
                         &x_next,
@@ -19573,8 +19581,10 @@ mod tests {
         // convergence (never a CostStall status). This pins the additive,
         // opt-in contract: `with_cost_stall` only ADDS an exit on flat
         // valleys, it does not change convergent runs.
+        // The cost stall is configured at the solver's own gradient threshold, as
+        // `CostStallConfig` asks, so it can only add an exit the gradient test lacks.
         let x0 = array![-1.2, 1.0];
-        let config = CostStallConfig::new(1.0e-3);
+        let config = CostStallConfig::new(1.0e-5);
         let report = Bfgs::new(x0, bfgs_oracle(rosenbrock))
             .with_max_iterations(MaxIterations::new(500).unwrap())
             .with_cost_stall(config)
